@@ -13,6 +13,92 @@ The web UI provides:
 - **Live Log Streaming** with filtering by level, item, AI score, and text search
 - **Export CSV** button in the header downloads all found (notified) listings — link, price, rating, and details — as a CSV file
 - **Auto-validation** of your config as you type
+- **Analytics dashboard** (the "Dashboard" tab) — see below
+- **Light / dark theme** toggle in the header
+
+## Analytics Dashboard
+
+The **Dashboard** tab analyses every listing the monitor has examined, not just
+the ones you were notified about.
+
+Each time a listing turns up in a search, the monitor records a *sighting*:
+when it was first and last seen, how many times it reappeared, and a timestamped
+diff of anything that changed since last time — price, title, description,
+location, seller, condition or image. That log is what makes price history,
+"listings from today", lowest-price-ever and bargain detection possible.
+
+Sections:
+
+| Section | What it shows |
+|---|---|
+| **Resumen** | Totals, mean/median/min/max price, seller and city counts, listings today and in the last hour |
+| **Gráficos** | Price histogram, price and volume by product type / city / comuna, spread boxplots, and daily / hourly time series |
+| **Comunas** | Volume, price level and top categories per comuna, with click-to-filter |
+| **Vendedores** | Per-seller volume, cadence and first/last posting, filterable to new, very active, or likely resellers |
+| **Oportunidades** | Listings priced well below comparable ones, with a configurable bargain threshold |
+| **Listado** | Every listing, or listings grouped into products with a best-price comparison; click any row for its full detail and change timeline |
+
+One filter bar at the top scopes every section at once — product type, category,
+city, comuna, seller, price range, date range, status, AI score and free text.
+Any table exports to CSV or JSON.
+
+### Where the data lives
+
+Sightings are stored in the monitor's own cache under the
+`listing-observations` tag. The browser keeps a local copy in **IndexedDB** and
+refreshes it incrementally, so the panel stays fast with tens of thousands of
+listings and works instantly on reload. Nothing is sent anywhere: the data never
+leaves your machine.
+
+To start over, clear the observation log:
+
+```bash
+ai-marketplace-monitor --clear-cache listing-observations
+```
+
+The browser notices the store was reset and rebuilds its copy on the next visit.
+
+### Signing in
+
+The browser runs on a persistent profile at
+`~/.ai-marketplace-monitor/browser-profile/`, so two-factor verification is
+normally a one-time thing rather than something you face on every start. That
+directory is equivalent to being signed in — treat it like a password.
+
+Persistence matters for more than convenience. A browser Facebook does not
+recognize gets challenged, and a throwaway profile is unrecognizable *every*
+time — which is how a CAPTCHA turns into a loop you cannot answer your way out
+of. A profile makes the second run the same browser coming back.
+
+One consequence: a persistent profile binds its proxy for the whole browser
+lifetime, so a rotating `proxy_server` list can no longer be sampled per page.
+The monitor warns at startup and uses the first entry.
+
+If an automated sign-in keeps looping — you answer the CAPTCHA correctly and
+land back on the login page — sign in by hand once:
+
+```bash
+ai-marketplace-monitor --login
+```
+
+That opens a browser and waits, with no deadline, for you to finish whatever
+Facebook asks for. Normal runs then reuse the saved session.
+
+To start over with a clean login:
+
+```bash
+ai-marketplace-monitor --clear-cache sessions
+```
+
+### Known limits
+
+- **Status.** The monitor does not revisit listings, so "sold" and "deleted"
+  cannot be observed. A listing that stops appearing in searches is reported as
+  *sin ver* (not seen recently) rather than guessed at.
+- **Comuna and city** are parsed out of the single free-text location line the
+  marketplace provides, so they can be imprecise or empty.
+- **Mixed currencies.** Averages across different currencies are meaningless;
+  the panel says so instead of printing a number, and you can filter down to one.
 
 ## Getting Started
 

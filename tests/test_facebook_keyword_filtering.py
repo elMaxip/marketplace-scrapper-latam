@@ -9,7 +9,7 @@ from ai_marketplace_monitor.listing import Listing
 @pytest.fixture
 def facebook_marketplace() -> FacebookMarketplace:
     """Create a Facebook marketplace instance with properly mocked dependencies."""
-    marketplace = FacebookMarketplace(name="facebook", browser=MagicMock(), logger=MagicMock())
+    marketplace = FacebookMarketplace(name="facebook", context=MagicMock(), logger=MagicMock())
 
     # Mock the config attribute following codebase patterns
     mock_config = MagicMock()

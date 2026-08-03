@@ -85,7 +85,7 @@ One or more sections `marketplace.name` show the options for interacting with va
 | `market_type`      | Optional    | String   | The supported marketplace. Currently, only `facebook` is supported.                                              |
 | `username`         | Optional    | String   | Username can be entered manually or kept in the config file. Falls back to `FACEBOOK_USERNAME` environment variable if not set. |
 | `password`         | Optional    | String   | Password can be entered manually or kept in the config file. Falls back to `FACEBOOK_PASSWORD` environment variable if not set. |
-| `login_wait_time`  | Optional    | Integer  | Time (in seconds) to wait before searching to allow enough time to enter CAPTCHA. Defaults to 60.                |
+| `login_wait_time`  | Optional    | Integer  | How long (in seconds) to wait for the login to complete — two-factor, CAPTCHA or QR. The wait ends as soon as the session is live, so this is only a ceiling. Defaults to 300. |
 | `language`         | Optional    | String   | Language for webpages                                                                                            |
 | **Common options** |             |          | Options listed in the [Common options](#common-options) section below that provide default values for all items. |
 

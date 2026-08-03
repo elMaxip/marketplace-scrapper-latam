@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="es">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="/static/vendor/codemirror.css" />
   <link rel="stylesheet" href="/static/vendor/dialog.css" />
   <link rel="stylesheet" href="/static/app.css" />
+  <link rel="stylesheet" href="/static/dashboard.css" />
   <link rel="icon" href="data:," />
 </head>
 <body>
@@ -14,13 +15,13 @@
     <form id="login-form" class="login-form">
       <h1 id="login-title">AI Marketplace Monitor</h1>
       <p id="login-subtitle" class="subtitle" hidden></p>
-      <label>Username
+      <label>Usuario
         <input type="text" name="username" autocomplete="username" required />
       </label>
-      <label>Password
+      <label>Contraseña
         <input type="password" name="password" autocomplete="current-password" required autofocus />
       </label>
-      <button type="submit" id="login-submit">Sign in</button>
+      <button type="submit" id="login-submit">Iniciar sesión</button>
       <p id="login-error" class="error" hidden></p>
     </form>
   </div>
@@ -29,31 +30,38 @@
     <header class="header">
       <div class="header-left">
         <span class="brand">AI Marketplace Monitor</span>
+        <nav class="view-tabs" role="tablist" aria-label="Vista">
+          <button data-view="config" class="view-tab active" role="tab" aria-selected="true">Configuración</button>
+          <button data-view="dashboard" class="view-tab" role="tab" aria-selected="false">Panel</button>
+        </nav>
         <span id="config-name" class="config-name">—</span>
       </div>
       <div class="header-right">
-        <span id="monitor-status" class="status-chip status-warn" title="Last activity from the monitor">● monitor: idle</span>
-        <button id="restart-btn" class="ghost small" title="Wake up and search all items now" aria-label="Wake up and search all items now">▶</button>
-        <a id="browser-btn" class="ghost" href="/vnc/vnc.html?path=ws/vnc&autoconnect=1&resize=scale" target="_blank" rel="noopener" title="Open the live Chromium view (CAPTCHA / login)" hidden>Browser</a>
-        <button id="export-csv-btn" class="ghost small" title="Download all found items as CSV" aria-label="Download all found items as CSV">⬇ Export CSV</button>
-        <button id="logout-btn" class="ghost">Logout</button>
+        <span id="monitor-status" class="status-chip status-warn" title="Última actividad del monitor">● monitor: inactivo</span>
+        <button id="restart-btn" class="ghost small" title="Despertar y buscar todos los ítems ahora" aria-label="Despertar y buscar todos los ítems ahora">▶</button>
+        <a id="browser-btn" class="ghost" href="/vnc/vnc.html?path=ws/vnc&autoconnect=1&resize=scale" target="_blank" rel="noopener" title="Abrir la vista en vivo de Chromium (CAPTCHA / inicio de sesión)" hidden>Navegador</a>
+        <button id="export-csv-btn" class="ghost small" title="Descargar todos los ítems encontrados en CSV" aria-label="Descargar todos los ítems encontrados en CSV">⬇ Exportar CSV</button>
+        <button id="theme-btn" class="ghost small" title="Cambiar entre tema claro y oscuro" aria-label="Cambiar tema">◐</button>
+        <button id="logout-btn" class="ghost">Cerrar sesión</button>
       </div>
     </header>
+
+    <section id="dashboard-root" class="dashboard-root hidden" role="tabpanel" aria-label="Panel de análisis"></section>
 
     <main class="main">
       <section class="editor-pane">
         <div class="editor-toolbar">
           <div class="add-dropdown" id="add-dropdown">
-            <button id="add-btn" class="toolbar-btn">+ Add section ▾</button>
+            <button id="add-btn" class="toolbar-btn">+ Agregar sección ▾</button>
             <div id="add-menu" class="add-menu hidden">
-              <button data-prefix="item">Item to watch</button>
-              <button data-prefix="user">User / notification</button>
-              <button data-prefix="ai">AI backend</button>
+              <button data-prefix="item">Ítem a vigilar</button>
+              <button data-prefix="user">Usuario / notificación</button>
+              <button data-prefix="ai">Backend de IA</button>
               <button data-prefix="marketplace">Marketplace</button>
             </div>
           </div>
           <div class="toolbar-spacer"></div>
-          <button id="save-btn" class="toolbar-btn save-btn" disabled>Save</button>
+          <button id="save-btn" class="toolbar-btn save-btn" disabled>Guardar</button>
         </div>
         <div class="editor-with-gutter">
           <div id="gutter" class="gutter"><div id="gutter-inner" class="gutter-inner"></div></div>
@@ -65,28 +73,28 @@
       <section class="logs-pane">
         <div class="logs-toolbar">
           <div class="level-chips">
-            <button data-level="ALL" class="chip active">All</button>
+            <button data-level="ALL" class="chip active">Todo</button>
             <button data-level="INFO" class="chip">Info</button>
-            <button data-level="WARNING" class="chip">Warn</button>
-            <button data-level="ERROR" class="chip">Error</button>
+            <button data-level="WARNING" class="chip">Avisos</button>
+            <button data-level="ERROR" class="chip">Errores</button>
           </div>
           <div class="kind-chips">
-            <button data-kind="" class="chip active">Any</button>
-            <button data-kind="ai_eval" class="chip">AI eval</button>
-            <button data-kind="search_summary" class="chip">Searches</button>
-            <button data-kind="listing_skip" class="chip">Skipped</button>
-            <button data-kind="credentials_wait" class="chip">Login</button>
+            <button data-kind="" class="chip active">Cualquiera</button>
+            <button data-kind="ai_eval" class="chip">Evaluación IA</button>
+            <button data-kind="search_summary" class="chip">Búsquedas</button>
+            <button data-kind="listing_skip" class="chip">Descartadas</button>
+            <button data-kind="credentials_wait" class="chip">Inicio de sesión</button>
           </div>
-          <select id="item-filter" title="Filter by item"><option value="">Any item</option></select>
-          <select id="score-filter" title="Minimum score">
-            <option value="">Any score</option>
+          <select id="item-filter" title="Filtrar por ítem"><option value="">Cualquier ítem</option></select>
+          <select id="score-filter" title="Puntaje mínimo">
+            <option value="">Cualquier puntaje</option>
             <option value="3">≥ 3</option>
             <option value="4">≥ 4</option>
-            <option value="5">= 5 (high)</option>
+            <option value="5">= 5 (alto)</option>
           </select>
-          <input id="log-filter" type="search" placeholder="Text filter…" />
+          <input id="log-filter" type="search" placeholder="Filtrar texto…" />
           <label class="autoscroll">
-            <input id="autoscroll" type="checkbox" checked /> auto-scroll
+            <input id="autoscroll" type="checkbox" checked /> desplazamiento automático
           </label>
         </div>
         <div id="logs" class="logs"></div>
@@ -94,7 +102,7 @@
     </main>
 
     <footer class="footer">
-      <span id="ws-status">● connecting…</span>
+      <span id="ws-status">● conectando…</span>
       <span id="mtime"></span>
     </footer>
   </div>
@@ -104,7 +112,7 @@
     <div class="modal-backdrop"></div>
     <div class="modal-card form-modal-card">
       <div class="modal-header">
-        <h2 id="form-modal-title">Edit section</h2>
+        <h2 id="form-modal-title">Editar sección</h2>
         <button class="modal-close" id="form-modal-close">×</button>
       </div>
       <div class="modal-body">
@@ -113,8 +121,8 @@
         <div id="form-error" class="error" hidden></div>
       </div>
       <div class="modal-footer">
-        <button type="button" id="form-cancel" class="ghost">Cancel</button>
-        <button type="button" id="form-save" class="primary">Save</button>
+        <button type="button" id="form-cancel" class="ghost">Cancelar</button>
+        <button type="button" id="form-save" class="primary">Guardar</button>
       </div>
     </div>
   </div>
@@ -139,6 +147,15 @@
     })();
   </script>
   <script src="/static/vendor/codemirror.js"></script>
+  <!--
+    React, ReactDOM and htm back the analytics dashboard (static/dashboard/).
+    Vendored as classic UMD scripts for the same reason CodeMirror is: this
+    project ships as a Python package with no JS build step.  The dashboard
+    modules themselves are imported on demand, the first time its tab is opened.
+  -->
+  <script src="/static/vendor/react.production.min.js"></script>
+  <script src="/static/vendor/react-dom.production.min.js"></script>
+  <script src="/static/vendor/htm.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

@@ -11,6 +11,7 @@ from .email_notify import EmailNotificationConfig
 from .listing import Listing
 from .marketplace import TItemConfig
 from .notification import NotificationConfig, NotificationStatus
+from .observations import record_notification
 from .ntfy import NtfyNotificationConfig
 from .pushbullet import PushbulletNotificationConfig
 from .pushover import PushoverNotificationConfig
@@ -103,6 +104,9 @@ class User:
             (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), listing.hash, listing.price),
             tag=CacheType.USER_NOTIFIED.value,
         )
+        # Mirror onto the observation so the dashboard can tell which listings
+        # were acted on without joining across cache namespaces.
+        record_notification(listing, self.name, local_cache=local_cache)
 
     def _is_discounted(self: "User", old_price: str | None, new_price: str | None) -> bool:
         def to_price(price_str: str | None):

@@ -13,6 +13,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from . import __version__
+from .session import clear_all_sessions, clear_profile
 from .utils import CacheType, amm_home, cache, counter, hilight
 
 app = typer.Typer()
@@ -120,10 +121,23 @@ def main(
             "--clear-cache",
             help=(
                 "Remove all or selected category of cached items and treat all queries as new. "
-                f"""Allowed cache types are {", ".join([x.value for x in CacheType])} and all """
+                f"""Allowed cache types are {", ".join([x.value for x in CacheType])}, """
+                """"sessions" (saved marketplace logins and the browser profile) and all."""
             ),
         ),
     ] = None,
+    login: Annotated[
+        bool,
+        typer.Option(
+            "--login",
+            help=(
+                "Open a browser, sign in to each marketplace by hand with no time limit, "
+                "save the session and exit. Use this when an automated sign-in keeps "
+                "looping on a CAPTCHA or two-factor challenge; later runs reuse the "
+                "saved session instead of signing in again."
+            ),
+        ),
+    ] = False,
     verbose: Annotated[
         Optional[bool],
         typer.Option("--verbose", "-v", help="If set to true, will show debug messages."),
@@ -216,18 +230,41 @@ def main(
     if clear_cache is not None:
         if clear_cache == "all":
             cache.clear()
+            # The saved login and the browser profile live outside the diskcache,
+            # but "all" should mean a genuinely clean slate -- otherwise a broken
+            # session is only fixable by deleting files by hand.
+            clear_all_sessions()
+            clear_profile()
+        elif clear_cache == "sessions":
+            clear_all_sessions()
+            clear_profile()
         elif clear_cache in [x.value for x in CacheType]:
             cache.evict(tag=clear_cache)
         else:
             logger.error(
-                f"""{hilight("[Clear Cache]", "fail")} {clear_cache} is not a valid cache type. Allowed cache types are {", ".join([x.value for x in CacheType])} and all """
+                f"""{hilight("[Clear Cache]", "fail")} {clear_cache} is not a valid cache type. Allowed cache types are {", ".join([x.value for x in CacheType])}, sessions and all """
             )
             sys.exit(1)
+        if clear_cache in ("all", "sessions"):
+            logger.info(
+                f"""{hilight("[Clear Cache]", "succ")} Saved logins and browser profile removed — the next run signs in from scratch."""
+            )
         logger.info(f"""{hilight("[Clear Cache]", "succ")} Cache cleared.""")
         sys.exit(0)
 
     # make --version a bit faster by lazy loading of MarketplaceMonitor
     from .monitor import MarketplaceMonitor
+
+    if login:
+        # Sign in by hand, once, with no clock running. Everything the monitor
+        # would otherwise rush -- two-factor, CAPTCHA, a QR scan -- can be taken
+        # at whatever pace it needs, and the resulting session is saved for
+        # normal runs to reuse.
+        monitor = MarketplaceMonitor(config_files, False, logger)
+        try:
+            sys.exit(0 if monitor.interactive_login() else 1)
+        finally:
+            monitor.stop_monitor()
 
     if items is not None:
         try:

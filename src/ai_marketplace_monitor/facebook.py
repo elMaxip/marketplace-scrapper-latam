@@ -11,19 +11,21 @@ from urllib.parse import quote
 
 import humanize
 from currency_converter import CurrencyConverter  # type: ignore
-from playwright.sync_api import Browser, ElementHandle, Page  # type: ignore
+from playwright.sync_api import BrowserContext, ElementHandle, Page  # type: ignore
 from rich.pretty import pretty_repr
 
 from .listing import Listing
 from .marketplace import ItemConfig, Marketplace, MarketplaceConfig, WebPage
+from .observations import record_observation
+from .session import save_device_state
 from .utils import (
     BaseConfig,
     CounterItem,
     KeyboardMonitor,
     Translator,
+    aimm_event,
     convert_to_seconds,
     counter,
-    doze,
     extract_price,
     hilight,
     is_substring,
@@ -283,19 +285,40 @@ class FacebookItemConfig(ItemConfig, FacebookMarketItemCommonConfig):
 
 
 class FacebookMarketplace(Marketplace):
-    initial_url = "https://www.facebook.com/login/device-based/regular/login/"
+    #: Where a sign-in starts.
+    #:
+    #: Marketplace itself, not ``/login/device-based/regular/login/``.  That
+    #: endpoint is a legacy form that has been observed looping -- the challenge
+    #: is answered and the login page simply returns.  Landing on Marketplace
+    #: gets the current sign-in surface, including the "log in with your phone"
+    #: QR code, and goes straight to the destination when a session already
+    #: exists rather than bouncing through a login page first.
+    initial_url = "https://www.facebook.com/marketplace/"
+
+    #: The old endpoint, still tried as a fallback when no login form shows up
+    #: on the Marketplace page.
+    legacy_login_url = "https://www.facebook.com/login/device-based/regular/login/"
 
     name = "facebook"
+
+    #: How long to wait for a login to complete before giving up on this cycle.
+    #: Generous because the wait now ends the moment the session goes live, so a
+    #: high ceiling costs nothing on a normal sign-in but leaves room for
+    #: two-factor verification or a QR scan.  Override with ``login_wait_time``.
+    DEFAULT_LOGIN_WAIT = 300
+
+    #: URL fragments that mean Facebook is still asking us to authenticate.
+    AUTH_WALL_MARKERS = ("/login", "/checkpoint", "two_step_verification", "/recover")
 
     def __init__(
         self: "FacebookMarketplace",
         name: str,
-        browser: Browser | None,
+        context: BrowserContext | None,
         keyboard_monitor: KeyboardMonitor | None = None,
         logger: Logger | None = None,
     ) -> None:
         assert name == self.name
-        super().__init__(name, browser, keyboard_monitor, logger)
+        super().__init__(name, context, keyboard_monitor, logger)
         self.page: Page | None = None
 
     @classmethod
@@ -306,13 +329,95 @@ class FacebookMarketplace(Marketplace):
     def get_item_config(cls: Type["FacebookMarketplace"], **kwargs: Any) -> FacebookItemConfig:
         return FacebookItemConfig(**kwargs)
 
-    def login(self: "FacebookMarketplace") -> None:
-        assert self.browser is not None
+    def is_logged_in(self: "FacebookMarketplace") -> bool:
+        """Whether the current context holds an authenticated Facebook session.
+
+        Two signals, because neither is sufficient alone:
+
+        * the ``c_user`` cookie, which Facebook only sets once a login
+          completes.  A cookie beats scraping the page for a logged-in element:
+          it does not depend on the interface language.  But a restored session
+          that Facebook has since invalidated still carries the cookie, so on
+          its own it produces false positives.
+        * not sitting on a sign-in wall.  Facebook redirects away from the login
+          page the moment a session is valid, so still being parked on
+          ``/login``, ``/checkpoint`` or the two-factor screen means it is not.
+        """
+        if self.page is None:
+            return False
+        try:
+            cookies = self.page.context.cookies()
+            url = self.page.url or ""
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            return False
+        if not any(cookie.get("name") == "c_user" and cookie.get("value") for cookie in cookies):
+            return False
+        return not any(marker in url for marker in self.AUTH_WALL_MARKERS)
+
+    def _login_form_present(self: "FacebookMarketplace", timeout: int = 8000) -> bool:
+        """Whether the classic email/password form is on the current page."""
+        if self.page is None:
+            return False
+        try:
+            self.page.wait_for_selector('input[name="email"]', timeout=timeout)
+            return True
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            return False
+
+    def _await_login(self: "FacebookMarketplace", timeout: int) -> bool:
+        """Poll until the session goes live, or the budget runs out.
+
+        Replaces a blind fixed-length sleep.  Two-factor verification can take
+        far longer than any default, and the old behaviour was to give up
+        silently and carry on unauthenticated -- which lands on the marketplace's
+        logged-out default city and quietly scrapes the wrong place.
+        """
+        deadline = time.time() + timeout
+        announced = False
+        while time.time() < deadline:
+            if self.is_logged_in():
+                return True
+            if not announced and self.logger:
+                announced = True
+                remaining = humanize.naturaldelta(timeout)
+                self.logger.info(
+                    f"""{hilight("[Login]", "info")} Waiting up to {remaining} for the login to complete"""
+                    """ (two-factor, CAPTCHA or QR code). The search starts as soon as the session is live.""",
+                    extra=aimm_event("credentials_wait", status="waiting", marketplace=self.name),
+                )
+            # Esc still cuts the wait short when the optional pynput extra is
+            # installed; without it this is just a poll.
+            if self.keyboard_monitor is not None and self.keyboard_monitor.is_paused():
+                return self.is_logged_in()
+            time.sleep(2)
+        return self.is_logged_in()
+
+    def login(self: "FacebookMarketplace") -> bool:
+        """Sign in, reusing a saved session when one is still valid.
+
+        Returns whether there is an authenticated session to search with.
+        """
+        assert self.context is not None
 
         self.page = self.create_page(swap_proxy=True)
 
         # Navigate to the URL, no timeout
         self.goto_url(self.initial_url)
+
+        # create_page replays the previous run's cookies, so the session may
+        # already be live and the whole credential dance skippable.
+        if self.is_logged_in():
+            if self.logger:
+                self.logger.info(
+                    f"""{hilight("[Login]", "succ")} Reusing the saved session — no sign-in needed.""",
+                    extra=aimm_event("credentials_wait", status="restored", marketplace=self.name),
+                )
+            self.save_session()
+            return True
 
         if self.logger:
             self.logger.debug("[Login] Checking for cookie consent pop-up...")
@@ -340,49 +445,134 @@ class FacebookMarketplace(Marketplace):
                 )
 
         self.config: FacebookMarketplaceConfig
+        if not self._login_form_present():
+            # Marketplace can show its sign-in wall without the classic email /
+            # password form (the QR "log in with your phone" flow). Fall back to
+            # the old endpoint so configured credentials still get a chance.
+            if self.logger:
+                self.logger.debug("[Login] No login form on Marketplace; trying the classic page")
+            self.goto_url(self.legacy_login_url)
+
         try:
-            if self.config.username:
+            if self.config.username and self._login_form_present(timeout=5000):
                 time.sleep(2)
-                selector = self.page.wait_for_selector('input[name="email"]')
+                selector = self.page.wait_for_selector('input[name="email"]', timeout=5000)
                 if selector is not None:
                     selector.type(self.config.username, delay=250)
-            if self.config.password:
-                time.sleep(2)
-                selector = self.page.wait_for_selector('input[name="pass"]')
-                if selector is not None:
-                    selector.type(self.config.password, delay=250)
-            if self.config.username and self.config.password:
-                time.sleep(2)
-                # Facebook removed the <button name="login"> — press Enter to submit the form
-                self.page.keyboard.press("Enter")
+                if self.config.password:
+                    time.sleep(2)
+                    selector = self.page.wait_for_selector('input[name="pass"]', timeout=5000)
+                    if selector is not None:
+                        selector.type(self.config.password, delay=250)
+                    time.sleep(2)
+                    # Facebook removed the <button name="login"> — press Enter to submit
+                    self.page.keyboard.press("Enter")
         except KeyboardInterrupt:
             raise
         except Exception as e:
             if self.logger:
                 self.logger.error(f"""{hilight("[Login]", "fail")} {e}""")
 
-        # in case there is a need to enter additional information
+        # Facebook may still want two-factor verification, a CAPTCHA or a QR
+        # scan. Wait for the session to actually come up rather than for a fixed
+        # stretch of wall clock.
         login_wait_time = (
-            60 if self.config.login_wait_time is None else self.config.login_wait_time
+            self.DEFAULT_LOGIN_WAIT
+            if self.config.login_wait_time is None
+            else self.config.login_wait_time
         )
-        if login_wait_time > 0:
+        if login_wait_time > 0 and self._await_login(login_wait_time):
             if self.logger:
                 self.logger.info(
-                    f"""{hilight("[Login]", "info")} Waiting {humanize.naturaldelta(login_wait_time)}"""
-                    + (
-                        f""" or press {hilight("Esc")} when you are ready."""
-                        if self.keyboard_monitor is not None
-                        else ""
-                    )
+                    f"""{hilight("[Login]", "succ")} Signed in.""",
+                    extra=aimm_event("credentials_wait", status="found", marketplace=self.name),
                 )
-            doze(login_wait_time, keyboard_monitor=self.keyboard_monitor)
+            # Save now so the next run resumes this session instead of tripping
+            # a fresh two-factor challenge.
+            if self.save_session() and self.logger:
+                self.logger.debug(
+                    f"""{hilight("[Login]", "succ")} Session saved for the next run."""
+                )
+            return True
+
+        # Keep the device identity even though the login failed. Discarding it
+        # would make the next attempt arrive as a brand-new browser, which is
+        # what turns a single challenge into an endless loop of them.
+        if self.page is not None:
+            save_device_state(self.name, self.page.context)
+
+        if self.logger:
+            self.logger.error(
+                f"""{hilight("[Login]", "fail")} Not signed in after """
+                f"""{humanize.naturaldelta(login_wait_time)}. Skipping this search: without a """
+                """session the marketplace serves its own default city, not yours. Raise """
+                """login_wait_time in [marketplace.facebook] if you need longer for """
+                """two-factor verification, or run `ai-marketplace-monitor --login` to sign in """
+                """once at your own pace.""",
+                extra=aimm_event("credentials_wait", status="failed", marketplace=self.name),
+            )
+        return False
+
+    def login_interactively(self: "FacebookMarketplace", timeout: int = 3600) -> bool:
+        """Hand the browser to the user, then save whatever session results.
+
+        Credentials are typed in if they are configured -- it saves a step -- but
+        nothing here is on a deadline the user can lose, and the device identity
+        is kept even on failure so a retry is not treated as a new browser.
+        """
+        assert self.context is not None
+        self.page = self.create_page(swap_proxy=True)
+        self.goto_url(self.initial_url)
+
+        if self.is_logged_in():
+            if self.logger:
+                self.logger.info(f"""{hilight("[Login]", "succ")} Already signed in.""")
+            return self.save_session()
+
+        try:
+            if self.config.username:
+                selector = self.page.wait_for_selector('input[name="email"]', timeout=15000)
+                if selector is not None:
+                    selector.fill(self.config.username)
+            if self.config.password:
+                selector = self.page.wait_for_selector('input[name="pass"]', timeout=15000)
+                if selector is not None:
+                    selector.fill(self.config.password)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            # The form may not be there at all (already part-way through a
+            # challenge). Leave it to the user.
+            if self.logger:
+                self.logger.debug("Could not prefill the login form", exc_info=True)
+
+        if self.logger:
+            self.logger.info(
+                f"""{hilight("[Login]", "info")} Complete the sign-in in the browser window """
+                """(password, CAPTCHA, two-factor — whatever it asks for). """
+                """This will wait.""",
+                extra=aimm_event("credentials_wait", status="interactive", marketplace=self.name),
+            )
+
+        if self._await_login(timeout):
+            return self.save_session()
+
+        if self.page is not None:
+            save_device_state(self.name, self.page.context)
+        return False
 
     def search(
         self: "FacebookMarketplace", item_config: FacebookItemConfig
     ) -> Generator[Listing, None, None]:
-        if not self.page:
-            self.login()
-            assert self.page is not None
+        # Re-check on every cycle, not just the first: the monitor runs for days
+        # and a session that expires mid-run has to be noticed and renewed.
+        if (not self.page or not self.is_logged_in()) and not self.login():
+            # Searching unauthenticated is worse than not searching: the
+            # marketplace answers for its own default city, so the run would
+            # look successful while caching listings from the wrong place.
+            # Yield nothing and let the next scheduled cycle try again.
+            return
+        assert self.page is not None
 
         options = []
 
@@ -521,9 +711,25 @@ class FacebookMarketplace(Marketplace):
                 ).get_listings()
                 time.sleep(5)
                 if self.logger:
-                    self.logger.error(
-                        f"""{hilight("[Search]", "fail")} Failed to get search results for {search_phrase} from {city}"""
-                    )
+                    if found_listings:
+                        self.logger.debug(
+                            f"""{hilight("[Search]", "succ")} {hilight(str(len(found_listings)))} """
+                            f"""result(s) on the search page for {search_phrase} from {city}"""
+                        )
+                    else:
+                        # An empty page is normal for a narrow search, so this is
+                        # a warning rather than an error -- but a lost session
+                        # produces the same emptiness, so say which one it is.
+                        reason = (
+                            ""
+                            if self.is_logged_in()
+                            else " The session was lost, so this is the marketplace's"
+                            " logged-out default city, not yours."
+                        )
+                        self.logger.warning(
+                            f"""{hilight("[Search]", "fail")} No results on the search page for """
+                            f"""{search_phrase} from {city}.{reason}"""
+                        )
 
                 counter.increment(CounterItem.SEARCH_PERFORMED, item_config.name)
 
@@ -579,7 +785,13 @@ class FacebookMarketplace(Marketplace):
                             f"""{hilight("[Error]", "fail")} Failed to extract description for {hilight(listing.title)} at {listing.post_url}. Keyword filtering will only apply to title."""
                         )
 
-                    if self.check_listing(listing, item_config):
+                    matched = self.check_listing(listing, item_config)
+                    # Log the sighting whichever way the filters went: the
+                    # dashboard reports on the whole market, not only the hits.
+                    record_observation(
+                        listing, matched=matched, item_name=item_config.name
+                    )
+                    if matched:
                         yield listing
                     else:
                         counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
@@ -601,8 +813,14 @@ class FacebookMarketplace(Marketplace):
             # if the price and title are the same, we assume everything else is unchanged.
             return details, True
 
-        if not self.page:
-            self.login()
+        if not self.page and not self.login():
+            # Listing pages are gated too, so an unauthenticated fetch would
+            # parse a login wall into a bogus Listing. Fail loudly instead.
+            raise ValueError(
+                f"Cannot fetch {post_url}: not signed in to {self.name}. "
+                "Check the credentials in your config, and raise login_wait_time "
+                "if two-factor verification needs longer."
+            )
 
         assert self.page is not None
         self.goto_url(post_url)

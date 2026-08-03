@@ -49,6 +49,7 @@ from .auth import (
 from .config_api import ConfigFileService
 from .config_auth import extract_credentials
 from .found_export import iter_found_csv, iter_found_rows
+from .listings_api import build_sync_response
 from .log_handler import LogBroadcastHandler
 
 # Ensure the vendored toml-edit-js WASM bundle is served with the right
@@ -479,6 +480,17 @@ def create_app(
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+
+    # Also sync def: the dashboard polls this, and reading observations out of
+    # the cache is blocking SQLite work that has no business on the event loop.
+    @app.get("/api/listings")
+    def listings_sync(
+        since: int = 0,
+        limit: int = 0,
+        _: str = Depends(require_session),
+    ) -> Dict[str, Any]:
+        """Incremental feed of observed listings for the dashboard's IndexedDB."""
+        return build_sync_response(cache, since=since, limit=limit)
 
     return app
 

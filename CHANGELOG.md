@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Analytics dashboard in the web UI (new "Dashboard" tab): summary tiles, price
+  distribution and time-series charts, per-comuna and per-seller rollups,
+  automatic bargain detection, product grouping and a per-listing change
+  timeline. Every section is scoped by one global filter bar, and any table can
+  be exported to CSV or JSON.
+- Observation log: every listing the monitor examines is now recorded with
+  first/last seen, a sighting count, and a timestamped diff of what changed
+  between sightings (price, title, description, location, seller, condition,
+  image), plus its AI rating and notification outcome. Stored under the new
+  `listing-observations` cache tag, clearable with
+  `--clear-cache listing-observations`.
+- `GET /api/listings` — incremental feed of observations, cursored on a
+  monotonic revision, that keeps the dashboard's local IndexedDB copy in sync.
+- Light/dark theme toggle in the web UI header.
+- The browser now runs on a persistent on-disk profile
+  (`~/.ai-marketplace-monitor/browser-profile/`) instead of a throwaway one, so
+  a second run is the same browser coming back rather than a fresh install. This
+  is what stops a site re-challenging every login. A session saved by the
+  previous cookie-only mechanism is imported once into a new profile, so
+  upgrading does not force a re-login. Clear it with `--clear-cache sessions`
+  (or `--clear-cache all`).
+- `--login`: opens a browser, lets you sign in by hand with no time limit, saves
+  the session and exits. For when an automated sign-in keeps looping on a
+  CAPTCHA or two-factor challenge.
+
+### Changed
+- The web UI is now in Spanish, and price examples use CLP rather than USD.
+
+### Fixed
+- Prices grouped with a space were mangled. Facebook renders CLP as
+  `100 000`, and `extract_price` only understood comma grouping, so it either
+  split one price into two (`100 | 000`) or — with a currency prefix — kept just
+  the leading group and recorded **`$100 000` as `$100`**. That wrong number fed
+  the AI evaluation, the price filters and the notifications, not only the
+  dashboard. Space, non-breaking space, narrow non-breaking space, dot and comma
+  are now all understood, and a trailing currency code (`150.000 CLP`) is kept.
+- The dashboard repairs already-cached `100 | 000` strings on read, so listings
+  scraped before the fix show the right price without being re-fetched, and a
+  currency label containing digits is never rendered (the source of `| 000150`).
+- Group counts (the "Publicaciones" column and every bar chart) counted only
+  listings with a readable price, because `summarize`'s own `count` overwrote the
+  group's. A category with 150 listings of which 12 had no price reported 138.
+- Prices rendered with a space after the symbol (`$ 150.000`). A symbol now sits
+  flush against the number (`$150.000`); an alphabetic code keeps its space
+  (`CLP 150.000`). Grouping follows the viewer's locale, so a Chilean browser
+  gets `150.000` rather than `150,000`.
+- The monitor no longer searches while signed out. It now waits for the login to
+  actually complete — polling for a live session rather than sleeping a fixed
+  60 seconds — and skips the cycle with a clear error if it never does. Searching
+  unauthenticated silently returned results for the marketplace's own default
+  city instead of the configured one. The `login_wait_time` default is now 5
+  minutes, which costs nothing on a normal sign-in because the wait ends as soon
+  as the session goes live.
+- An expired session mid-run is now detected and re-authenticated instead of
+  degrading to signed-out searches.
+- Chromium no longer announces itself as automated (`--enable-automation` /
+  `navigator.webdriver`), which could bounce an ordinary interactive sign-in
+  into an endless CAPTCHA loop — the challenge is answered correctly and the
+  login page simply returns, because it is the browser being rejected, not the
+  answer.
+- A failed login now keeps the browser's device cookies (`datr`, `sb`) instead
+  of discarding everything. Each retry used to arrive as a brand-new browser,
+  which is what escalates a single challenge into a loop of them. Session and
+  checkpoint cookies are still dropped, so a failed attempt is never replayed.
+- Sign-in now starts on Facebook Marketplace rather than the legacy
+  `/login/device-based/regular/login/` endpoint, which was observed looping. The
+  current page also offers the "log in with your phone" QR flow. The old
+  endpoint is still tried as a fallback when no login form appears.
+- Under `--headless`, Chromium no longer advertises `HeadlessChrome` in its user
+  agent (both the JS value and the HTTP header). A profile that signed in fine
+  with a visible window would otherwise start failing once switched to headless.
+- The web UI's "search now" (▶) button had no effect. It touches the config file
+  to wake the monitor, but the monitor compared file *contents* and went straight
+  back to sleep on finding them unchanged.
+- `[Search] Failed to get search results` was logged after every search, whether
+  or not it succeeded. It now reports the result count, and says so explicitly
+  when an empty page is caused by a lost session.
+
 ## [0.10.2] - 2026-07-17
 
 ### Added

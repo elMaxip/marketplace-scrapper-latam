@@ -77,6 +77,8 @@ class CacheType(Enum):
     AI_INQUIRY = "ai-inquiries"
     USER_NOTIFIED = "user-notifications"
     COUNTERS = "counters"
+    LISTING_OBSERVATION = "listing-observations"
+    LISTING_OBSERVATION_META = "listing-observations-meta"
 
 
 class CounterItem(Enum):
@@ -576,18 +578,37 @@ def doze(
             observer.join()
 
 
+# One price: an optional currency symbol or code, then a number whose thousands
+# may be grouped by a dot, comma, space or non-breaking space, with an optional
+# 1-2 digit decimal tail.
+#
+# The space alternatives matter: Facebook renders CLP as "100 000", and a pattern
+# that only knows about commas reads that as two separate prices -- or, with a
+# currency prefix, throws the thousands away entirely and turns $100.000 into
+# $100.
+_THOUSANDS_SEP = r"[.,\s\u00a0\u202f]"
+
+_PRICE_RE = re.compile(
+    r"(?P<currency>[^\d\s.,|]{0,4})[\s\u00a0]?"
+    r"(?P<amount>\d{1,3}(?:" + _THOUSANDS_SEP + r"\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)"
+    # A trailing code ("150.000 CLP"), letters only so that the "$" opening the
+    # next price in a concatenated pair is never swallowed as this one's suffix.
+    r"(?:[\s\u00a0]?(?P<code>[A-Za-z]{2,4})\b)?"
+)
+
+
 def extract_price(price: str) -> str:
+    """Pull the price (and the struck-through original, if any) out of raw text.
+
+    Facebook concatenates the current and original price into one string, so up
+    to two are returned joined by " | ".  Each is kept in the marketplace's own
+    formatting rather than normalized; only the split is our doing.
+    """
     if not price or price == "**unspecified**":
         return price
 
-    # extract leading non-numeric characters as currency symbol
-    matched = re.match(r"(\D*)\d+", price)
-    if matched:
-        currency = matched.group(1).strip()
-    else:
-        currency = "$"
-
-    matches = re.findall(currency.replace("$", r"\$") + r"[\d,]+(?:\.\d+)?", price)
+    matches = [match.group(0).strip() for match in _PRICE_RE.finditer(price)]
+    matches = [match for match in matches if match]
     if matches:
         return " | ".join(matches[:2])
     return price

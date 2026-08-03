@@ -4,9 +4,10 @@ from enum import Enum
 from logging import Logger
 from typing import Any, Callable, Generator, Generic, List, Type, TypeVar
 
-from playwright.sync_api import Browser, ElementHandle, Locator, Page  # type: ignore
+from playwright.sync_api import BrowserContext, ElementHandle, Locator, Page  # type: ignore
 
 from .listing import Listing
+from .session import load_session, save_session
 from .utils import (
     BaseConfig,
     Currency,
@@ -455,12 +456,12 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
     def __init__(
         self: "Marketplace",
         name: str,
-        browser: Browser | None,
+        context: BrowserContext | None,
         keyboard_monitor: KeyboardMonitor | None = None,
         logger: Logger | None = None,
     ) -> None:
         self.name = name
-        self.browser = browser
+        self.context = context
         self.keyboard_monitor = keyboard_monitor
         self.translator = Translator()
         self.logger = logger
@@ -481,47 +482,73 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
         if translator is not None:
             self.translator = translator
 
-    def set_browser(self: "Marketplace", browser: Browser | None = None) -> None:
-        if browser is not None:
-            self.browser = browser
+    def set_context(self: "Marketplace", context: BrowserContext | None = None) -> None:
+        if context is not None:
+            self.context = context
             self.page = None
 
     def stop(self: "Marketplace") -> None:
-        if self.browser is not None:
+        if self.context is not None:
             # stop closing the browser since Ctrl-C will kill playwright,
             # leaving browser in a dysfunctional status.
             # see
             #   https://github.com/microsoft/playwright-python/issues/1170
-            # for details.
-            # self.browser.close()
-            self.browser = None
+            # for details.  The monitor closes the persistent context on a
+            # clean shutdown so the profile is flushed to disk.
+            self.context = None
             self.page = None
 
     def create_page(self: "Marketplace", swap_proxy: bool = False) -> Page:
-        assert self.browser is not None
+        """Take a page on the shared persistent context.
 
-        # if there is an existing page, asked to swap_proxy, and there is an proxy_server
-        # setting with multiple proxies
-        if (
-            self.page
-            and swap_proxy
-            and self.config.monitor_config is not None
-            and isinstance(self.config.monitor_config.proxy_server, list)
-            and len(self.config.monitor_config.proxy_server) > 1
-        ):
-            self.page.close()
-            self.page = None
+        ``swap_proxy`` is accepted for call-site compatibility but no longer does
+        anything: a persistent profile binds its proxy for the whole browser
+        lifetime, so a page cannot be moved onto a different one.  The monitor
+        warns at launch when a rotating proxy list is configured.
+        """
+        assert self.context is not None
+        del swap_proxy
 
         if self.page is None:
-            context = self.browser.new_context(
-                proxy=(
-                    None
-                    if self.config.monitor_config is None
-                    else self.config.monitor_config.get_proxy_options()
-                )
+            # Claim the blank page the persistent context opens with, so a
+            # visible browser does not sit there with a stray about:blank tab.
+            blank = next(
+                (page for page in self.context.pages if page.url in ("about:blank", "")), None
             )
-            self.page = context.new_page()
+            self.page = blank or self.context.new_page()
         return self.page
+
+    def seed_session(self: "Marketplace") -> bool:
+        """Import a previously saved storage state into a brand-new profile.
+
+        Only for the first run on a fresh profile: it carries a session saved by
+        an older version (which stored cookies rather than a profile) across the
+        upgrade, instead of forcing a re-login.  An established profile owns its
+        own cookies and must not be overwritten from a stale file.
+        """
+        if self.context is None:
+            return False
+        state = load_session(self.name)
+        if not state or not state.get("cookies"):
+            return False
+        try:
+            self.context.add_cookies(state["cookies"])
+            return True
+        except Exception:
+            return False
+
+    def save_session(self: "Marketplace") -> bool:
+        """Persist the current session for the next run."""
+        if self.page is None:
+            return False
+        return save_session(self.name, self.page.context)
+
+    def login_interactively(self: "Marketplace", timeout: int = 3600) -> bool:
+        """Sign in with the user driving, then save the session.
+
+        Marketplaces without a login concept have nothing to do here.
+        """
+        raise NotImplementedError(f"{self.name} does not support interactive login.")
 
     def goto_url(self: "Marketplace", url: str, attempt: int = 0) -> None:
         try:

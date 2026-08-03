@@ -1,14 +1,15 @@
+import json
 import sys
 import time
 from logging import Logger
 from pathlib import Path
-from typing import ClassVar, List
+from typing import Any, ClassVar, List
 
 import humanize
 import inflect
 import rich
 import schedule  # type: ignore
-from playwright.sync_api import Browser, Playwright, sync_playwright
+from playwright.sync_api import BrowserContext, Playwright, sync_playwright
 from rich.pretty import pretty_repr
 from rich.prompt import Prompt
 
@@ -17,6 +18,8 @@ from .config import Config, supported_ai_backends, supported_marketplaces
 from .listing import Listing
 from .marketplace import Marketplace, TItemConfig, TMarketplaceConfig
 from .notification import NotificationStatus
+from .observations import record_observation, record_rating
+from .session import load_session, profile_dir, profile_is_new
 from .user import User
 from .utils import (
     CounterItem,
@@ -60,7 +63,7 @@ class MarketplaceMonitor:
         self.ai_agents: List[AIBackend] = []
         self.keyboard_monitor: KeyboardMonitor | None = None
         self.playwright: Playwright = sync_playwright().start()
-        self.browser: Browser | None = None
+        self.context: BrowserContext | None = None
         self.logger = logger
 
     def load_config_file(self: "MarketplaceMonitor") -> Config:
@@ -92,8 +95,109 @@ class MarketplaceMonitor:
                 doze(60, self.config_files, self.keyboard_monitor)
                 continue
 
-    def _launch_browser(self: "MarketplaceMonitor") -> Browser:
-        """Launch a browser, preferring Chromium if available, otherwise any installed browser."""
+    @staticmethod
+    def _launch_options(browser_name: str) -> dict:
+        """Per-engine launch flags that keep a normal sign-in from being refused.
+
+        Playwright's Chromium advertises itself as automated: it sets
+        ``--enable-automation``, which makes ``navigator.webdriver`` true.  Sites
+        that read that flag can bounce an ordinary interactive login into a
+        challenge loop -- the CAPTCHA is answered correctly and the login page
+        just comes back, because what was rejected is the browser, not the
+        answer.  Turning the flag off lets the user's own manual sign-in behave
+        the way it does in their normal browser.
+
+        Chromium-only: Firefox and WebKit reject these arguments.
+        """
+        if browser_name != "chromium":
+            return {}
+        return {
+            "args": ["--disable-blink-features=AutomationControlled"],
+            "ignore_default_args": ["--enable-automation"],
+        }
+
+    def _proxy_for_launch(self: "MarketplaceMonitor") -> Any:
+        """The proxy to bind to the persistent profile, if one is configured.
+
+        A persistent profile fixes its proxy at launch, so a rotating list can no
+        longer be sampled per page.  Say so rather than silently honouring only
+        the first entry.
+        """
+        monitor_config = getattr(self.config, "monitor", None) if self.config else None
+        if monitor_config is None:
+            return None
+        servers = getattr(monitor_config, "proxy_server", None)
+        if isinstance(servers, list) and len(servers) > 1 and self.logger:
+            self.logger.warning(
+                f"""{hilight("[Browser]", "fail")} {len(servers)} proxies configured, but a """
+                """persistent browser profile binds one proxy for its whole lifetime. """
+                """Using the first; rotation is not applied."""
+            )
+        return monitor_config.get_proxy_options()
+
+    def _hide_headless_marker(self: "MarketplaceMonitor", context: BrowserContext) -> None:
+        """Drop "HeadlessChrome" from the user agent when running headless.
+
+        Chromium puts it in both the JS value and the HTTP header, which is an
+        outright declaration of automation -- enough on its own to put a login
+        back into the challenge loop the rest of this setup exists to avoid.  So
+        a profile that signed in fine with a visible window would start failing
+        the moment the monitor was switched to ``--headless``.
+        """
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            agent = page.evaluate("() => navigator.userAgent")
+            if "Headless" not in agent:
+                return
+            cleaned = agent.replace("HeadlessChrome", "Chrome")
+            # The header is what the server sees; the init script keeps the
+            # value scripts on the page read consistent with it.
+            context.set_extra_http_headers({"User-Agent": cleaned})
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'userAgent', "
+                f"{{get: () => {json.dumps(cleaned)}}});"
+            )
+        except Exception:
+            if self.logger:
+                self.logger.debug("Could not adjust the headless user agent", exc_info=True)
+
+    def _seed_profile_from_saved_sessions(
+        self: "MarketplaceMonitor", context: BrowserContext
+    ) -> None:
+        """Carry cookie-only sessions from an older version into a new profile.
+
+        Runs once, on a profile the browser has never written.  Without it,
+        upgrading to profile-based persistence would silently throw away a
+        working session and demand a fresh login.
+        """
+        if self.config is None:
+            return
+        for marketplace_config in self.config.marketplace.values():
+            state = load_session(marketplace_config.name)
+            if not state or not state.get("cookies"):
+                continue
+            try:
+                context.add_cookies(state["cookies"])
+                if self.logger:
+                    self.logger.debug(
+                        f"Seeded new profile with the saved {marketplace_config.name} session"
+                    )
+            except Exception:
+                if self.logger:
+                    self.logger.debug("Could not seed saved session", exc_info=True)
+
+    def _launch_context(self: "MarketplaceMonitor") -> BrowserContext:
+        """Open the browser on a persistent on-disk profile.
+
+        A profile directory rather than a throwaway browser: sites that decide
+        whether to challenge a login partly on whether they recognize the browser
+        will re-challenge forever against a fresh install every run.  The profile
+        makes the second run the same browser coming back.
+        """
+        user_data_dir = str(profile_dir())
+        first_run = profile_is_new()
+        proxy = self._proxy_for_launch()
+
         # Try browsers in order of preference
         browser_types = [
             ("chromium", self.playwright.chromium),
@@ -105,13 +209,33 @@ class MarketplaceMonitor:
             try:
                 if self.logger:
                     self.logger.debug(f"Attempting to launch {browser_name} browser...")
-                browser = browser_type.launch(headless=self.headless)
+                context = browser_type.launch_persistent_context(
+                    user_data_dir,
+                    headless=self.headless,
+                    proxy=proxy,
+                    **self._launch_options(browser_name),
+                )
+                # Chromium leaves navigator.webdriver defined even with the
+                # automation flag off; clear it before any page script runs.
+                try:
+                    context.add_init_script(
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                    )
+                except Exception:
+                    # Not supported on every engine; the launch flag already
+                    # covers the common case.
+                    pass
+                if self.headless:
+                    self._hide_headless_marker(context)
+                if first_run:
+                    self._seed_profile_from_saved_sessions(context)
                 if self.logger:
                     self.logger.info(
-                        f"""{hilight("[Browser]", "info")} Successfully launched {browser_name} browser.""",
-                        extra=aimm_event("browser_ready", engine=browser_name),
+                        f"""{hilight("[Browser]", "info")} Successfully launched {browser_name} browser"""
+                        f""" ({"new" if first_run else "existing"} profile).""",
+                        extra=aimm_event("browser_ready", engine=browser_name, new_profile=first_run),
                     )
-                return browser
+                return context
             except Exception as e:
                 if self.logger:
                     self.logger.debug(f"Failed to launch {browser_name}: {e}")
@@ -201,6 +325,13 @@ class MarketplaceMonitor:
             # for x in self.find_new_items(found_items)
             res = self.evaluate_by_ai(
                 listing, item_config=item_config, marketplace_config=marketplace_config
+            )
+            record_rating(
+                listing,
+                score=res.score,
+                comment=res.comment,
+                conclusion=res.conclusion,
+                ai_name=res.name,
             )
             if self.logger:
                 if res.comment == AIResponse.NOT_EVALUATED:
@@ -337,7 +468,7 @@ class MarketplaceMonitor:
                 marketplace = self.active_marketplaces[marketplace_config.name]
             else:
                 marketplace = marketplace_class(
-                    marketplace_config.name, self.browser, self.keyboard_monitor, self.logger
+                    marketplace_config.name, self.context, self.keyboard_monitor, self.logger
                 )
                 self.active_marketplaces[marketplace_config.name] = marketplace
 
@@ -516,9 +647,9 @@ class MarketplaceMonitor:
         # asking for those same credentials.
         if self.defer_login_until_credentials:
             self._wait_for_marketplace_credentials()
-        self.browser = self._launch_browser()
+        self.context = self._launch_context()
         #
-        assert self.browser is not None
+        assert self.context is not None
         while True:
             self.handle_pause()
             self.schedule_jobs()
@@ -597,16 +728,94 @@ class MarketplaceMonitor:
                             )
                         schedule.clear()
                         break
+                    # Same content, only the timestamp moved. That is the web
+                    # UI's "search now" button, which touches the config on
+                    # purpose to wake us. Falling through here would send us
+                    # straight back to sleep and make the button a no-op, so
+                    # run every job now instead of waiting for its next slot.
+                    if self.logger:
+                        self.logger.info(
+                            f"""{hilight("[Schedule]", "info")} Woken on request — searching all items now."""
+                        )
+                    for job in schedule.get_jobs():
+                        job.run()
+                        self.handle_pause()
                 elif res == SleepStatus.BY_KEYBOARD:
                     self.keyboard_monitor.set_paused(True)
 
                 self.handle_pause()
                 schedule.run_pending()
 
+    def interactive_login(self: "MarketplaceMonitor") -> bool:
+        """Sign in to every enabled marketplace by hand and save the session.
+
+        The scheduled path has to give up on a login eventually, or a stuck
+        challenge would wedge the monitor forever.  That deadline is exactly
+        wrong when a site keeps looping the challenge: every attempt is abandoned
+        half-way and nothing is ever saved.  This runs the same login with no
+        deadline and a visible browser, so the sign-in can be finished properly
+        once and reused from then on.
+        """
+        self.load_config_file()
+        assert self.config is not None
+        self.context = self._launch_context()
+
+        signed_in = 0
+        attempted = 0
+        for marketplace_config in self.config.marketplace.values():
+            if marketplace_config.enabled is False:
+                continue
+            attempted += 1
+            marketplace_class = supported_marketplaces[marketplace_config.name]
+            marketplace = marketplace_class(marketplace_config.name, self.context, None, self.logger)
+            marketplace.configure(
+                marketplace_config,
+                translator=self._select_translator(marketplace_config.language),
+            )
+            if self.logger:
+                self.logger.info(
+                    f"""{hilight("[Login]", "info")} Opening {hilight(marketplace_config.name)} — """
+                    """finish the sign-in in the browser window. """
+                    """Press Ctrl-C here to give up."""
+                )
+            try:
+                # A long ceiling rather than a true infinity: this still returns
+                # the moment the session goes live, so the number only bounds an
+                # abandoned attempt.
+                if marketplace.login_interactively(timeout=3600):
+                    signed_in += 1
+                    if self.logger:
+                        self.logger.info(
+                            f"""{hilight("[Login]", "succ")} Session for {hilight(marketplace_config.name)} saved."""
+                        )
+                elif self.logger:
+                    self.logger.error(
+                        f"""{hilight("[Login]", "fail")} Gave up on {hilight(marketplace_config.name)}; nothing saved."""
+                    )
+            except KeyboardInterrupt:
+                if self.logger:
+                    self.logger.warning(f"""{hilight("[Login]", "fail")} Cancelled.""")
+                break
+
+        if attempted == 0 and self.logger:
+            self.logger.error(
+                f"""{hilight("[Login]", "fail")} No enabled marketplace in the configuration."""
+            )
+        return signed_in > 0
+
     def stop_monitor(self: "MarketplaceMonitor") -> None:
         """Stop the monitor."""
         for marketplace in self.active_marketplaces.values():
             marketplace.stop()
+        # Close the persistent context so Chromium flushes cookies and the rest
+        # of the profile to disk; an abandoned profile can lose the session that
+        # persistence exists to keep.
+        if self.context is not None:
+            try:
+                self.context.close()
+            except Exception:
+                pass
+            self.context = None
         self.playwright.stop()
         if self.keyboard_monitor:
             self.keyboard_monitor.stop()
@@ -667,13 +876,13 @@ class MarketplaceMonitor:
 
                 # do we need a browser?
                 if Listing.from_cache(post_url) is None:
-                    if self.browser is None:
+                    if self.context is None:
                         if self.logger:
                             self.logger.info(
                                 f"""{hilight("[Search]", "info")} Starting a browser because the item was not checked before."""
                             )
-                        self.browser = self._launch_browser()
-                        marketplace.set_browser(self.browser)
+                        self.context = self._launch_context()
+                        marketplace.set_context(self.context)
 
                 # ignore enabled
                 if for_item is None:
@@ -707,9 +916,17 @@ class MarketplaceMonitor:
                     self.logger.info(
                         f"""{hilight("[Search]", "succ")} Checking {post_url} for item {item_config.name} with configuration {pretty_repr(item_config)}"""
                     )
-                marketplace.check_listing(listing, item_config)
+                matched = marketplace.check_listing(listing, item_config)
+                record_observation(listing, matched=matched, item_name=item_config.name)
                 rating = self.evaluate_by_ai(
                     listing, item_config=item_config, marketplace_config=marketplace_config
+                )
+                record_rating(
+                    listing,
+                    score=rating.score,
+                    comment=rating.comment,
+                    conclusion=rating.conclusion,
+                    ai_name=rating.name,
                 )
                 if self.logger:
                     if rating.comment == AIResponse.NOT_EVALUATED:
