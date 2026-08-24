@@ -209,3 +209,62 @@ def test_listing_without_identity_is_skipped(temp_cache: Cache) -> None:
     listing.id = ""
     assert obs.record_observation(listing, local_cache=temp_cache) is None
     assert obs.current_revision(temp_cache) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Deleting
+# --------------------------------------------------------------------------- #
+
+
+def test_delete_replaces_the_record_with_a_tombstone(temp_cache: Cache) -> None:
+    obs.record_observation(_listing("1"), local_cache=temp_cache)
+    deleted, revision = obs.delete_observations([("facebook", "1")], local_cache=temp_cache)
+
+    assert deleted == 1
+    record = obs.get_observation("facebook", "1", local_cache=temp_cache)
+    assert obs.is_deleted(record)
+    assert record is not None
+    # The tombstone carries its own revision, which is what lets a client that
+    # already synced the listing learn that it is gone.
+    assert record["rev"] == revision
+    assert "listing" not in record
+
+
+def test_deleting_twice_burns_no_revision(temp_cache: Cache) -> None:
+    obs.record_observation(_listing("1"), local_cache=temp_cache)
+    obs.delete_observations([("facebook", "1")], local_cache=temp_cache)
+    before = obs.current_revision(temp_cache)
+
+    deleted, revision = obs.delete_observations([("facebook", "1")], local_cache=temp_cache)
+    assert deleted == 0
+    assert revision == before
+
+
+def test_delete_ignores_listings_that_were_never_seen(temp_cache: Cache) -> None:
+    deleted, _ = obs.delete_observations(
+        [("facebook", "nope"), ("", "x"), ("facebook", "")], local_cache=temp_cache
+    )
+    assert deleted == 0
+    assert obs.current_revision(temp_cache) == 0
+
+
+def test_a_deleted_listing_is_not_recorded_again(temp_cache: Cache) -> None:
+    """The scraper has no memory of what the user threw away; the store does."""
+    obs.record_observation(_listing("1"), local_cache=temp_cache)
+    obs.delete_observations([("facebook", "1")], local_cache=temp_cache)
+
+    assert obs.record_observation(_listing("1"), local_cache=temp_cache) is None
+    assert obs.record_rating(_listing("1"), score=5, local_cache=temp_cache) is None
+    assert obs.is_deleted(obs.get_observation("facebook", "1", local_cache=temp_cache))
+
+
+def test_deletion_reaches_a_synced_client(temp_cache: Cache) -> None:
+    obs.record_observation(_listing("1"), local_cache=temp_cache)
+    obs.record_observation(_listing("2"), local_cache=temp_cache)
+    _, cursor, _ = obs.observations_since(since=0, local_cache=temp_cache)
+
+    obs.delete_observations([("facebook", "1")], local_cache=temp_cache)
+    delta, _, _ = obs.observations_since(since=cursor, local_cache=temp_cache)
+
+    assert [record["id"] for record in delta] == ["1"]
+    assert obs.is_deleted(delta[0])

@@ -261,6 +261,12 @@ def _update(
     try:
         with local.transact():
             record = local.get(key)
+            if isinstance(record, dict) and record.get("deleted"):
+                # Deleted from the dashboard on purpose. Seeing it again is the
+                # normal case -- the scraper has no memory of what the user threw
+                # away -- so the tombstone has to outrank the sighting, or the
+                # delete button would be undone by the very next search.
+                return None
             if not isinstance(record, dict):
                 record = _new_record(listing, _now())
             if not mutate(record):
@@ -374,6 +380,62 @@ def record_notification(
         return True
 
     return _update(listing, mutate, local_cache)
+
+
+# --------------------------------------------------------------------------- #
+# Deleting
+# --------------------------------------------------------------------------- #
+
+
+def is_deleted(record: Optional[Dict[str, Any]]) -> bool:
+    """Whether a record is a tombstone rather than a real observation."""
+    return isinstance(record, dict) and bool(record.get("deleted"))
+
+
+def delete_observations(
+    keys: List[Tuple[str, str]],
+    local_cache: Cache | None = None,
+) -> Tuple[int, int]:
+    """Remove listings from the dashboard, permanently.
+
+    The record is replaced by a tombstone rather than erased.  Two things need
+    it: the sync is "what changed since revision N?", so a deletion has to carry
+    a revision of its own or clients would keep the row until their next full
+    rebuild; and :func:`record_observation` consults it, so a listing the user
+    threw away does not walk back in on the next search.
+
+    Returns ``(deleted, revision)`` -- how many records were actually removed,
+    and where the store's revision counter ended up.  Keys that were already
+    gone (or already tombstoned) are not counted and burn no revision.
+    """
+    local = _resolve(local_cache)
+    deleted = 0
+    now = _now()
+    for marketplace, listing_id in keys:
+        if not marketplace or not listing_id:
+            continue
+        key = observation_key(marketplace, listing_id)
+        try:
+            with local.transact():
+                record = local.get(key)
+                if not isinstance(record, dict) or record.get("deleted"):
+                    continue
+                tombstone: Dict[str, Any] = {
+                    "marketplace": marketplace,
+                    "id": listing_id,
+                    "deleted": True,
+                    "deleted_at": now,
+                    "rev": _next_revision(local),
+                }
+                local.set(key, tombstone, tag=OBSERVATION_TAG)
+            _touch_index(local, marketplace, listing_id, int(tombstone["rev"]))
+            deleted += 1
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            logger.debug("Failed to delete observation %r", key, exc_info=True)
+            continue
+    return deleted, current_revision(local)
 
 
 # --------------------------------------------------------------------------- #
