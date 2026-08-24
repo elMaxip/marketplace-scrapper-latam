@@ -11,6 +11,7 @@ import asyncio
 import logging
 import mimetypes
 import os
+import re
 import secrets
 import socket
 import threading
@@ -34,6 +35,16 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from .. import control
+from ..config import supported_marketplaces
+from ..pause import is_paused, pause_state, run_state, set_paused
+from ..session import (
+    clear_session,
+    import_session,
+    parse_cookies,
+    rearm_import,
+    session_info,
+)
 from ..utils import cache
 from .auth import (
     CSRF_COOKIE,
@@ -49,8 +60,10 @@ from .auth import (
 from .config_api import ConfigFileService
 from .config_auth import extract_credentials
 from .found_export import iter_found_csv, iter_found_rows
-from .listings_api import build_sync_response
+from .listings_api import MAX_DELETE_KEYS, build_sync_response, delete_listings
+from .listings_export import iter_group_csv, iter_group_rows
 from .log_handler import LogBroadcastHandler
+from .scraper_state import config_sync, scraper_state
 
 # Ensure the vendored toml-edit-js WASM bundle is served with the right
 # Content-Type. Python's mimetypes module learned .wasm in 3.10 but
@@ -66,6 +79,19 @@ class WebUIConfig:
     port: int = 8467
     config_files: List[Path] = field(default_factory=list)
     log_handler: LogBroadcastHandler | None = None
+    #: Serve without a password even though the bind address is not loopback.
+    #:
+    #: There is exactly one situation this is for, and it is the reason it
+    #: exists: a container.  Inside Docker the server *must* bind 0.0.0.0 or
+    #: nothing outside the container can reach it -- including the web UI's own
+    #: container, one hop away on a private network -- and the bind address is
+    #: what the loopback rule reads.  So a perfectly private deployment looked
+    #: identical to one on the open internet, and the server refused to start.
+    #:
+    #: It is off by default and has to be asked for by name (``--webui-open``,
+    #: or ``AIMM_WEBUI_OPEN=1``), because saying "no password" is a decision
+    #: about who can reach the port, and only the person running it knows.
+    open_access: bool = False
 
 
 @dataclass
@@ -101,7 +127,11 @@ def _resolve_auth(config: WebUIConfig) -> tuple[AuthState, StartupInfo]:
     sections, then ``FACEBOOK_USERNAME`` / ``FACEBOOK_PASSWORD`` env
     vars.
     """
-    exposed = config.host not in ("127.0.0.1", "localhost", "::1")
+    # "Exposed" means "a password is required", and it is not quite the same
+    # question as "is the bind address loopback".  A container has to bind
+    # 0.0.0.0 to be reachable from the container next to it, which is not the
+    # same as being reachable from the internet -- so the operator can say so.
+    exposed = config.host not in ("127.0.0.1", "localhost", "::1") and not config.open_access
     state = AuthState()
     state.exposed = exposed
 
@@ -270,9 +300,41 @@ def create_app(
             "urls": _enumerate_urls(config.host, config.port),
             "auth_mode": "open" if is_open() else "authenticated",
             "open": is_open(),
+            "paused": is_paused(),
+            # Which of the three states the monitor is in, said by the monitor
+            # rather than pieced together by the interface from two booleans.
+            # "Pausar" and "Detener" do not have the same way back -- one is
+            # resumed, the other started again -- so the controls need to know
+            # which one happened, not merely that something is held back.
+            "run_state": run_state(),
+            # Everything the controls need in one poll: whether the pause was the
+            # forced kind, and whether a search is actually under way right now.
+            "pause": pause_state(),
+            "scraping": control.state(),
+            # What the loop is doing at the coarsest grain, and whether it has
+            # taken up the configuration that is on disk.  Both belong in the
+            # poll every screen already makes: a saved change the scraper has
+            # not read yet is worth saying wherever the user is looking.
+            "phase": control.phase(),
+            "config_sync": config_sync(list(config.config_files)),
             "vnc_enabled": os.environ.get("AIMM_ENABLE_VNC") == "1"
             and Path(os.environ.get("AIMM_NOVNC_DIR", "/usr/share/novnc")).is_dir(),
         }
+
+    @app.get("/api/scraper/state")
+    async def get_scraper_state(_: str = Depends(require_session)) -> Dict[str, Any]:
+        """What the scraper is doing, and on which configuration.
+
+        Deliberately separate from ``/api/status``, which answers "is the
+        monitor up and is it paused" and is polled by every screen.  This one
+        is the detailed picture, and only the screen showing it asks for it.
+
+        The two questions it exists to answer honestly are "which searches is
+        the scraper actually running" and "has it taken up the change I just
+        saved" -- both read from what the scraping thread reported, never
+        inferred from the file on disk.
+        """
+        return scraper_state(list(config.config_files))
 
     @app.get("/api/config/files")
     async def list_config_files(_: str = Depends(require_session)) -> Dict[str, Any]:
@@ -360,6 +422,268 @@ def create_app(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to touch config: {e}") from e
 
+    @app.get("/api/monitor/pause")
+    async def get_pause(_: str = Depends(require_session)) -> Dict[str, Any]:
+        return {**pause_state(), "run_state": run_state(), "scraping": control.state()}
+
+    @app.post("/api/monitor/pause")
+    async def post_pause(
+        body: Dict[str, Any],
+        _: str = Depends(require_session),
+        __: None = Depends(require_csrf),
+    ) -> Dict[str, Any]:
+        """Hold back searching, or release it.
+
+        Two kinds of stop, and both of them stop the search under way at its
+        next checkpoint -- within seconds, not whenever it happens to finish.
+        What separates them is what is left standing afterwards:
+
+        * plain (``force`` absent or false): the browsers, tabs and signed-in
+          sessions stay exactly as they are, so resuming costs one search
+          rather than one sign-in.  This is "Pausa".
+        * forced (``force: true``): every browser is closed and the resources
+          released.  This is "Detener", and there is nothing to resume into.
+
+        The stop is a request, not an act.  Playwright's objects belong to the
+        thread that made them, so this handler cannot close a page itself; it
+        raises a flag that the scraping loop reads within seconds.  ``scraping``
+        in the response is how the caller sees whether it has landed yet.
+        """
+        paused = body.get("paused")
+        if not isinstance(paused, bool):
+            raise HTTPException(status_code=400, detail="Missing boolean 'paused' field")
+        force = bool(body.get("force")) and paused
+        state = set_paused(paused, force=force)
+        if paused:
+            # Both kinds interrupt.  A pause that waited for the current search
+            # to finish was a pause that did nothing for the twenty minutes a
+            # Facebook pass takes, which is not what the word promises.
+            control.request_cancel(mode="stop" if force else "pause")
+        else:
+            # Resuming withdraws any stop that had not been acted on yet.
+            control.clear_cancel()
+        return {**state, "run_state": run_state(), "scraping": control.state()}
+
+    # ------------------------------------------------------------------
+    # Controlling the searches themselves
+    # ------------------------------------------------------------------
+    #
+    # Three buttons that all mean "not this, now" without meaning "stop the
+    # scraper".  Like every other cross-thread request here they are flags the
+    # scraping loop reads at its own checkpoints, so the answer is always "asked
+    # for", never "done" -- the caller watches `scraping` to see it land.
+
+    @app.post("/api/scraper/search/stop")
+    async def stop_search(
+        body: Dict[str, Any],
+        _: str = Depends(require_session),
+        __: None = Depends(require_csrf),
+    ) -> Dict[str, Any]:
+        """End one search early and move on to the next.
+
+        With ``marketplace``, only that platform of that product stops and the
+        rest of the product carries on.  Without it, the product is done for
+        this pass -- including the platforms it has not started yet, which is
+        the difference between stopping a search and stopping a page.
+
+        The scraper itself is untouched either way: no browser is closed, and
+        the next search starts as soon as this one unwinds.
+        """
+        item = body.get("item")
+        if not isinstance(item, str) or not item:
+            raise HTTPException(status_code=400, detail="Missing 'item' field")
+        marketplace = body.get("marketplace")
+        if marketplace is not None and not isinstance(marketplace, str):
+            raise HTTPException(status_code=400, detail="'marketplace' must be a string")
+        requested = control.request_search_stop(item, marketplace or None)
+        return {"ok": True, "stop": requested, "scraping": control.state()}
+
+    @app.post("/api/scraper/search/next")
+    async def choose_next_search(
+        body: Dict[str, Any],
+        _: str = Depends(require_session),
+        __: None = Depends(require_csrf),
+    ) -> Dict[str, Any]:
+        """Put one product at the head of the queue.  ``item: null`` clears it.
+
+        Deliberately does not touch the search under way: the promise is the
+        *next* one, and a button that cut off the current search would be the
+        one above.
+        """
+        item = body.get("item")
+        if item is not None and (not isinstance(item, str) or not item):
+            raise HTTPException(status_code=400, detail="'item' must be a name or null")
+        chosen = control.set_next_search(item)
+        return {"ok": True, "next_search": chosen, "scraping": control.state()}
+
+    @app.post("/api/monitor/run")
+    async def force_run(
+        _: str = Depends(require_session),
+        __: None = Depends(require_csrf),
+    ) -> Dict[str, Any]:
+        """Search everything now, whatever the schedule says.
+
+        Refused rather than queued while a search is already running: stacking a
+        second full pass on top of the first is the concurrent hammering of the
+        marketplace this is meant to avoid, and the caller can simply watch the
+        run that is already going.
+
+        This does not release the pause switch.  A paused monitor that was told
+        to search would be obeying two contradictory instructions; the caller
+        resumes first if that is what it means.
+        """
+        result = control.request_run(reason="web UI")
+        return {
+            "ok": True,
+            **result,
+            "paused": is_paused(),
+            "run_state": run_state(),
+            "scraping": control.state(),
+        }
+
+    # ------------------------------------------------------------------
+    # Marketplace sessions
+    # ------------------------------------------------------------------
+    #
+    # Some sites will not complete a sign-in inside an automated browser: the
+    # form is accepted and the visitor is quietly returned to the front page.
+    # Rather than fight that, the user can hand over a session established in
+    # their own browser.  Cookies are credential-equivalent, so they only ever
+    # travel *in*: nothing here can read one back out.
+
+    def _marketplace_sections() -> Dict[str, Dict[str, Any]]:
+        """Every ``[marketplace.*]`` section in the file, by name."""
+        from .config_api import scan_sections
+
+        try:
+            content, _mtime = config_service.read("primary")
+        except KeyError:
+            return {}
+        found: Dict[str, Dict[str, Any]] = {}
+        for section in scan_sections(content):
+            if section.prefix != "marketplace" or not section.suffix:
+                continue
+            found[section.suffix.strip("\"'")] = dict(section.fields or {})
+        return found
+
+    def _configured_marketplaces() -> Dict[str, str]:
+        """Marketplace name -> the implementation behind it.
+
+        Every platform this monitor supports is here whether or not the file
+        mentions it: a platform is a capability, not something the user adds,
+        and a session panel that listed only the platforms someone had already
+        declared was empty exactly when it was needed.
+
+        Sections are still read, because one may be named something other than
+        its platform (``[marketplace.houston]`` with ``market_type =
+        "facebook"``) and the session belongs to the name every other part of
+        the monitor stores under.
+        """
+        found: Dict[str, str] = {name: name for name in supported_marketplaces}
+        for name, fields in _marketplace_sections().items():
+            declared = str(fields.get("market_type") or "") or name
+            if declared.lower() in supported_marketplaces:
+                found[name] = declared.lower()
+        return found
+
+    def _marketplace_class(name: str) -> Any:
+        """The implementation behind a configured marketplace section."""
+        kind = _configured_marketplaces().get(name)
+        return supported_marketplaces.get(kind) if kind else None
+
+    @app.get("/api/marketplace/sessions")
+    async def list_sessions(_: str = Depends(require_session)) -> Dict[str, Any]:
+        """What is stored for each marketplace, and never what it contains.
+
+        ``credentials`` is the other way a platform can be signed in: a
+        username and a password in the config, which Facebook can still use.
+        Reported alongside the stored session so the interface can say "this
+        platform will be searched anonymously" without having to read the
+        config file and guess.
+        """
+        sections = _marketplace_sections()
+        result: Dict[str, Any] = {}
+        for name in sorted(_configured_marketplaces()):
+            fields = sections.get(name, {})
+            result[name] = {
+                **session_info(name),
+                "credentials": bool(fields.get("username")) and bool(fields.get("password")),
+            }
+        return {"sessions": result}
+
+    @app.post("/api/marketplace/{name}/session")
+    def put_marketplace_session(
+        name: str,
+        body: Dict[str, Any],
+        _: str = Depends(require_session),
+        __: None = Depends(require_csrf),
+    ) -> Dict[str, Any]:
+        """Import a session for one marketplace from pasted cookies.
+
+        Sync def: it writes a file and reads the config, which is blocking work.
+        Accepts a cookie-manager export, a Playwright ``storageState``, or the
+        bare ``Cookie:`` header line -- whichever the user's tools produce.
+        """
+        marketplace = _marketplace_class(name)
+        if marketplace is None:
+            raise HTTPException(status_code=404, detail=f"Unknown marketplace {name!r}")
+        raw = body.get("cookies")
+        if not isinstance(raw, str):
+            raise HTTPException(status_code=400, detail="Missing 'cookies' text")
+
+        domains = marketplace.session_domains()
+        try:
+            cookies = parse_cookies(raw, default_domain=domains[0] if domains else "")
+            result = import_session(name, cookies, domains)
+        except ValueError as error:
+            # The user's paste was the wrong thing, which is a thing to say
+            # rather than a server fault.
+            raise HTTPException(status_code=400, detail=str(error)) from None
+        if not result["ok"]:
+            raise HTTPException(status_code=500, detail="Could not write the session file")
+
+        # The browser belongs to the scraping thread; it loads these itself.
+        control.request_session_import(name)
+        # Stored now, live shortly: the monitor loads it between jobs, so a
+        # search under way finishes on the session it started with.
+        return {**result, "session": session_info(name), "pending": True}
+
+    @app.post("/api/marketplace/{name}/session/apply")
+    def reapply_marketplace_session(
+        name: str,
+        _: str = Depends(require_session),
+        __: None = Depends(require_csrf),
+    ) -> Dict[str, Any]:
+        """Load the stored session into the browser again.
+
+        For a session that is still good but is no longer in the profile -- the
+        site logged us out, or the monitor was restarted with a profile that
+        never took the import.  Nothing is re-pasted: the cookies are already
+        here.
+        """
+        if _marketplace_class(name) is None:
+            raise HTTPException(status_code=404, detail=f"Unknown marketplace {name!r}")
+        if not rearm_import(name):
+            raise HTTPException(status_code=404, detail="No hay una sesión guardada que aplicar.")
+        control.request_session_import(name)
+        return {"ok": True, "pending": True, "session": session_info(name)}
+
+    @app.delete("/api/marketplace/{name}/session")
+    def delete_marketplace_session(
+        name: str,
+        _: str = Depends(require_session),
+        __: None = Depends(require_csrf),
+    ) -> Dict[str, Any]:
+        """Forget a stored session.
+
+        The cookies already loaded into the running browser stay there until it
+        is restarted -- this removes what would be replayed, not what is live.
+        """
+        if _marketplace_class(name) is None:
+            raise HTTPException(status_code=404, detail=f"Unknown marketplace {name!r}")
+        clear_session(name)
+        return {"ok": True, "session": session_info(name)}
+
     @app.get("/api/logs")
     async def get_logs(
         limit: int = 500,
@@ -425,7 +749,14 @@ def create_app(
                 if not session or sessions.validate(session) is None:
                     await websocket.close(code=4401)
                     return
-            await websocket.accept(subprotocol="binary")
+            # Echoed, never asserted.  RFC 6455 requires a client to fail the
+            # connection when the server names a subprotocol it did not offer,
+            # and noVNC stopped offering "binary" at 1.3 -- so answering every
+            # client with it meant the browser closed the socket itself and
+            # noVNC showed "Failed to connect to server", with nothing wrong at
+            # either end of the VNC connection underneath.
+            offered = websocket.scope.get("subprotocols") or []
+            await websocket.accept(subprotocol="binary" if "binary" in offered else None)
             try:
                 reader, writer = await asyncio.open_connection(vnc_host, vnc_port)
             except OSError:
@@ -491,6 +822,53 @@ def create_app(
     ) -> Dict[str, Any]:
         """Incremental feed of observed listings for the dashboard's IndexedDB."""
         return build_sync_response(cache, since=since, limit=limit)
+
+    # Sync def like the sync feed above: walking the observation store is
+    # blocking SQLite work, and the body streams row by row so exporting a large
+    # group never holds the whole CSV in memory.
+    @app.get("/api/listings/export.csv")
+    def export_group_csv(
+        item: str,
+        _: str = Depends(require_session),
+    ) -> StreamingResponse:
+        """Every listing of one search item, as a spreadsheet.
+
+        ``item`` is the search item's name -- the thing the dashboard groups by.
+        The whole group is exported, not the page being looked at, because the
+        rows come from the store rather than from the client.
+        """
+        if not item.strip():
+            raise HTTPException(status_code=400, detail="Missing 'item' query parameter")
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "-", item.strip()).strip("-") or "grupo"
+        filename = f"{safe}-{time.strftime('%Y%m%d-%H%M%S')}.csv"
+        return StreamingResponse(
+            iter_group_csv(iter_group_rows(cache, item)),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # Sync def for the same reason as the two above: deleting walks the cache
+    # under a transaction per key, which is blocking work.
+    @app.post("/api/listings/delete")
+    def listings_delete(
+        body: Dict[str, Any],
+        _: str = Depends(require_session),
+        __: None = Depends(require_csrf),
+    ) -> Dict[str, Any]:
+        """Delete listings from the dashboard by their ``marketplace:id`` keys.
+
+        Permanent: the monitor will not re-record a deleted listing even when a
+        later search turns it up again.
+        """
+        keys = body.get("keys")
+        if not isinstance(keys, list):
+            raise HTTPException(status_code=400, detail="Missing 'keys' array")
+        if len(keys) > MAX_DELETE_KEYS:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Too many keys in one request (max {MAX_DELETE_KEYS})",
+            )
+        return delete_listings(cache, keys)
 
     return app
 
@@ -561,6 +939,16 @@ def start_webui(
     if config.log_handler is None:
         raise ValueError("WebUIConfig.log_handler is required")
     state, info = _resolve_auth(config)
+
+    if config.open_access and config.host not in ("127.0.0.1", "localhost", "::1"):
+        # Said out loud every time, because it is the one setting whose whole
+        # effect is invisible until somebody else finds the port.
+        (logger or logging.getLogger("monitor")).warning(
+            f"The web UI is listening on {config.host}:{config.port} with no password, "
+            "because --webui-open (or AIMM_WEBUI_OPEN) was set. Only do this when "
+            "something else keeps the port private -- a container network, a firewall, "
+            "or a reverse proxy that authenticates."
+        )
 
     # --webui-host requires credentials. Refuse to expose without auth.
     if state.exposed and state.auth is None:

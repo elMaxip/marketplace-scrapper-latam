@@ -17,7 +17,7 @@ else:  # pragma: no cover
     import tomli as tomllib
 
 from ..config import Config
-from .secrets_redact import SecretMap, redact, restore
+from .secrets_redact import SecretMap, has_mask, redact, restore
 
 
 @dataclass
@@ -131,8 +131,8 @@ class ConfigFileService:
         self._editable: Path = config_files[-1].expanduser().resolve()
         self._all: List[Path] = [p.expanduser().resolve() for p in config_files]
         self._logger = logger
-        # Most recent secret map, populated on every read() call. Write()
-        # uses this to round-trip "<REDACTED>" masks back to real values.
+        # Most recent secret map. Kept as a cache of what is on disk, and never
+        # relied on as the only copy: see _restore_masks.
         self._secrets: SecretMap = {}
 
     @property
@@ -158,13 +158,39 @@ class ConfigFileService:
         self._secrets = secrets
         return redacted, self._editable.stat().st_mtime
 
+    def _restore_masks(self, content: str) -> str:
+        """Turn round-tripped "<REDACTED>" back into the real secrets.
+
+        The secrets are read from the file *now* rather than taken from
+        whatever the last :meth:`read` happened to leave behind. The cached map
+        is an optimisation, and treating it as the only copy made a browser tab
+        that outlived a monitor restart unable to save: the new process had
+        never read the file, its map was empty, every mask passed through
+        untouched, and the loader rejected the write with a complaint about a
+        token the user had not even opened the form to look at.
+
+        A file with no masks in it is left alone, so the ordinary save — where
+        nothing sensitive is configured at all — costs no extra read.
+        """
+        if not has_mask(content):
+            return content
+        try:
+            _redacted, secrets = redact(self._editable.read_text(encoding="utf-8"))
+        except OSError:
+            # Unreadable this instant; the cached map is better than nothing,
+            # and the write below will fail on its own terms if it is wrong.
+            secrets = self._secrets
+        if secrets:
+            self._secrets = secrets
+        return restore(content, self._secrets)
+
     def validate(self, content: str) -> Tuple[bool, str | None]:
         """Parse the given content using the real Config loader.
 
         Masks in ``content`` are first restored to their real values so we
         validate what will actually be written.
         """
-        restored = restore(content, self._secrets)
+        restored = self._restore_masks(content)
         tmp_dir = self._editable.parent
         tmp = tempfile.NamedTemporaryFile(
             mode="w",
@@ -208,7 +234,7 @@ class ConfigFileService:
 
         # Restore masks before validating and writing so round-tripped
         # "<REDACTED>" tokens become the real secret values on disk.
-        restored = restore(content, self._secrets)
+        restored = self._restore_masks(content)
 
         ok, error = self.validate(restored)
         if not ok:

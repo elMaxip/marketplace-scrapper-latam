@@ -17,17 +17,27 @@ instead of forcing a full re-sync.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from diskcache import Cache  # type: ignore
 
-from ..observations import current_revision, observations_since, store_epoch
+from ..observations import (
+    current_revision,
+    delete_observations,
+    observations_since,
+    store_epoch,
+)
 
 #: Cap on records per response.  Big enough that a first sync of a few thousand
 #: listings finishes in a handful of round trips, small enough that no single
 #: response has to hold tens of thousands of descriptions in memory.
 DEFAULT_LIMIT = 500
 MAX_LIMIT = 2000
+
+#: Cap on one delete request.  "Select all and delete" over a large filtered
+#: selection is a legitimate thing to do, so this is generous; it exists only so
+#: a single request cannot pin the cache in a transaction loop indefinitely.
+MAX_DELETE_KEYS = 5000
 
 #: Fields lifted out of the stored ``Listing`` snapshot.
 _SNAPSHOT_FIELDS = (
@@ -51,12 +61,25 @@ def _fallback_url(marketplace: str, listing_id: str) -> str:
 
 
 def serialize_record(record: Dict[str, Any]) -> Dict[str, Any]:
-    """Flatten one observation into the shape the client stores."""
+    """Flatten one observation into the shape the client stores.
+
+    A deleted listing is sent as a bare marker rather than an empty row: the
+    client drops it from its store, so every other field would be dead weight.
+    """
     snapshot = record.get("listing")
     if not isinstance(snapshot, dict):
         snapshot = {}
     marketplace = str(record.get("marketplace") or "")
     listing_id = str(record.get("id") or "")
+
+    if record.get("deleted"):
+        return {
+            "key": f"{marketplace}:{listing_id}",
+            "marketplace": marketplace,
+            "id": listing_id,
+            "rev": int(record.get("rev") or 0),
+            "deleted": True,
+        }
 
     row: Dict[str, Any] = {
         "key": f"{marketplace}:{listing_id}",
@@ -86,6 +109,42 @@ def clamp_limit(limit: Optional[int]) -> int:
     if not limit or limit <= 0:
         return DEFAULT_LIMIT
     return min(int(limit), MAX_LIMIT)
+
+
+def parse_key(key: Any) -> Optional[Tuple[str, str]]:
+    """Split a client's ``"<marketplace>:<id>"`` row key back into its parts.
+
+    ``partition`` rather than ``split``: a marketplace id is free-form and may
+    itself contain a colon, and only the first one separates the two halves.
+    """
+    if not isinstance(key, str):
+        return None
+    marketplace, separator, listing_id = key.partition(":")
+    if not separator or not marketplace or not listing_id:
+        return None
+    return marketplace, listing_id
+
+
+def delete_listings(local_cache: Cache, keys: Iterable[Any]) -> Dict[str, Any]:
+    """Delete the listings behind a set of client row keys.
+
+    Unparseable keys are counted as ``skipped`` rather than rejecting the whole
+    request: a bulk delete of a thousand rows should not fail wholesale because
+    one of them was malformed.
+    """
+    requested = list(keys)
+    parsed: List[Tuple[str, str]] = []
+    for key in requested:
+        pair = parse_key(key)
+        if pair is not None:
+            parsed.append(pair)
+    deleted, revision = delete_observations(parsed, local_cache=local_cache)
+    return {
+        "deleted": deleted,
+        "requested": len(requested),
+        "skipped": len(requested) - deleted,
+        "revision": revision,
+    }
 
 
 def build_sync_response(

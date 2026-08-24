@@ -15,6 +15,8 @@ from ai_marketplace_monitor.webui.listings_api import (
     MAX_LIMIT,
     build_sync_response,
     clamp_limit,
+    delete_listings,
+    parse_key,
     serialize_record,
 )
 
@@ -132,3 +134,65 @@ def test_empty_store_reports_a_usable_cursor(temp_cache: Cache) -> None:
     assert payload["count"] == 0
     assert payload["revision"] == 0
     assert payload["cursor"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Deleting
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_key_splits_on_the_first_colon() -> None:
+    assert parse_key("facebook:123") == ("facebook", "123")
+    # Listing ids are opaque; only the first colon separates the two halves.
+    assert parse_key("facebook:12:34") == ("facebook", "12:34")
+
+
+@pytest.mark.parametrize("bad", ["", "facebook", "facebook:", ":123", None, 7, ["facebook:1"]])
+def test_parse_key_rejects_malformed_keys(bad: object) -> None:
+    assert parse_key(bad) is None
+
+
+def test_serialize_reduces_a_deleted_record_to_a_marker() -> None:
+    row = serialize_record(
+        {"marketplace": "facebook", "id": "9", "deleted": True, "deleted_at": "now", "rev": 4}
+    )
+    assert row == {
+        "key": "facebook:9",
+        "marketplace": "facebook",
+        "id": "9",
+        "rev": 4,
+        "deleted": True,
+    }
+
+
+def test_delete_listings_counts_what_it_removed(temp_cache: Cache) -> None:
+    obs.record_observation(_listing("1"), local_cache=temp_cache)
+    obs.record_observation(_listing("2"), local_cache=temp_cache)
+
+    result = delete_listings(temp_cache, ["facebook:1", "facebook:2"])
+    assert result["deleted"] == 2
+    assert result["requested"] == 2
+    assert result["skipped"] == 0
+    assert result["revision"] > 0
+
+
+def test_delete_listings_survives_junk_in_the_batch(temp_cache: Cache) -> None:
+    """One malformed key must not sink the other 999 in a bulk delete."""
+    obs.record_observation(_listing("1"), local_cache=temp_cache)
+
+    result = delete_listings(temp_cache, ["facebook:1", "garbage", "facebook:missing"])
+    assert result["deleted"] == 1
+    assert result["requested"] == 3
+    assert result["skipped"] == 2
+
+
+def test_sync_hands_the_deletion_to_the_client(temp_cache: Cache) -> None:
+    obs.record_observation(_listing("1"), local_cache=temp_cache)
+    first = build_sync_response(temp_cache, since=0)
+
+    delete_listings(temp_cache, ["facebook:1"])
+    delta = build_sync_response(temp_cache, since=first["cursor"])
+
+    assert delta["count"] == 1
+    assert delta["records"][0]["deleted"] is True
+    assert delta["records"][0]["key"] == "facebook:1"

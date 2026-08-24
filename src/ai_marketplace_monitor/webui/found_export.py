@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import re
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from diskcache import Cache  # type: ignore
@@ -46,6 +47,9 @@ NotifiedRow = Tuple[str, str, str, str, Optional[str], Optional[str]]
 # Leading characters a spreadsheet may interpret as a formula.
 _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
+# A plain signed number, which the guard below must not touch.
+_PLAIN_NUMBER = re.compile(r"[+-]?\d+(?:\.\d+)?")
+
 
 def _normalize_notified(value: Any) -> Tuple[str, Optional[str], Optional[str]]:
     """Return (date, listing_hash, price) from a USER_NOTIFIED cache value.
@@ -70,7 +74,7 @@ def _fallback_url(marketplace: str, listing_id: str) -> str:
     return ""
 
 
-def _sanitize(value: str) -> str:
+def sanitize_cell(value: str) -> str:
     """Neutralize spreadsheet formula triggers in an untrusted CSV cell.
 
     Listing fields (title, seller, AI comment, ...) are scraped, attacker-
@@ -78,9 +82,35 @@ def _sanitize(value: str) -> str:
     formula when opened in Excel/Sheets, so such cells are prefixed with a
     single quote (OWASP CSV-injection guidance).
     """
-    if value and value[0] in _FORMULA_PREFIXES:
-        return "'" + value
-    return value
+    if not value or value[0] not in _FORMULA_PREFIXES:
+        return value
+    # "-20000" is a negative number, not a formula, and quoting it turns a
+    # column a spreadsheet could add up into a column of text. The rule is about
+    # a leading operator followed by *something else*; a bare number is safe.
+    if _PLAIN_NUMBER.fullmatch(value):
+        return value
+    return "'" + value
+
+
+#: Kept under its old private name for callers inside this module.
+_sanitize = sanitize_cell
+
+
+def iter_csv(rows: Iterable[Dict[str, str]], columns: List[str]) -> Iterator[str]:
+    """Yield CSV text incrementally (header first), one chunk per row.
+
+    Shared by every export here: cells are quoted by the csv module (so a comma,
+    a quote or a newline inside a scraped title survives intact) and sanitized
+    against spreadsheet formula injection.  ``newline=""`` keeps the csv
+    module's line terminators from being doubled.
+    """
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    yield _drain(buffer)
+    for row in rows:
+        writer.writerow({key: sanitize_cell(value) for key, value in row.items()})
+        yield _drain(buffer)
 
 
 def _collect_needed(
@@ -203,18 +233,8 @@ def _drain(buffer: io.StringIO) -> str:
 
 
 def iter_found_csv(rows: Iterable[Dict[str, str]]) -> Iterator[str]:
-    """Yield CSV text incrementally (header first), one chunk per row.
-
-    Cells are sanitized against spreadsheet formula injection.  ``newline=""``
-    keeps the csv module's line terminators intact.
-    """
-    buffer = io.StringIO(newline="")
-    writer = csv.DictWriter(buffer, fieldnames=CSV_COLUMNS, extrasaction="ignore")
-    writer.writeheader()
-    yield _drain(buffer)
-    for row in rows:
-        writer.writerow({key: _sanitize(value) for key, value in row.items()})
-        yield _drain(buffer)
+    """Yield the found-items CSV incrementally (header first)."""
+    return iter_csv(rows, CSV_COLUMNS)
 
 
 def rows_to_csv(rows: Iterable[Dict[str, str]]) -> str:

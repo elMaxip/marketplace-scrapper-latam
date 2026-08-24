@@ -191,3 +191,35 @@ def test_write_new_secret_over_mask(config_file: Path) -> None:
     on_disk = config_file.read_text(encoding="utf-8")
     assert "new-user@example.com" in on_disk
     assert "user@example.com" not in on_disk.replace("new-user@example.com", "")
+
+
+def test_saving_works_on_a_service_that_has_never_read_the_file(tmp_path: Path) -> None:
+    """A browser tab that outlived a monitor restart must still be able to save.
+
+    The secret map is filled in by `read`, and the tab has no idea a *new*
+    process is answering it: it PUTs the content it fetched from the old one,
+    masks and all. With an empty map every "<REDACTED>" passed straight through
+    and the loader rejected the write — complaining about a token the user had
+    not opened the form to look at, which is about as far from the actual cause
+    as an error message can get.
+    """
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[user.me]\ntelegram_token = "12345:abcdef"\ntelegram_chat_id = "42"\n',
+        encoding="utf-8",
+    )
+    reader = ConfigFileService([path])
+    redacted, mtime = reader.read("primary")
+    assert "<REDACTED>" in redacted
+
+    # A different service over the same file: the restart, in one line.
+    fresh = ConfigFileService([path])
+    edited = redacted.replace('telegram_chat_id = "42"', 'telegram_chat_id = "43"')
+    _new_mtime, ok, error = fresh.write("primary", edited, mtime)
+
+    assert ok, error
+    written = path.read_text(encoding="utf-8")
+    # The secret survived untouched, and the edit landed.
+    assert 'telegram_token = "12345:abcdef"' in written
+    assert 'telegram_chat_id = "43"' in written
+    assert "<REDACTED>" not in written

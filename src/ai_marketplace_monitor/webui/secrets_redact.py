@@ -27,7 +27,7 @@ should split secrets into a separate file (planned follow-up).
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 # The literal we render in place of real secret values.
 MASK = "<REDACTED>"
@@ -65,6 +65,30 @@ def _is_sensitive(key: str) -> bool:
     if k in _SENSITIVE_EXACT:
         return True
     return any(s in k for s in _SENSITIVE_SUBSTRINGS)
+
+
+def is_sensitive_key(key: str) -> bool:
+    """Whether a key's value must not reach a browser.  Same rule as the file scanner."""
+    return _is_sensitive(key)
+
+
+def redact_tree(value: Any) -> Any:
+    """The same masking, applied to a parsed structure rather than to text.
+
+    The file scanner works line by line because it has to put the real values
+    back on the way in.  Nothing goes back in here -- this is the resolved
+    configuration the scraper is running, which is read-only -- so a walk over
+    the structure is enough, and it catches the shapes the line scanner
+    deliberately gives up on (lists, nested tables).
+    """
+    if isinstance(value, dict):
+        return {
+            key: (MASK if is_sensitive_key(str(key)) and item not in (None, "") else redact_tree(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_tree(item) for item in value]
+    return value
 
 
 def redact(content: str) -> Tuple[str, SecretMap]:
