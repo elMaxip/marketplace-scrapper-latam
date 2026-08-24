@@ -1,3 +1,9 @@
+# Everything the image does not need, kept out of the build context.
+#
+# Two reasons, and the second is the one that bites: a smaller context is a
+# faster build, but a context that changes is a *cache miss*, and `.git`,
+# `__pycache__` and a profiling dump change constantly.  Leaving them in meant
+# every build re-installed every dependency.
 .git
 .github
 .claude
@@ -15,6 +21,19 @@ htmlcov
 dist
 build
 *.egg-info
+docs
 docs/_build
 tests
+conftest.py
+noxfile.py
+tasks.py
 program.prof
+*.prof
+uv.lock
+CHANGELOG.md
+Dockerfile
+.dockerignore
+docker-compose.yml
+# Debug dumps the scraper writes beside itself when a page will not parse.
+debug_*.html
+_diag*.py
