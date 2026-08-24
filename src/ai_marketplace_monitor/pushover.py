@@ -13,6 +13,11 @@ from .utils import hilight
 class PushoverNotificationConfig(PushNotificationConfig):
     notify_method = "pushover"
     required_fields: ClassVar[List[str]] = ["pushover_user_key", "pushover_api_token"]
+    #: Pushover refuses a message over this.  `send_message` below has always
+    #: split on it as a last resort; declaring it here means the cards are
+    #: built to fit in the first place, so the split is rarely reached and no
+    #: longer cuts a listing in half when it is.
+    message_limit: ClassVar[int | None] = 1024
 
     pushover_user_key: str | None = None
     pushover_api_token: str | None = None

@@ -1,4 +1,3 @@
-import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from logging import Logger
@@ -10,13 +9,22 @@ from .ai import AIResponse  # type: ignore
 from .email_notify import EmailNotificationConfig
 from .listing import Listing
 from .marketplace import TItemConfig
+from .messages import build_card
 from .notification import NotificationConfig, NotificationStatus
 from .observations import record_notification
 from .ntfy import NtfyNotificationConfig
 from .pushbullet import PushbulletNotificationConfig
 from .pushover import PushoverNotificationConfig
 from .telegram import TelegramNotificationConfig
-from .utils import CacheType, CounterItem, cache, convert_to_seconds, counter, hilight
+from .utils import (
+    CacheType,
+    CounterItem,
+    cache,
+    convert_to_seconds,
+    counter,
+    hilight,
+    price_value,
+)
 
 
 @dataclass
@@ -109,18 +117,24 @@ class User:
         record_notification(listing, self.name, local_cache=local_cache)
 
     def _is_discounted(self: "User", old_price: str | None, new_price: str | None) -> bool:
-        def to_price(price_str: str | None):
-            if not price_str or price_str == "**unspecified**":
-                # invalid price is "very expensive", the new one might be cheaper.
-                return 999999999
-            matched = re.match(r"(\D*)\d+", price_str)
-            if matched:
-                currency = matched.group(1).strip()
-                price_str = price_str.replace(currency, "")
-            try:
-                return float(price_str.replace(",", "").replace(" ", ""))
-            except:
-                return 999999999
+        """Whether the listing is cheaper now than when the user was notified.
+
+        Parsing goes through :func:`price_value`, which understands the formats
+        the scraper actually stores -- including the space-grouped thousands
+        Facebook uses for CLP ("450\u00a0000") and the "current | original"
+        pair.  The parser this replaced stripped plain spaces only, so every
+        Chilean price failed to convert and no price drop was ever noticed.
+
+        A price that cannot be read counts as infinitely expensive, which keeps
+        the original intent: an unreadable *old* price must not hide a real
+        drop, and an unreadable *new* one must not be reported as one.  Infinity
+        rather than a large constant, because a real price can exceed any
+        constant -- the previous 999999999 is an ordinary asking price in COP.
+        """
+
+        def to_price(price_str: str | None) -> float:
+            value = price_value(price_str)
+            return float("inf") if value is None else value
 
         return to_price(old_price) > to_price(new_price)
 
@@ -162,6 +176,35 @@ class User:
             NotificationStatus.NOTIFIED if expired > datetime.now() else NotificationStatus.EXPIRED
         )
 
+    def last_notification(
+        self: "User", listing: Listing, local_cache: Cache | None = None
+    ) -> Tuple[datetime | None, str | None]:
+        """When this user was last told about this listing, and at what price.
+
+        The price is the whole reason this exists.  It is already in the cache
+        -- :meth:`notification_status` reads it to decide whether a listing got
+        cheaper -- but it was thrown away immediately afterwards, so a message
+        could say "discounted" without being able to say discounted *from what*.
+        Both halves are optional: entries written by older versions hold only a
+        date, and one written before there was a price holds no price.
+        """
+        notified = (cache if local_cache is None else local_cache).get(
+            self.notified_key(listing)
+        )
+        if notified is None:
+            return None, None
+        if isinstance(notified, str):
+            stamp, price = notified, None
+        elif len(notified) == 2:
+            stamp, price = notified[0], None
+        else:
+            stamp, price = notified[0], notified[2]
+        try:
+            when = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            when = None
+        return when, price if isinstance(price, str) else None
+
     def time_since_notification(
         self: "User", listing: Listing, local_cache: Cache | None = None
     ) -> int:
@@ -180,7 +223,18 @@ class User:
         item_config: TItemConfig,
         local_cache: Cache | None = None,
         force: bool = False,
+        language: str | None = None,
+        marketplace_label: str | None = None,
+        description_words: int | None = None,
     ) -> None:
+        """Tell this user about these listings, once, through every channel.
+
+        The cards are built here rather than inside the channels because this
+        is the only place that can see the two facts that make a notification
+        worth reading: what the user was last told this listing cost, which
+        lives in this user's own cache entry, and which language to say it in.
+        A channel asked to build its own card would have neither.
+        """
         if self.config.enabled is False:
             if self.logger:
                 self.logger.info(
@@ -188,9 +242,31 @@ class User:
                 )
             return
         statuses = [self.notification_status(listing, local_cache) for listing in listings]
+        cards = []
+        for listing, rating, status in zip(listings, ratings, statuses):
+            when, price = self.last_notification(listing, local_cache)
+            cards.append(
+                build_card(
+                    listing,
+                    rating,
+                    status,
+                    previous_price=price,
+                    notified_at=when,
+                    language=language,
+                    marketplace_label=marketplace_label,
+                )
+            )
 
         if NotificationConfig.notify_all(
-            self.config, listings, ratings, statuses, force=force, logger=self.logger
+            self.config,
+            listings,
+            ratings,
+            statuses,
+            force=force,
+            logger=self.logger,
+            cards=cards,
+            language=language,
+            description_words=description_words,
         ):
             counter.increment(CounterItem.NOTIFICATIONS_SENT, item_config.name)
             for listing, ns in zip(listings, statuses):

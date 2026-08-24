@@ -6,10 +6,16 @@ from enum import Enum
 from logging import Logger
 from typing import Any, ClassVar, DefaultDict, Deque, List, Optional, Tuple, Type
 
-import inflect
-
 from .ai import AIResponse  # type: ignore
 from .listing import Listing
+from .messages import (
+    DEFAULT_DESCRIPTION_WORDS,
+    PLAIN,
+    ListingCard,
+    build_card,
+    summary_title,
+    truncate_description,
+)
 from .utils import BaseConfig, hilight
 
 
@@ -24,6 +30,17 @@ class NotificationStatus(Enum):
 @dataclass
 class NotificationConfig(BaseConfig):
     required_fields: ClassVar[List[str]] = []
+
+    #: The most characters this channel will carry in one message, or None
+    #: when it has no meaningful limit.
+    #:
+    #: A fact about the service, not a preference, which is why it is a class
+    #: attribute and not a configurable field: Telegram refuses a message over
+    #: 4096 characters with "Message is too long", and no amount of the user
+    #: wanting a longer one changes that.  Every channel that has a limit
+    #: declares it here so the one place that renders a message can make it
+    #: fit -- see :meth:`ai_marketplace_monitor.messages.ListingCard.render_within`.
+    message_limit: ClassVar[int | None] = None
 
     max_retries: int = 5
     retry_delay: int = 60
@@ -287,6 +304,15 @@ class PushNotificationConfig(NotificationConfig):
     notify_method = "push_notification"
     message_format: str | None = None
     with_description: int | None = None
+    #: How many words of the seller's own text a notification carries.
+    #:
+    #: ``None`` means "whatever the monitor was configured with"
+    #: (``[monitor] max_description_words``, 25 by default); the field exists
+    #: on the channel as well so one user can be told more or less than
+    #: another without changing the system-wide answer.  Zero or below is
+    #: "no limit", which has to stay expressible or the limit could not be
+    #: switched off.
+    max_description_words: int | None = None
 
     def handle_message_format(self: "PushNotificationConfig") -> None:
         if self.message_format is None:
@@ -307,6 +333,16 @@ class PushNotificationConfig(NotificationConfig):
         if not isinstance(self.with_description, int) or self.with_description < 0:
             raise ValueError("with_description must be a boolean or a positive integer number.")
 
+    def handle_max_description_words(self: "PushNotificationConfig") -> None:
+        if self.max_description_words is None:
+            return
+        if self.max_description_words is True:
+            self.max_description_words = DEFAULT_DESCRIPTION_WORDS
+        elif self.max_description_words is False:
+            self.max_description_words = 0
+        if not isinstance(self.max_description_words, int):
+            raise ValueError("max_description_words must be a number of words, or false.")
+
     def notify(
         self: "PushNotificationConfig",
         listings: List[Listing],
@@ -314,98 +350,145 @@ class PushNotificationConfig(NotificationConfig):
         notification_status: List[NotificationStatus],
         force: bool = False,
         logger: Logger | None = None,
+        cards: List[ListingCard] | None = None,
+        language: str | None = None,
+        description_words: int | None = None,
     ) -> bool:
+        """Tell this channel about the listings it has not been told about.
+
+        The message itself is not built here any more.  Each listing becomes a
+        :class:`~ai_marketplace_monitor.messages.ListingCard` -- the facts,
+        resolved, nothing rendered -- and the channel renders it in whatever it
+        can show.  That indirection is what lets Telegram attach the listing's
+        photo: the card still knows which listing it is, which a pre-joined
+        block of text for six listings does not.
+
+        ``cards`` come from :meth:`ai_marketplace_monitor.user.User.notify`,
+        which is the only caller that can see the previous price and the
+        language.  Built here from the listings alone when it does not -- the
+        message is then simply missing the "was 399.990" line, which is the
+        honest result of not knowing it.
+        """
         if not self._has_required_fields():
             if logger:
                 logger.debug(
-                    f"Missing required fields  {', '.join(self.required_fields)}. No {self.notify_method} notification sent."
+                    f"Missing required fields  {', '.join(self.required_fields)}. "
+                    f"No {self.notify_method} notification sent."
                 )
             return False
-        #
-        # we send listings with different status with different messages
-        msgs: DefaultDict[NotificationStatus, List[Tuple[Listing, str]]] = defaultdict(list)
-        p = inflect.engine()
-        for listing, rating, ns in zip(listings, ratings, notification_status):
-            if ns == NotificationStatus.NOTIFIED and not force:
+
+        if cards is None:
+            cards = [
+                build_card(listing, rating, status, language=language)
+                for listing, rating, status in zip(listings, ratings, notification_status)
+            ]
+
+        # Grouped by what happened to them, because that is what the one line a
+        # phone shows on the lock screen has to say: three new listings and one
+        # that got cheaper are two different pieces of news.
+        batches: DefaultDict[NotificationStatus, List[Tuple[Listing, ListingCard]]]
+        batches = defaultdict(list)
+        for listing, card, status in zip(listings, cards, notification_status):
+            if status == NotificationStatus.NOTIFIED and not force:
                 continue
-            if self.with_description is None:
-                desc = listing.description
-            elif self.with_description == 0:
-                desc = ""
-            elif self.with_description == 1 or len(listing.description) < self.with_description:
-                desc = listing.description
-            else:
-                desc = listing.description[: self.with_description] + "..."
+            card.description = self._description_for(listing, description_words)
+            batches[status].append((listing, card))
 
-            if self.message_format == "plain_text":
-                desc_newline = "\n" if desc else ""
-                msg = (
-                    (
-                        f"{listing.title}\n{listing.price}, {listing.location}\n"
-                        f"{listing.post_url.split('?')[0]}{desc_newline}{desc}"
-                    )
-                    if rating.comment == AIResponse.NOT_EVALUATED
-                    else (
-                        f"[{rating.conclusion} ({rating.score})] {listing.title}\n"
-                        f"{listing.price}, {listing.location}\n"
-                        f"{listing.post_url.split('?')[0]}\n{desc}{desc_newline}"
-                        f"\nAI: {rating.comment}"
-                    )
-                )
-            elif self.message_format == "markdown":
-                desc_newline = "\n" if desc else ""
-                msg = (
-                    (
-                        f"[**{listing.title}**]({listing.post_url.split('?')[0]})\n"
-                        f"{listing.price}, {listing.location}"
-                        f"{desc_newline}{desc}"
-                    )
-                    if rating.comment == AIResponse.NOT_EVALUATED
-                    else (
-                        f"[{rating.conclusion} ({rating.score})] "
-                        f"[**{listing.title}**]({listing.post_url.split('?')[0]})\n"
-                        f"{listing.price}, {listing.location}\n"
-                        f"{desc}{desc_newline}"
-                        f"\n**AI**: {rating.comment}"
-                    )
-                )
-            elif self.message_format == "html":
-                desc_newline = "<br>" if desc else ""
-                msg = (
-                    (
-                        f"""<a href="{listing.post_url.split("?")[0]}"><b>{listing.title}</b></a>"""
-                        f"<br>{listing.price}, {listing.location}{desc_newline}{desc}"
-                    )
-                    if rating.comment == AIResponse.NOT_EVALUATED
-                    else (
-                        f"<b>[{rating.conclusion} ({rating.score})]</b>"
-                        f"""<a href="{listing.post_url.split("?")[0]}"><b>{listing.title}</b></a>"""
-                        f"<br>{listing.price}, {listing.location}<br>"
-                        f"{desc}{desc_newline}"
-                        f"<br><b>AI</b>: <i>{rating.comment}</i>"
-                    )
-                )
-            msgs[ns].append((listing, msg))
-
-        if not msgs:
+        if not batches:
             if logger:
                 logger.debug("No new listings to notify.")
             return False
 
-        for ns, listing_msg in msgs.items():
-            if ns == NotificationStatus.NOT_NOTIFIED:
-                title = f"Found {len(listing_msg)} new {p.plural_noun(listing.name, len(listing_msg))} from {listing.marketplace}"
-            elif ns == NotificationStatus.EXPIRED:
-                title = f"Another look at {len(listing_msg)} {p.plural_noun(listing.name, len(listing_msg))} from {listing.marketplace}"
-            elif ns == NotificationStatus.LISTING_CHANGED:
-                title = f"Found {len(listing_msg)} updated {p.plural_noun(listing.name, len(listing_msg))} from {listing.marketplace}"
-            elif ns == NotificationStatus.LISTING_DISCOUNTED:
-                title = f"Found {len(listing_msg)} discounted {p.plural_noun(listing.name, len(listing_msg))} from {listing.marketplace}"
-            else:
-                title = f"Resend {len(listing_msg)} {p.plural_noun(listing.name, len(listing_msg))} from {listing.marketplace}"
-
-            message = "\n\n".join([x[1] for x in listing_msg])
-            #
-            if not self.send_message_with_retry(title, message, logger=logger):
+        for status, batch in batches.items():
+            title = summary_title(
+                [card for _listing, card in batch],
+                status.name,
+                # The card's name for the platform, not the listing's: one is
+                # "Mercado Libre" and the other is the key in a config file.
+                batch[0][1].marketplace,
+                language=language,
+            )
+            if not self.send_items(title, batch, logger=logger):
                 return False
         return True
+
+    def _description_for(
+        self: "PushNotificationConfig",
+        listing: Listing,
+        description_words: int | None = None,
+    ) -> str:
+        """As much of the seller's own text as this channel was asked to carry.
+
+        Two limits, applied in that order and answering different questions.
+        ``with_description`` is per channel and counted in characters -- what
+        it always meant.  The word limit is the system-wide one
+        (``[monitor] max_description_words``, overridable per channel), and it
+        exists because a Mercado Libre seller who pastes their catalogue into
+        the description produces a message the service rejects outright.
+
+        Characters first, then words: the character cut is the older, narrower
+        setting and doing it second would let it re-cut text the word limit had
+        already ended cleanly, leaving two ellipses in a row.
+        """
+        text = listing.description
+        if self.with_description is not None:
+            if self.with_description == 0:
+                return ""
+            if self.with_description > 1 and len(text) >= self.with_description:
+                text = text[: self.with_description] + "..."
+        # The channel's own answer wins when it has one; otherwise whatever the
+        # monitor was configured with reaches here as `description_words`.
+        words = (
+            self.max_description_words
+            if self.max_description_words is not None
+            else description_words
+        )
+        return truncate_description(text, words)
+
+    def send_items(
+        self: "PushNotificationConfig",
+        title: str,
+        items: List[Tuple[Listing, ListingCard]],
+        logger: Logger | None = None,
+    ) -> bool:
+        """Send one batch of cards.  Text, joined, which is all most channels do.
+
+        Overridden by a channel that can do better -- Telegram sends each card
+        as its listing's photo with the text as the caption -- and the reason
+        this is a method rather than a branch: adding a channel that can carry
+        pictures should not mean editing the one that cannot.
+        """
+        fmt = self.message_format or PLAIN
+        if self.message_limit is None:
+            message = "\n\n".join(card.render(fmt) for _listing, card in items)
+            return self.send_message_with_retry(title, message, logger=logger)
+
+        # The title counts: most channels put it at the top of the same message
+        # the limit applies to, and forgetting it is how a message built to sit
+        # exactly on the limit ends up over it.  The margin covers the blank
+        # line under the title and the " (2/3)" a split batch adds to it --
+        # which is the same mistake one level down, and just as easy to make.
+        room = max(1, self.message_limit - len(title) - 16)
+        # More listings than fit go in more messages rather than fewer
+        # listings: a batch of six that arrives as four is a notification that
+        # quietly lied about what was found.
+        messages: List[str] = []
+        current = ""
+        for _listing, card in items:
+            text = card.render_within(room, fmt)
+            joined = text if not current else f"{current}\n\n{text}"
+            if len(joined) <= room:
+                current = joined
+                continue
+            if current:
+                messages.append(current)
+            current = text
+        if current:
+            messages.append(current)
+
+        ok = True
+        for index, message in enumerate(messages, 1):
+            heading = title if len(messages) == 1 else f"{title} ({index}/{len(messages)})"
+            if not self.send_message_with_retry(heading, message, logger=logger):
+                ok = False
+        return ok

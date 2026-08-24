@@ -2,8 +2,6 @@ from dataclasses import dataclass
 from logging import Logger
 from typing import ClassVar, List
 
-from pushbullet import Pushbullet  # type: ignore
-
 from .notification import PushNotificationConfig
 from .utils import hilight
 
@@ -59,6 +57,15 @@ class PushbulletNotificationConfig(PushNotificationConfig):
         message: str,
         logger: Logger | None = None,
     ) -> bool:
+        # Imported here rather than at module scope: the `pushbullet` package
+        # pulls in python-magic, which loads libmagic and its database the
+        # moment it is imported.  That is seconds of work (and, on a machine
+        # where the DLL load misbehaves, considerably more) paid by everything
+        # that merely reads the configuration -- the CLI, the web UI, the tests
+        # -- for the sake of a notification channel most configurations do not
+        # even use.  Nothing else in this module needs the package.
+        from pushbullet import Pushbullet  # type: ignore
+
         pb = Pushbullet(
             self.pushbullet_token,
             proxy=(

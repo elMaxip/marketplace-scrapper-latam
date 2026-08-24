@@ -1,6 +1,7 @@
 import smtplib
 import ssl
 import time
+from collections import Counter
 from dataclasses import dataclass
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
@@ -16,6 +17,7 @@ from markupsafe import Markup, escape
 
 from .ai import AIResponse  # type: ignore
 from .listing import Listing
+from .messages import PLAIN, ListingCard, build_card, summary_title
 from .notification import NotificationConfig, NotificationStatus
 from .utils import fetch_with_retry, hilight, resize_image_data
 
@@ -92,7 +94,32 @@ class EmailNotificationConfig(NotificationConfig):
         listings: List[Listing],
         notification_status: List[NotificationStatus],
         force: bool = False,
+        cards: List[ListingCard] | None = None,
+        language: str | None = None,
     ) -> str:
+        """The subject line: how many, of what kind, from where.
+
+        The one-kind case -- which is nearly every email -- is handed to
+        :func:`~ai_marketplace_monitor.messages.summary_title` so the subject
+        reads the same as the heading a push channel would send, in the same
+        language.  A round that turned up several kinds at once keeps the older
+        enumerating sentence, because there is no shorter honest way to say
+        "two new, one cheaper and one worth another look".
+        """
+        counts = Counter(
+            status for status in notification_status
+            if force or status != NotificationStatus.NOTIFIED
+        )
+        if not counts:
+            return ""
+        if cards is not None and len(counts) == 1:
+            only = next(iter(counts))
+            return summary_title(
+                [card for card, status in zip(cards, notification_status) if status == only],
+                only.name,
+                listings[0].marketplace,
+                language=language,
+            )
         p = inflect.engine()
         n_new = len([x for x in notification_status if x == NotificationStatus.NOT_NOTIFIED])
         n_notified = len([x for x in notification_status if x == NotificationStatus.NOTIFIED])
@@ -130,37 +157,25 @@ class EmailNotificationConfig(NotificationConfig):
         notification_status: List[NotificationStatus],
         force: bool = False,
         logger: Logger | None = None,
+        cards: List[ListingCard] | None = None,
     ) -> str:
-        messages = []
-        for listing, rating, ns in zip(listings, ratings, notification_status):
-            prefix = ""
-            if ns == NotificationStatus.NOTIFIED:
-                if force:
-                    prefix = "[NOTIFIED] "
-                else:
-                    continue
-            if ns == NotificationStatus.EXPIRED:
-                prefix = "[REMINDER] "
-            elif ns == NotificationStatus.LISTING_CHANGED:
-                prefix = "[lISTING UPDATED] "
-            elif ns == NotificationStatus.LISTING_DISCOUNTED:
-                prefix = "[lISTING DISCOUNTED] "
+        """The plain-text half of the email: the same cards, unformatted.
 
-            messages.append(
-                (
-                    f"{prefix}{listing.title}\n{listing.price}, {listing.location}\n"
-                    f"{listing.post_url.split('?')[0]}"
-                )
-                if rating.comment == AIResponse.NOT_EVALUATED
-                else (
-                    f"{prefix} [{rating.conclusion} ({rating.score})] {listing.title}\n"
-                    f"{listing.price}, {listing.location}\n"
-                    f"{listing.post_url.split('?')[0]}\n"
-                    f"\nAI: {rating.comment}"
-                )
-            )
-        message = "\n\n".join(messages)
-        return message
+        It is what a text-only client shows and what most clients quote when
+        the message is replied to, so it says the same things in the same order
+        as the HTML rather than a shorter, differently-organised version of
+        them.
+        """
+        if cards is None:
+            cards = [
+                build_card(listing, rating, status)
+                for listing, rating, status in zip(listings, ratings, notification_status)
+            ]
+        return "\n\n".join(
+            card.render(PLAIN)
+            for card, status in zip(cards, notification_status)
+            if force or status != NotificationStatus.NOTIFIED
+        )
 
     def get_html_message(
         self: "EmailNotificationConfig",
@@ -169,6 +184,7 @@ class EmailNotificationConfig(NotificationConfig):
         notification_status: List[NotificationStatus],
         force: bool = False,
         logger: Logger | None = None,
+        cards: List[ListingCard] | None = None,
     ) -> Tuple[str, list[Tuple[bytes, str, str]]]:  # Return HTML and image data
         template_dir = Path(__file__).parent
 
@@ -215,9 +231,17 @@ class EmailNotificationConfig(NotificationConfig):
                     if logger:
                         logger.debug(f"Failed to fetch image: {listing.image}")
 
-        # Render template
+        if cards is None:
+            cards = [
+                build_card(listing, rating, status)
+                for listing, rating, status in zip(listings, ratings, notification_status)
+            ]
+
+        # Render template.  The card travels alongside the listing rather than
+        # replacing it: the template still needs the raw listing for the image
+        # it has already fetched and attached by content id.
         html = template.render(
-            listings=zip(listings, ratings, notification_status),
+            listings=zip(listings, ratings, notification_status, cards),
             force=force,
             item_name=listings[0].name.capitalize(),
             NotificationStatus=NotificationStatus,  # Pass enum for comparison
@@ -232,7 +256,24 @@ class EmailNotificationConfig(NotificationConfig):
         notification_status: List[NotificationStatus],
         force: bool = False,
         logger: Logger | None = None,
+        cards: List[ListingCard] | None = None,
+        language: str | None = None,
+        description_words: int | None = None,
     ) -> bool:
+        """Send one email covering every listing this round turned up.
+
+        Unlike the push channels, an email is a place where a picture and a
+        paragraph both fit, so this one keeps its HTML template.  What it takes
+        from the cards is the part it could not work out for itself: what the
+        listing cost last time, and how far it has moved since.
+
+        ``description_words`` is accepted and deliberately not applied to the
+        HTML body.  The limit exists because a phone notification is read in a
+        second and because Telegram refuses a long message outright; an email
+        has neither problem, and it is the copy that gets kept and searched, so
+        it carries the seller's whole text.  The cards it renders in the plain
+        text half were already shortened by whoever built them.
+        """
         if not self._has_required_fields():
             if logger:
                 logger.debug(
@@ -240,16 +281,23 @@ class EmailNotificationConfig(NotificationConfig):
                 )
             return False
 
-        title = self.get_title(listings, notification_status, force=force)
+        if cards is None:
+            cards = [
+                build_card(listing, rating, status, language=language)
+                for listing, rating, status in zip(listings, ratings, notification_status)
+            ]
+
+        title = self.get_title(listings, notification_status, force=force, cards=cards,
+                               language=language)
         if not title:
             if logger:
                 logger.debug("No new listings. No email sent.")
             return False
         message = self.get_text_message(
-            listings, ratings, notification_status, force, logger=logger
+            listings, ratings, notification_status, force, logger=logger, cards=cards
         )
         html_message, images = self.get_html_message(
-            listings, ratings, notification_status, force, logger=logger
+            listings, ratings, notification_status, force, logger=logger, cards=cards
         )
         return self.send_email_message(title, message, html_message, images, logger=logger)
 

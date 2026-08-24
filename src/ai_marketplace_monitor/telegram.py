@@ -3,18 +3,36 @@ import time
 from dataclasses import dataclass
 from datetime import timedelta
 from logging import Logger
-from typing import TYPE_CHECKING, ClassVar, List
+from typing import TYPE_CHECKING, ClassVar, List, Tuple
 
+from .listing import Listing
+from .messages import MARKDOWN_V2, ListingCard, escape_markdown_v2
 from .notification import PushNotificationConfig
 
 if TYPE_CHECKING:
     import telegram
+
+#: Telegram's cap on a photo caption.  A quarter of the cap on a plain message,
+#: which is why a card that runs long is sent as text with the photo above it
+#: rather than truncated: the price and the link are the point, and they are at
+#: the two ends of the card.
+CAPTION_LIMIT = 1024
+
+#: Telegram's cap on a text message.  The card is built to fit inside it rather
+#: than sent and hoped for: over it the API answers "Message is too long", the
+#: retry loop tries three more times, and the listing is never delivered at all
+#: -- which is exactly what a Mercado Libre description ten screens long did.
+MESSAGE_LIMIT = 4096
 
 
 @dataclass
 class TelegramNotificationConfig(PushNotificationConfig):
     notify_method = "telegram"
     required_fields: ClassVar[List[str]] = ["telegram_token", "telegram_chat_id"]
+    #: Telegram's cap on a text message.  Going over it is not a truncated
+    #: message, it is no message at all: the API answers "Message is too long"
+    #: and the send is retried three times to arrive at the same answer.
+    message_limit: ClassVar[int | None] = MESSAGE_LIMIT
 
     telegram_token: str | None = None
     telegram_chat_id: str | None = None
@@ -75,6 +93,157 @@ class TelegramNotificationConfig(PushNotificationConfig):
                 raise ValueError(
                     "telegram_chat_id must be numeric or start with @ for usernames."
                 ) from e
+
+    def send_items(
+        self: "TelegramNotificationConfig",
+        title: str,
+        items: List[Tuple["Listing", ListingCard]],
+        logger: Logger | None = None,
+    ) -> bool:
+        """One message per listing, with the listing's photo when it has one.
+
+        This is the whole reason cards exist as data rather than as text.  A
+        picture of the thing being sold is worth more than any description the
+        seller wrote, and Telegram will carry it -- but only attached to a
+        message about *one* listing, which a joined block of text for six of
+        them can never be.
+
+        Falling back is deliberate at three points, because none of them is a
+        reason not to send the message:
+
+        * a listing with no image is sent as text;
+        * an image Telegram will not fetch (Facebook's URLs expire, and by the
+          time a notification goes out one can already be dead) is retried
+          without it;
+        * a card longer than a caption is allowed to be is sent as text, rather
+          than cut in the middle to fit under a photo.
+        """
+        return self._run_async(self._send_items_async(title, items, logger), logger)
+
+    async def _send_items_async(
+        self: "TelegramNotificationConfig",
+        title: str,
+        items: List[Tuple["Listing", ListingCard]],
+        logger: Logger | None = None,
+    ) -> bool:
+        try:
+            import telegram
+        except ImportError:
+            if logger:
+                logger.error("python-telegram-bot library is required for Telegram notifications")
+            return False
+
+        if self.telegram_token is None or self.telegram_chat_id is None:
+            if logger:
+                logger.error("telegram_token and telegram_chat_id are required")
+            return False
+
+        bot = telegram.Bot(token=self.telegram_token)
+        # The heading goes once, above the batch, rather than on every card:
+        # six listings do not need to be told six times that six were found.
+        await self._wait_for_rate_limit(logger)
+        await self._send_single_message_with_retry(
+            bot,
+            self.telegram_chat_id,
+            f"*{escape_markdown_v2(title)}*",
+            logger,
+        )
+
+        ok = True
+        for _listing, card in items:
+            await self._wait_for_rate_limit(logger)
+            # Rendered *as* MarkdownV2 rather than rendered and then escaped:
+            # escaping afterwards would backslash the asterisks that make the
+            # title bold along with the dots in the price, and Telegram would
+            # show the markup instead of applying it.
+            body = card.render(MARKDOWN_V2, link=False)
+            # The link is a button rather than a line of text: it is the one
+            # thing the reader is going to press, and a caption is small.
+            markup = telegram.InlineKeyboardMarkup(
+                [[telegram.InlineKeyboardButton(card.link_label(), url=card.url)]]
+            )
+            sent = False
+            if card.image and len(body) <= CAPTION_LIMIT:
+                sent = await self._send_photo(bot, card.image, body, markup, logger)
+            if not sent:
+                # Built to fit rather than sent and hoped for.  The message
+                # this replaces was `card.render(MARKDOWN_V2)` with no length
+                # check at all, and a Mercado Libre seller's twelve-screen
+                # description made it 6000 characters -- which Telegram does
+                # not truncate, it rejects: "Max retries (3) reached for
+                # Telegram errors: Message is too long", and the listing was
+                # never delivered.  Shortening the card and re-rendering (see
+                # `render_within`) is what keeps the escaping valid; cutting
+                # the rendered MarkdownV2 would strand a backslash and be
+                # rejected just as firmly, for a different reason.
+                sent = await self._send_single_message_with_retry(
+                    bot,
+                    self.telegram_chat_id,
+                    card.render_within(MESSAGE_LIMIT, MARKDOWN_V2),
+                    logger,
+                )
+            ok = ok and sent
+        if logger and ok:
+            logger.info(
+                f"""Sent {self.name} {len(items)} Telegram message(s) with title {title}"""
+            )
+        return ok
+
+    async def _send_photo(
+        self: "TelegramNotificationConfig",
+        bot: "telegram.Bot",
+        image: str,
+        caption: str,
+        markup: "telegram.InlineKeyboardMarkup",
+        logger: Logger | None = None,
+    ) -> bool:
+        """Try to send the card as a photo.  False means "send it as text".
+
+        No retry loop: a photo that fails has a perfectly good text form
+        waiting, and retrying a URL Facebook has already expired is a minute
+        spent to arrive at the same answer.
+        """
+        assert self.telegram_chat_id is not None
+        try:
+            await bot.send_photo(
+                chat_id=self.telegram_chat_id,
+                photo=image,
+                caption=caption,
+                parse_mode="MarkdownV2",
+                reply_markup=markup,
+            )
+            return True
+        except Exception as e:
+            if logger:
+                logger.debug(f"Telegram would not take the listing image ({e}); sending text.")
+            return False
+
+    def _run_async(self: "TelegramNotificationConfig", coroutine, logger=None) -> bool:
+        """Run one coroutine, whether or not a loop is already turning.
+
+        Extracted from ``send_message``, which grew this dance first and is now
+        one of two callers.  The thread is not paranoia: ``asyncio.run`` refuses
+        outright inside a running loop, and the monitor's web UI runs one.
+        """
+        import asyncio
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return bool(asyncio.run(coroutine))
+
+        import concurrent.futures
+
+        def run_async() -> bool:
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                return bool(new_loop.run_until_complete(coroutine))
+            finally:
+                new_loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            return bool(executor.submit(run_async).result(timeout=120))
 
     def send_message(
         self: "TelegramNotificationConfig",

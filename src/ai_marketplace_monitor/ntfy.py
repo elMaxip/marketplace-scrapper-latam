@@ -12,6 +12,9 @@ from .utils import hilight
 class NtfyNotificationConfig(PushNotificationConfig):
     notify_method = "ntfy"
     required_fields: ClassVar[List[str]] = ["ntfy_server", "ntfy_topic"]
+    #: ntfy's own cap on a message body.  A server may be configured lower,
+    #: but none accepts more, and a body over it comes back as a 413.
+    message_limit: ClassVar[int | None] = 4096
 
     message_format: str | None = None
     ntfy_server: str | None = None
