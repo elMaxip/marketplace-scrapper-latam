@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import socket
 from pathlib import Path
 from typing import Any, Dict, Iterator
 
@@ -137,3 +139,72 @@ def test_clear_profile_removes_everything(profile_dir: Path) -> None:
 
 def test_clear_profile_on_missing_directory(profile_dir: Path) -> None:
     assert session_mod.clear_profile() is False
+
+
+# --------------------------------------------------------------------------- #
+# A profile still claimed by a browser that is gone
+# --------------------------------------------------------------------------- #
+#
+# Chromium writes `SingletonLock` as a symlink to `<hostname>-<pid>` and refuses
+# to open a profile whose lock names anything but itself.  In a container both
+# halves of that go stale routinely: the profile lives in a volume and the
+# volume outlives the container, but the hostname does not -- so an ordinary
+# `docker compose up` after a replace found a lock naming a machine that no
+# longer exists, Chromium declined, Playwright reported "Target page, context or
+# browser has been closed", and the monitor crashed on every start under a
+# supervisor that restarted it for ever.
+
+
+def _write_lock(profile: Path, target: str) -> bool:
+    """Write a Chromium singleton lock.  False where symlinks are not allowed."""
+    profile.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(target, profile / "SingletonLock")
+    except (OSError, NotImplementedError):
+        # Windows without developer mode.  The lock is a POSIX-shaped thing and
+        # so is the container this exists for.
+        return False
+    return True
+
+
+def test_a_lock_from_another_machine_is_stale(profile_dir: Path) -> None:
+    if not _write_lock(profile_dir, "2bda25b32978-77"):
+        pytest.skip("this platform does not allow symlinks")
+    assert session_mod.stale_profile_lock() is not None
+    assert session_mod.release_stale_profile_lock() is not None
+    assert not (profile_dir / "SingletonLock").exists()
+
+
+def test_a_lock_from_a_dead_process_is_stale(profile_dir: Path) -> None:
+    # A pid that is certainly not running: this process is, and nothing else is
+    # allowed to reuse the number while it holds it.
+    dead = 2**22 - 1
+    if not _write_lock(profile_dir, f"{socket.gethostname()}-{dead}"):
+        pytest.skip("this platform does not allow symlinks")
+    assert session_mod.stale_profile_lock() is not None
+
+
+def test_a_lock_held_by_a_live_process_here_is_left_alone(profile_dir: Path) -> None:
+    """The one case that must never be touched: a browser this monitor is using
+    right now.  Removing that lock would let a second Chromium into a profile
+    the first one holds, which corrupts it."""
+    if not _write_lock(profile_dir, f"{socket.gethostname()}-{os.getpid()}"):
+        pytest.skip("this platform does not allow symlinks")
+    assert session_mod.stale_profile_lock() is None
+    assert session_mod.release_stale_profile_lock() is None
+    assert (profile_dir / "SingletonLock").exists()
+
+
+def test_no_lock_is_not_a_stale_lock(profile_dir: Path) -> None:
+    session_mod.profile_dir()
+    assert session_mod.stale_profile_lock() is None
+    assert session_mod.release_stale_profile_lock() is None
+
+
+def test_lane_profiles_are_checked_separately(profile_dir: Path) -> None:
+    """Each lane holds a profile of its own, and one being stale says nothing
+    about another."""
+    if not _write_lock(session_mod.profile_path("mercadolibre"), "elsewhere-9"):
+        pytest.skip("this platform does not allow symlinks")
+    assert session_mod.stale_profile_lock("mercadolibre") is not None
+    assert session_mod.stale_profile_lock() is None

@@ -48,6 +48,19 @@ base_marketplace_cfg = """
 search_city = 'dallas'
 """
 
+# A saved region, defined here because nothing ships one any more: the packaged
+# config.toml used to carry a dozen `[region.*]` blocks and no longer does. A
+# config that names a region has to define it, which is exactly what the web UI
+# writes when the user saves one.
+region_cfg = """
+[region.usa]
+full_name = "USA (test)"
+radius = 500
+city_name = ["Houston", "Dallas"]
+search_city = ["houston", "dallas"]
+currency = "USD"
+"""
+
 full_marketplace_cfg = """
 [marketplace.facebook]
 login_wait_time = 50
@@ -186,16 +199,25 @@ proxy_password = 'fadfadf'
 @pytest.mark.parametrize(
     "config_content,acceptable",
     [
-        (base_marketplace_cfg, False),
+        # No section is required any more.  The platforms are built in, a
+        # monitor with no searches is idle rather than broken, and one with
+        # nobody to notify still searches and stores what it finds -- so each
+        # of these on its own is a configuration, just not an interesting one.
+        (base_marketplace_cfg, True),
+        # Still refused, and not for a missing section: a Facebook search has
+        # to say where to search from, and this one names no city and no region.
         (base_item_cfg, False),
-        (base_user_cfg, False),
+        (base_user_cfg, True),
         (base_marketplace_cfg + base_item_cfg + base_user_cfg, True),
         (base_marketplace_cfg + base_item_cfg + base_user_cfg + base_ai_cfg, True),
-        (full_marketplace_cfg + full_item_cfg + full_user_cfg + full_ai_cfg, True),
-        (base_marketplace_cfg + full_item_cfg + base_user_cfg + base_ai_cfg, True),
+        (
+            region_cfg + full_marketplace_cfg + full_item_cfg + full_user_cfg + full_ai_cfg,
+            True,
+        ),
+        (region_cfg + base_marketplace_cfg + full_item_cfg + base_user_cfg + base_ai_cfg, True),
         # notification should match
         (
-            base_marketplace_cfg + full_item_cfg + notify_user_cfg,
+            region_cfg + base_marketplace_cfg + full_item_cfg + notify_user_cfg,
             False,
         ),
         # pushbullet
@@ -241,7 +263,10 @@ proxy_password = 'fadfadf'
         ),
         # user should match
         (
-            base_marketplace_cfg + full_item_cfg.replace("user1", "unknown_user") + base_user_cfg,
+            region_cfg
+            + base_marketplace_cfg
+            + full_item_cfg.replace("user1", "unknown_user")
+            + base_user_cfg,
             False,
         ),
         # no additional keys
@@ -297,6 +322,7 @@ def test_config(config_file: Callable, config_content: str, acceptable: bool) ->
         "searched_count": int,
         "sort_by": (str, type(None)),
         "start_at": (list, type(None)),
+        "target_price": (str, type(None)),
         "username": (str, type(None)),
     }
     if acceptable:
@@ -337,7 +363,8 @@ def test_support_multiple_marketplaces(config_file: Callable) -> None:
     )
     config = Config([cfg])
 
-    assert len(config.marketplace) == 2
+    # The two built-in platforms, plus the extra section this file declares.
+    assert sorted(config.marketplace) == ["facebook", "houston", "mercadolibre"]
     assert len(config.item) == 2
     assert len(config.user) == 1
 
@@ -363,7 +390,8 @@ def test_multiplace_ai_agent(config_file: Callable) -> None:
     )
     config = Config([cfg])
 
-    assert len(config.marketplace) == 1
+    # Every platform the monitor supports, whether or not the file names it.
+    assert sorted(config.marketplace) == ["facebook", "mercadolibre"]
     assert len(config.ai) == 2
 
     assert config.ai["openai"].api_key == "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
@@ -386,3 +414,23 @@ def test_price_conversion(config_file: Callable) -> None:
 
     assert config.item["name"].max_price == "300 USD"
     assert config.item["name"].currency == ["EUR"]
+
+
+def test_the_telegram_library_cannot_log_the_bot_token() -> None:
+    """The token is in the URL the library announces at DEBUG.
+
+    `python-telegram-bot` logs "Set Bot API URL: https://api.telegram.org/
+    bot<token>" and then every call's parameters, chat id included.  The root
+    logger is at DEBUG whether or not `--verbose` was passed, so that went into
+    the log file in clear text -- and out over the web UI's log websocket to
+    anyone with the interface open.
+    """
+    import logging
+
+    from ai_marketplace_monitor.cli import _silence_noisy_loggers
+
+    _silence_noisy_loggers()
+    for name in ("telegram", "telegram.ext", "telegram.request"):
+        assert logging.getLogger(name).level == logging.ERROR, name
+    # A record the library would have emitted is now below the bar.
+    assert not logging.getLogger("telegram.request").isEnabledFor(logging.DEBUG)

@@ -116,3 +116,77 @@ def test_await_login_gives_up_when_the_challenge_never_clears() -> None:
     marketplace.logger = None
     marketplace.keyboard_monitor = None
     assert marketplace._await_login(0) is False
+
+
+# --------------------------------------------------------------------------- #
+# The wait is a checkpoint
+# --------------------------------------------------------------------------- #
+#
+# It was not, and that was the one place in the scraping path where the monitor
+# stopped listening.  A sign-in wait runs for up to five minutes by default, and
+# for all of it "Detener búsqueda de esta plataforma" sat on "deteniéndose…", a
+# pause did nothing, and a configuration change that deleted this very search
+# was not noticed -- because those are all flags read at checkpoints, and this
+# loop had none.
+
+
+def test_a_stopped_scrape_ends_the_login_wait() -> None:
+    import pytest
+
+    from ai_marketplace_monitor import control
+
+    control.reset_for_tests()
+    page = FakePage([], "https://www.facebook.com/two_step_verification/x")
+    marketplace = _marketplace(page)
+    marketplace.logger = None
+    marketplace.keyboard_monitor = None
+
+    control.request_cancel()
+    try:
+        started = time.monotonic()
+        with pytest.raises(control.CancelledScrape):
+            # A budget of five minutes, and this has to come back at once.
+            marketplace._await_login(300)
+        assert time.monotonic() - started < 5
+    finally:
+        control.reset_for_tests()
+
+
+def test_the_search_being_superseded_ends_the_login_wait() -> None:
+    """The guard the monitor installs is read here too, so a search deleted
+    while it waits for a sign-in stops waiting."""
+    import pytest
+
+    from ai_marketplace_monitor import control
+
+    control.reset_for_tests()
+    page = FakePage([], "https://www.facebook.com/two_step_verification/x")
+    marketplace = _marketplace(page)
+    marketplace.logger = None
+    marketplace.keyboard_monitor = None
+
+    def guard() -> None:
+        raise control.SearchSuperseded("ps5", "facebook", "deleted")
+
+    control.set_checkpoint_guard(guard)
+    try:
+        with pytest.raises(control.SearchSuperseded):
+            marketplace._await_login(300)
+    finally:
+        control.reset_for_tests()
+
+
+def test_an_untimed_manual_sign_in_is_not_cut_short() -> None:
+    """`--login` installs no guard and asks for no cancellation, so the
+    checkpoint is a no-op there -- which is what keeps it untimed."""
+    from ai_marketplace_monitor import control
+
+    control.reset_for_tests()
+    page = SigningInPage(clears_after=1)
+    marketplace = _marketplace(page)
+    marketplace.logger = None
+    marketplace.keyboard_monitor = None
+    try:
+        assert marketplace._await_login(30) is True
+    finally:
+        control.reset_for_tests()

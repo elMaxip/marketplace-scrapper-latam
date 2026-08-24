@@ -19,32 +19,102 @@ from .utils import CacheType, amm_home, cache, counter, hilight
 app = typer.Typer()
 
 
+def _silence_noisy_loggers() -> None:
+    """Turn down libraries that log too much -- or, in one case, too much of
+    a secret.  Lifted out of ``main`` so it can be tested on its own."""
+    # remove logging from other packages.
+    #
+    # `telegram` is not here for noise, it is here for secrecy.  At DEBUG the
+    # library announces "Set Bot API URL: https://api.telegram.org/bot<token>"
+    # and then prints every call's parameters, chat id included -- and the root
+    # logger is at DEBUG whether or not `--verbose` was passed, so the bot token
+    # was written to `ai-marketplace-monitor.log` in clear text dozens of times
+    # a run.  Worse, the web UI's handler is at DEBUG too, so the same token was
+    # broadcast over the log websocket to anyone with the interface open.
+    #
+    # ERROR rather than WARNING because the library's own warnings are of no use
+    # here and its errors are already reported by the notification code.
+    # `watchdog` is here for volume rather than secrecy, and it is not a small
+    # one: the config file is watched, and at DEBUG the inotify reader logs one
+    # `in-event <InotifyEvent ...>` line per filesystem event under the data
+    # directory -- which includes every write to the log file it is writing.
+    # The root logger is at DEBUG whether or not `--verbose` was passed, so a
+    # container filled its 5 x 1 MB of rotated logs with nothing else inside a
+    # minute, taking the record of what the monitor had actually done with it,
+    # and broadcast the same flood over the web UI's log socket.
+    for logger_name in (
+        "asyncio",
+        "watchdog",
+        "openai._base_client",
+        "httpcore.connection",
+        "httpcore.http11",
+        "httpx",
+        "telegram",
+        "telegram.ext",
+        "telegram.request",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.ERROR)
+
+
+def _handle_termination(logger: logging.Logger) -> None:
+    """Turn a polite "please stop" from the operating system into a clean exit.
+
+    Python's default handler for ``SIGTERM`` ends the process where it stands:
+    no exception, so no ``finally``, so ``stop_monitor`` never runs -- the
+    browsers are left to be killed with the process, the persistent profile is
+    not flushed (which can lose the session the profile exists to keep), and a
+    notification still in the queue is dropped.  That is exactly what
+    ``docker stop`` sends, so the container's every shutdown was the ungraceful
+    one.  Raising ``KeyboardInterrupt`` instead puts a signal on the same path
+    Ctrl-C already takes, which is the path that cleans up.
+
+    ``SIGTERM`` is not defined on every platform this runs on; where it is not,
+    there is nothing to arrange and nothing to complain about.
+    """
+    import signal
+
+    def stop(signum: int, _frame: Any) -> None:
+        logger.info(
+            f"""{hilight("[Monitor]", "info")} Received signal {signum}; shutting down."""
+        )
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGINT"):
+        handler = getattr(signal, name, None)
+        if handler is None:
+            continue
+        try:
+            signal.signal(handler, stop)
+        except (ValueError, OSError):  # pragma: no cover - not the main thread
+            pass
+
+
 _DEFAULT_CONFIG_TEMPLATE = """\
 # AI Marketplace Monitor — configuration file
 #
-# Created automatically on first run. Edit in the web UI (or any
-# editor) and save — the monitor picks up changes within a second.
+# Created automatically on first run. It is deliberately empty: a fresh
+# install has no searches, no users and nothing to migrate, and the
+# monitor waits, doing nothing, until you add a search from the web UI.
+# Save there (or here, in any editor) and it picks the change up within
+# a second.
 #
-# The web UI requires no password on localhost (127.0.0.1). To expose
-# it on a network interface (--webui-host), set username and password
-# below or via FACEBOOK_USERNAME / FACEBOOK_PASSWORD env vars.
+# The platforms it can search — Facebook Marketplace and Mercado Libre —
+# are built in. There is nothing to add here to make them available; each
+# search picks which of them it runs on.
+#
+# The web UI requires no password on localhost (127.0.0.1). To expose it
+# on a network interface (--webui-host), set FACEBOOK_USERNAME and
+# FACEBOOK_PASSWORD in the environment, or add:
+#
+#     [marketplace.facebook]
+#     username = "your@email"
+#     password = "..."
+#
+# To sign a platform in, prefer Ajustes → Sesiones del navegador in the
+# web UI: pasting the cookies from your own browser works where an
+# automated sign-in usually does not.
 #
 # See https://ai-marketplace-monitor.readthedocs.io/ for a full reference.
-
-[marketplace.facebook]
-username = "${FACEBOOK_USERNAME}"
-password = "${FACEBOOK_PASSWORD}"
-search_city = "houston"
-
-[item.example]
-# Describe what you want to find. Duplicate this block for each item.
-search_phrases = "gopro hero"
-# min_price = 50
-# max_price = 300
-
-[user.me]
-# One of these notification channels is required.
-# pushbullet_token = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 """
 
 
@@ -172,6 +242,19 @@ def main(
         int,
         typer.Option("--webui-port", help="Port for the web UI. Default: 8467"),
     ] = 8467,
+    webui_open: Annotated[
+        bool,
+        typer.Option(
+            "--webui-open",
+            envvar="AIMM_WEBUI_OPEN",
+            help=(
+                "Serve the web UI without a password even when --webui-host is not "
+                "loopback. For a container or a private network, where the bind address "
+                "has to be 0.0.0.0 to be reachable at all and something else keeps the "
+                "port private. Do not use it on an address the internet can reach."
+            ),
+        ),
+    ] = False,
     webui_log_retention: Annotated[
         int,
         typer.Option(
@@ -212,20 +295,13 @@ def main(
         handlers=log_handlers,
     )
 
-    # remove logging from other packages.
-    for logger_name in (
-        "asyncio",
-        "openai._base_client",
-        "httpcore.connection",
-        "httpcore.http11",
-        "httpx",
-    ):
-        logging.getLogger(logger_name).setLevel(logging.ERROR)
+    _silence_noisy_loggers()
 
     logger = logging.getLogger("monitor")
     logger.info(
         f"""{hilight("[VERSION]", "info")} AI Marketplace Monitor, version {hilight(__version__, "name")}"""
     )
+    _handle_termination(logger)
 
     if clear_cache is not None:
         if clear_cache == "all":
@@ -303,12 +379,27 @@ def main(
                             port=webui_port,
                             config_files=monitor.config_files,
                             log_handler=log_broadcast_handler,
+                            open_access=webui_open,
                         ),
                         logger=logger,
                     )
-                    _print_webui_banner(webui_info)
                 except Exception as e:
                     logger.error(f"""{hilight("[WebUI]", "fail")} Failed to start web UI: {e}""")
+                else:
+                    # Outside the `try`: the server is already listening by this
+                    # point, so a failure to *print* the banner is not a failure
+                    # to start.  It happens for real -- the panel has an emoji in
+                    # it, and a console that cannot encode one raises -- and
+                    # reporting that as "Failed to start web UI" sends the user
+                    # looking for a server that is running perfectly well.
+                    try:
+                        _print_webui_banner(webui_info)
+                    except Exception as e:
+                        logger.warning(
+                            f"""{hilight("[WebUI]", "fail")} Web UI is running at """
+                            f"""{", ".join(webui_info.urls)}; its banner could not be """
+                            f"""printed ({e})."""
+                        )
         monitor.start_monitor()
     except KeyboardInterrupt:
         rich.print("Exiting...")

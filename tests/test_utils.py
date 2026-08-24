@@ -2,7 +2,7 @@ from typing import List
 
 import pytest
 
-from ai_marketplace_monitor.utils import is_substring
+from ai_marketplace_monitor.utils import SleepStatus, doze, is_substring
 
 
 @pytest.mark.parametrize(
@@ -42,3 +42,12 @@ from ai_marketplace_monitor.utils import is_substring
 )
 def test_is_substring(var1: List[str] | str, var2: str, res: bool) -> None:
     assert is_substring(var1, var2) == res
+
+
+def test_doze_returns_immediately_when_the_condition_is_already_true() -> None:
+    """The pause switch cuts a long sleep short instead of waiting it out."""
+    assert doze(3600, stop_when=lambda: True) == SleepStatus.BY_CONDITION
+
+
+def test_doze_ignores_a_condition_that_never_fires() -> None:
+    assert doze(1, stop_when=lambda: False) == SleepStatus.NOT_DISRUPTED

@@ -2,10 +2,11 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from logging import Logger
-from typing import Any, Callable, Generator, Generic, List, Type, TypeVar
+from typing import Any, Callable, Generator, Generic, List, Tuple, Type, TypeVar
 
 from playwright.sync_api import BrowserContext, ElementHandle, Locator, Page  # type: ignore
 
+from .control import raise_if_cancelled
 from .listing import Listing
 from .session import load_session, save_session
 from .utils import (
@@ -14,13 +15,32 @@ from .utils import (
     KeyboardMonitor,
     MonitorConfig,
     Translator,
-    convert_to_seconds,
     hilight,
+    interval_in_seconds,
+    validated_start_at,
 )
 
 
 class MarketPlace(Enum):
     FACEBOOK = "facebook"
+
+
+class ListingStatus(Enum):
+    """What a re-visit to a listing page established about that listing.
+
+    The three failure-ish outcomes are kept apart because only two of them may
+    ever cause a deletion.  ``SOLD`` and ``GONE`` are *positive evidence* that
+    the listing is over -- the page said so.  ``UNKNOWN`` is everything else: a
+    timeout, a network blip, a rate limit, a login wall, a layout the parser did
+    not recognise.  Those look identical from the outside and none of them is a
+    reason to throw a listing away, so the refresher leaves such a listing
+    exactly where it was and tries again later.
+    """
+
+    ACTIVE = "active"
+    SOLD = "sold"
+    GONE = "gone"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -45,6 +65,11 @@ class MarketItemCommonConfig(BaseConfig):
     search_region: List[str] | None = None
     max_price: str | None = None
     min_price: str | None = None
+    #: What the user hopes to pay on this platform.  Not a search filter -- the
+    #: monitor never sends it anywhere -- but the number the dashboard measures
+    #: the best price found against, which is why it lives per platform: the
+    #: same product is worth a different price on Facebook and on Mercado Libre.
+    target_price: str | None = None
     rating: List[int] | None = None
     prompt: str | None = None
     extra_prompt: str | None = None
@@ -71,20 +96,17 @@ class MarketItemCommonConfig(BaseConfig):
             raise ValueError(f"Item {hilight(self.name)} exclude_sellers must be a list.")
 
     def handle_max_search_interval(self: "MarketItemCommonConfig") -> None:
+        """Deprecated: the schedule is the ``[monitor]`` section's business now.
+
+        Still parsed, because a config written before the move must keep
+        working, and still honored as a fallback when ``[monitor]`` says
+        nothing about the schedule.
+        """
         if self.max_search_interval is None:
             return
-
-        if isinstance(self.max_search_interval, str):
-            try:
-                self.max_search_interval = convert_to_seconds(self.max_search_interval)
-            except Exception as e:
-                raise ValueError(
-                    f"Marketplace {self.name} max_search_interval {self.max_search_interval} is not recognized."
-                ) from e
-        if not isinstance(self.max_search_interval, int) or self.max_search_interval < 1:
-            raise ValueError(
-                f"Item {hilight(self.name)} max_search_interval must be at least 1 second."
-            )
+        self.max_search_interval = interval_in_seconds(
+            self.max_search_interval, f"Item {hilight(self.name)}", "max_search_interval"
+        )
 
     def handle_notify(self: "MarketItemCommonConfig") -> None:
         if self.notify is None:
@@ -207,20 +229,12 @@ class MarketItemCommonConfig(BaseConfig):
             )
 
     def handle_search_interval(self: "MarketItemCommonConfig") -> None:
+        """Deprecated, like :meth:`handle_max_search_interval`."""
         if self.search_interval is None:
             return
-
-        if isinstance(self.search_interval, str):
-            try:
-                self.search_interval = convert_to_seconds(self.search_interval)
-            except Exception as e:
-                raise ValueError(
-                    f"Marketplace {self.name} search_interval {self.search_interval} is not recognized."
-                ) from e
-        if not isinstance(self.search_interval, int) or self.search_interval < 1:
-            raise ValueError(
-                f"Item {hilight(self.name)} search_interval must be at least 1 second."
-            )
+        self.search_interval = interval_in_seconds(
+            self.search_interval, f"Item {hilight(self.name)}", "search_interval"
+        )
 
     def handle_search_region(self: "MarketItemCommonConfig") -> None:
         if self.search_region is None:
@@ -292,43 +306,37 @@ class MarketItemCommonConfig(BaseConfig):
                 f"Item {hilight(self.name)} min_price must be a number followed by currency name."
             )
 
-    def handle_start_at(self: "MarketItemCommonConfig") -> None:
-        if self.start_at is None:
+    def handle_target_price(self: "MarketItemCommonConfig") -> None:
+        """Same shape as ``max_price``: a number, optionally with a currency."""
+        if self.target_price is None:
             return
 
-        if isinstance(self.start_at, str):
-            self.start_at = [self.start_at]
+        if isinstance(self.target_price, (int, float)):
+            self.target_price = str(int(self.target_price))
 
-        if not isinstance(self.start_at, list) or not all(
-            isinstance(x, str) for x in self.start_at
-        ):
+        if not isinstance(self.target_price, str):
+            raise ValueError(f"Item {hilight(self.name)} target_price must be a string.")
+
+        amount = self.target_price.split(" ", 1)[0] if " " in self.target_price else self.target_price
+        if not amount.isdigit():
             raise ValueError(
-                f"Item {hilight(self.name)} start_at must be a string or list of string."
+                f"Item {hilight(self.name)} target_price must be a number, optionally "
+                "followed by a currency name."
             )
+        if " " in self.target_price:
+            currency = self.target_price.split(" ", 1)[1]
+            try:
+                Currency(currency)
+            except ValueError as e:
+                raise ValueError(
+                    f"Item {hilight(self.name)} target_price currency {currency} is not recognized."
+                ) from e
 
-        # start_at should be in one of the format of
-        # HH:MM:SS, HH:MM, *:MM:SS, or *:MM, or *:*:SS
-        # where HH, MM, SS are hour, minutes and seconds
-        # and * can be any number
-        # if not, raise ValueError
-        for val in self.start_at:
-            if (
-                val.count(":") not in (1, 2)
-                or val.count("*") == 3
-                or not all(x == "*" or (x.isdigit() and len(x) == 2) for x in val.split(":"))
-            ):
-                raise ValueError(f"Item {hilight(self.name)} start_at {val} is not recognized.")
-            #
-            acceptable = False
-            for pattern in ["%H:%M:%S", "%H:%M", "*:%M:%S", "*:%M", "*:*:%S"]:
-                try:
-                    time.strptime(val, pattern)
-                    acceptable = True
-                    break
-                except ValueError:
-                    pass
-            if not acceptable:
-                raise ValueError(f"Item {hilight(self.name)} start_at {val} is not recognized.")
+    def handle_start_at(self: "MarketItemCommonConfig") -> None:
+        """Deprecated, like :meth:`handle_search_interval`."""
+        if self.start_at is None:
+            return
+        self.start_at = validated_start_at(self.start_at, f"Item {hilight(self.name)}")
 
     def handle_rating(self: "MarketItemCommonConfig") -> None:
         if self.rating is None:
@@ -475,6 +483,48 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
     def get_item_config(cls: Type["Marketplace"], **kwargs: Any) -> TItemConfig:
         raise NotImplementedError("get_config method must be implemented by subclasses.")
 
+    @classmethod
+    def item_config_class(cls: Type["Marketplace"]) -> Type[TItemConfig]:
+        """The dataclass this marketplace reads an item's options into.
+
+        The config loader inspects it to decide which of an item's options this
+        platform understands, so it has to be reachable without building one.
+        """
+        raise NotImplementedError("item_config_class must be implemented by subclasses.")
+
+    @classmethod
+    def session_domains(cls: Type["Marketplace"]) -> Tuple[str, ...]:
+        """Domains whose cookies belong to this marketplace.
+
+        Used to filter a session imported from the user's own browser: a paste
+        that turns out to be the wrong export is a normal mistake, and loading
+        somebody's unrelated session into the scraping profile would be a bad
+        way to find out.  Empty means "cannot say", which disables the check.
+        """
+        return ()
+
+    @classmethod
+    def handles_url(cls: Type["Marketplace"], url: str) -> bool:
+        """Whether a listing URL belongs to this marketplace.
+
+        Used by the interactive ``--check <url>`` path to pick the marketplace
+        that can actually read the page.
+        """
+        return False
+
+    @classmethod
+    def validate_item_config(
+        cls: Type["Marketplace"],
+        item_config: "ItemConfig",
+        marketplace_config: "MarketplaceConfig",
+    ) -> None:
+        """Refuse an item this marketplace cannot actually search for.
+
+        What is missing depends on the platform, so each one answers for itself.
+        The default is that a search phrase (already required) is enough.
+        """
+        return None
+
     def configure(
         self: "Marketplace", config: TMarketplaceConfig, translator: Translator | None = None
     ) -> None:
@@ -516,7 +566,45 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
                 (page for page in self.context.pages if page.url in ("about:blank", "")), None
             )
             self.page = blank or self.context.new_page()
+        self._close_stray_blanks()
         return self.page
+
+    def _close_stray_blanks(self: "Marketplace") -> None:
+        """Close any leftover blank tab beside the one actually in use.
+
+        Two marketplaces sharing one browser each want a tab, and the first one
+        takes the blank page the profile opened with -- so the second opens its
+        own.  Get that order wrong once (a search skipped before it navigated, a
+        page dropped and remade) and the browser is left showing an empty
+        about:blank beside the real one, which reads as the monitor having
+        opened a window for nothing.
+
+        Never the last page: closing every tab of a persistent context takes the
+        browser down with it.  Safe to do here without any locking because a
+        Playwright context belongs to exactly one thread -- the whole reason
+        lanes exist -- so no other flow can be halfway through claiming a tab of
+        this browser while this runs.
+        """
+        if self.context is None or self.page is None:
+            return
+        try:
+            pages = list(self.context.pages)
+        except Exception:
+            return
+        # Counted down rather than re-read, and iterated over a copy: closing a
+        # page removes it from `context.pages`, so mutating the list being
+        # walked would skip every second tab.
+        remaining = len(pages)
+        for page in pages:
+            if page is self.page or remaining <= 1:
+                continue
+            try:
+                if page.url in ("about:blank", ""):
+                    page.close()
+                    remaining -= 1
+            except Exception:
+                # A tab that will not close is not worth failing a search over.
+                continue
 
     def seed_session(self: "Marketplace") -> bool:
         """Import a previously saved storage state into a brand-new profile.
@@ -551,6 +639,10 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
         raise NotImplementedError(f"{self.name} does not support interactive login.")
 
     def goto_url(self: "Marketplace", url: str, attempt: int = 0) -> None:
+        # Before the navigation, and so before each of the ten retries: a page
+        # that keeps failing is exactly where a forced pause would otherwise
+        # wait out a minute of retries for nothing.
+        raise_if_cancelled()
         try:
             assert self.page is not None
             if self.logger:
@@ -567,6 +659,18 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
 
     def search(self: "Marketplace", item: TItemConfig) -> Generator[Listing, None, None]:
         raise NotImplementedError("Search method must be implemented by subclasses.")
+
+    def recheck_listing(
+        self: "Marketplace", post_url: str, item_config: TItemConfig
+    ) -> Tuple[ListingStatus, Listing | None]:
+        """Re-read one listing page and say what became of it.
+
+        The second half of the pair is the refreshed snapshot, present only for
+        :attr:`ListingStatus.ACTIVE`.  Anything the marketplace cannot decide
+        must come back as :attr:`ListingStatus.UNKNOWN` rather than as an
+        exception with a guessed meaning -- see the enum for why that matters.
+        """
+        raise NotImplementedError(f"{self.name} cannot re-check a listing.")
 
 
 class WebPage:

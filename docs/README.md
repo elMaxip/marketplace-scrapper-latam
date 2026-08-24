@@ -78,7 +78,16 @@ api_key = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
 
 ### Marketplaces
 
-One or more sections `marketplace.name` show the options for interacting with various marketplaces.
+Every marketplace the monitor supports — Facebook Marketplace and Mercado Libre —
+exists whether or not the configuration mentions it, and a search runs on all of
+them unless it says otherwise. There is nothing to add to make a platform
+available.
+
+A `marketplace.name` section is therefore optional, and only says how to *sign
+in* to one. A section named after something else (`[marketplace.houston]` with
+`market_type = "facebook"`) still creates an extra marketplace of its own, which
+is how one monitor can search two Facebook accounts or two cities as separate
+platforms.
 
 | Option             | Requirement | DataType | Description                                                                                                      |
 | ------------------ | ----------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
@@ -86,7 +95,7 @@ One or more sections `marketplace.name` show the options for interacting with va
 | `username`         | Optional    | String   | Username can be entered manually or kept in the config file. Falls back to `FACEBOOK_USERNAME` environment variable if not set. |
 | `password`         | Optional    | String   | Password can be entered manually or kept in the config file. Falls back to `FACEBOOK_PASSWORD` environment variable if not set. |
 | `login_wait_time`  | Optional    | Integer  | How long (in seconds) to wait for the login to complete — two-factor, CAPTCHA or QR. The wait ends as soon as the session is live, so this is only a ceiling. Defaults to 300. |
-| `language`         | Optional    | String   | Language for webpages                                                                                            |
+| `language`         | Optional    | String   | Language the platform's pages are read in. A fallback only: each search sets its own `language`, and that wins.  |
 | **Common options** |             |          | Options listed in the [Common options](#common-options) section below that provide default values for all items. |
 
 1. Multiple marketplaces with different `name`s can be specified for different `item`s (see [Multiple marketplaces](../README.md#multiple-marketplaces)). However, because the default `marketplace` for all items are `facebook`, it is easiest to define a default marketplace called `marketplace.facebook`.
@@ -257,7 +266,8 @@ One or more `item.item_name` where `item_name` is the name of the item.
 | `description`      | Optional    | String      | A longer description of the item that better describes your requirements (e.g., manufacture, condition, location, seller reputation, shipping options). Only used if AI assistance is enabled. |
 | `keywords`         | Optional    | String/List | Excludes listings whose titles and description do not contain any of the keywords.                                                                                                             |
 | `antikeywords`     | Optional    | String/List | Excludes listings whose titles or descriptions contain any of the specified keywords.                                                                                                          |
-| `marketplace`      | Optional    | String      | Name of the marketplace, default to `facebook` that points to a `marketplace.facebook` sectiion.                                                                                               |
+| `marketplace`      | Optional    | String      | Restricts the item to one marketplace. Unset, it is searched on every one of them. Prefer `enabled = false` in the item's per-marketplace block, which is what the web UI writes.               |
+| `language`         | Optional    | String      | Facebook only, and per search: the interface language its pages are served in, so the parser can find the labels. Set it in `[item.<name>.facebook]`. Defaults to `es_LA`.                      |
 | **Common options** |             |             | Options listed below. These options, if specified in the item section, will override options in the marketplace section.                                                                       |
 
 Marketplaces may return listings that are completely unrelated to search search_phrases, but can also
@@ -280,7 +290,7 @@ The following options that can specified for both `marketplace` sections and `it
 | `delivery_method`     | Optional          | String/List         | One of `all`, `local_pick_up`, and `shipping`.                                                                                                              |
 | `exclude_sellers`     | Optional          | String/List         | Exclude certain sellers by their names (not username).                                                                                                      |
 | `max_price`           | Optional          | Integer/String      | Maximum price, can be followed by a currency name.                                                                                                          |
-| `max_search_interval` | Optional          | String              | Maximum interval in seconds between searches. If specified, a random time will be chosen between `search_interval` and `max_search_interval`.               |
+| `max_search_interval` | Deprecated        | String              | Moved to the [`monitor` section](#monitor-configuration). Still read when `monitor` sets no schedule.                                                        |
 | `min_price`           | Optional          | Integer/String      | Minimum price, can be followed by a currency name.                                                                                                          |
 | `category`            | Optional          | String              | Category of search.                                                                                                                                         |
 | `notify`              | Optional          | String/List         | Users who should be notified.                                                                                                                               |
@@ -293,11 +303,12 @@ The following options that can specified for both `marketplace` sections and `it
 | `ranking_prompt`      | Optional          | String              | Ranking prompt that instruct how AI rates the listings                                                                                                      |
 | `rating`              | Optional          | Integer/List        | Notify users with listings with rating at or higher than specified rating.                                                                                  |
 | `search_city`         | Required          | String/List         | One or more search cities, obtained from the URL of your search query. Required for marketplace or item if `search_region` is unspecified.                  |
-| `search_interval`     | Optional          | String              | Minimal interval between searches, should be specified in formats such as `1d`, `5h`, or `1h 30m`.                                                          |
+| `search_interval`     | Deprecated        | String              | Moved to the [`monitor` section](#monitor-configuration). Still read when `monitor` sets no schedule.                                                        |
 | `search_region`       | Optional          | String/List         | Search over multiple locations to cover an entire region. `regions` should be one or more pre-defined regions or regions defined in the configuration file. |
 | `seller_locations`    | Optional          | String/List         | Only allow searched items from these locations.                                                                                                             |
 | `sort_by`             | Optional          | String              | Order of search results. One of `suggested`, `new`, `price_ascend`, `price_descend`, and `distance_ascend`.                                                 |
-| `start_at`            | Optional          | String/List         | Time to start the search. Overrides `search_interval`.                                                                                                      |
+| `start_at`            | Deprecated        | String/List         | Moved to the [`monitor` section](#monitor-configuration). Still read when `monitor` sets no schedule, where it overrides `search_interval`.                  |
+| `target_price`        | Optional          | Integer/String      | What you hope to pay. Never sent to the marketplace and never used as a filter; the web dashboard measures the cheapest listing found against it. Belongs in `[item.<name>.<marketplace>]`, since the same product is worth a different price on each platform. |
 
 Note that
 
@@ -313,6 +324,8 @@ Note that
 ### Regions
 
 One or more sections of `[region.region_name]`, which defines regions to search. Multiple searches will be performed for multiple cities to cover entire regions.
+
+No regions are shipped with the package any more. Earlier versions merged a dozen of them in from `ai_marketplace_monitor/config.toml` (`usa`, `can`, `mex`, `bra`, `arg`, `aus`, `nzl`, `ind`, `gbr`, `fra`, `spa`, ...), which was only ever useful to somebody living in one of the countries they happened to cover — there was no Chilean one, for instance — while every one of them appeared in the web UI's region picker for everybody. A region is now only what you define here (or save from **Ajustes -> Regiones guardadas** in the web UI, which writes exactly this section). A search naming a region that does not exist is refused by the loader with that region's name in the message, rather than failing obscurely.
 
 | Parameter     | Required/Optional | Data Type    | Description                                                                 |
 | ------------- | ----------------- | ------------ | --------------------------------------------------------------------------- |
@@ -348,18 +361,137 @@ Note that not all words needs to be translated (the English version will be used
 
 Please see [Support for non-English languages](../README.md#support-for-non-english-languages)
 
+### Mercado Libre options
+
+There are none at the platform level: `[marketplace.mercadolibre]` does not have
+to exist, and nothing in it decides whether the platform is searched. Mercado
+Libre is always searched, with or without a signed-in session. What each search
+asks it — the site, the condition, the shipping — goes in that search's own
+`[item.<name>.mercadolibre]` block.
+
+`require_login` used to live here and no longer exists; a file that still has it
+keeps loading, with the key ignored and a warning naming it.
+
+See [docs/mercadolibre.md](mercadolibre.md) for what the site's sign-in wall
+looks like, how the monitor backs off from it, and how to sign in once with
+`ai-marketplace-monitor --login`.
+
 ### Monitor Configuration
 
-The optional `monitor` section allows you to define system configurations for the _AI Marketplace Monitor_. It supports options for sending your queries through one or more proxy servers, which can hide your IP address and reduce the chances of your IP being blocked.
+The optional `monitor` section allows you to define system configurations for the _AI Marketplace Monitor_: **when it searches**, and how it reaches the network.
 
-| Option           | Requirement | DataType    | Description                              |
-| ---------------- | ----------- | ----------- | ---------------------------------------- |
-| `proxy_server`   | Optional    | String/List | URL for one or more proxy servers.       |
-| `proxy_bypass`   | Optional    | String      | Comma-separated domains to bypass proxy. |
-| `proxy_username` | Optional    | String      | username for the proxy.                  |
-| `proxy_password` | Optional    | String      | password for the proxy.                  |
+| Option                | Requirement | DataType    | Description                                                                                    |
+| --------------------- | ----------- | ----------- | ---------------------------------------------------------------------------------------------- |
+| `search_interval`     | Optional    | String      | Time between searches (`30m`, `2h`, or a number of seconds). The low end of the range, if both. |
+| `max_search_interval` | Optional    | String      | With `search_interval`, a random interval is drawn between the two before each search.          |
+| `start_at`            | Optional    | String/List | Times of day to search at, *in addition to* the interval.                                       |
+| `proxy_server`        | Optional    | String/List | URL for one or more proxy servers.                                                              |
+| `proxy_bypass`        | Optional    | String      | Comma-separated domains to bypass proxy.                                                        |
+| `proxy_username`      | Optional    | String      | username for the proxy.                                                                         |
+| `proxy_password`      | Optional    | String      | password for the proxy.                                                                         |
+| `parallel_marketplaces`    | Optional | Boolean    | Search every marketplace at the same time, each on a browser of its own. Default `true`.        |
+| `parallel_listing_updates` | Optional | Boolean    | Give re-checking stored listings a browser and a thread of its own, so it runs alongside searching. Default `true`. |
+| `listing_recheck_interval` | Optional | String     | How stale a stored listing has to be before its page is opened again. Default `6h`.             |
+| `listing_review_interval`  | Optional | String     | How often a round of re-checks happens, or the low end of the range. Default `60` seconds.      |
+| `listing_review_max_interval` | Optional | String  | With `listing_review_interval`, a random interval is drawn between the two before each round.   |
+| `listing_review_start_at`  | Optional | String/List | Times of day to review at, *in addition to* the interval.                                      |
+| `listing_review_batch`     | Optional | Integer    | Stored listings one round re-checks. Default `10`.                                              |
+| `apply_changes_while_running` | Optional | Boolean | Take an edit into the search already under way instead of dropping it. Default `true`.          |
+| `on_delete_running`        | Optional | String     | What deleting the running search does: `"stop"` (default) or `"finish"`.                        |
+| `notify_immediately`       | Optional | Boolean    | Notify each listing as it passes, rather than once at the end of the search. Default `false`.    |
+| `max_description_words`    | Optional | Integer    | Words of the seller's description a notification carries. Default `25`; `0` for no limit.        |
 
+- When to search is a property of the program, not of a product or of a marketplace, so it is asked once here. The same three options on an `item` or a `marketplace` section are **deprecated**: they are still honored when `monitor` sets none of them, so an older configuration file keeps working unchanged, but nothing should be written there any more.
+- `start_at` and the interval are not alternatives in the `monitor` section: set both and the monitor searches on its interval *and* at those times. (In the deprecated per-item form, `start_at` still replaces the interval, which is what a file written that way meant.)
 - If multiple `proxy_server` URLs are specified as a list, a random one will be chosen each time. However, the proxy will not change while the _AI Marketplace Monitor_ is running.
+- The browser does two kinds of work: searching for new listings, and re-reading listings already stored so a price change, a sold item or a dead link is noticed. The second one runs between searches and while waiting for the next one, a few listings at a time.
+  - `listing_recheck_interval` is what makes a listing due. A listing read more recently than this is left alone, by the refresher *and* by a search that turns it up again, so the same page is not opened twice in a row.
+  - Longest-overdue first, except that a listing whose search is still configured outranks one whose search has been deleted or renamed. Orphans are still re-checked and still removed when they sell — they are still in the dashboard — but they cannot hold up the search actually running, which matters because a dropped search leaves the oldest records in the store precisely because nothing has touched them since.
+  - `listing_review_interval`, `listing_review_max_interval` and `listing_review_start_at` say *when* a round happens, with the same three modes the search schedule has: a fixed interval, a random one between two bounds, or fixed times of day. They are not alternatives — set an interval and some times and whichever comes first wins. `listing_review_batch` says how many listings one round re-checks. With none of them set the monitor keeps its old rhythm, a round of ten at most once a minute whenever the browser is free, so an existing configuration behaves exactly as it did.
+  - The moment of the next round is drawn once, when a round ends, and published for the web UI to show. Drawing it on request instead would give a random interval a different answer every time the page refreshed.
+  - `parallel_listing_updates` decides whether reviewing happens *at the same time* as searching (`true`, the default) or takes turns with it on one browser (`false`). On, it gets a browser and a thread of its own — see the note on parallelism below for why it cannot be a second tab. On by default because taking turns means the review only happens in the gaps between searches, which on a busy schedule is barely at all. The cost is a second Chromium, and it is only paid when there is something to re-check: the lane is not started while nothing in the store is overdue.
+  - The two flows are kept off each other's listings by three things that hold however many are running: the queue is built from `last_seen`, which both flows write, so a listing a search has just fetched is not stale and is not in it; freshness is asked again at the moment a listing's turn comes, because the queue is a snapshot and the other flow may have read it since; and a listing being read right now is claimed, with the loser skipping rather than waiting. A marketplace that has refused either flow goes on a cooldown both read.
+
+- The configuration is re-read from the checkpoints the scraping code already stops at, so a change is in use within seconds — mid-search, without waiting for anything to finish. The two options above are the only part the monitor cannot work out for itself: what to do when the thing you just changed is *the search running at that moment*.
+  - `apply_changes_while_running` on (the default) takes the new settings into that search and lets it carry on. Lowering a maximum price is a change of mind about what the results should be, not an instruction to throw away a page already loaded and the AI calls already spent on it. Off restores the older behaviour: the search is dropped and the next one starts.
+  - What a running search can actually absorb depends on when it reads a setting, and the monitor is explicit about the difference rather than claiming all of it. Filters consulted once per listing — `keywords`, `antikeywords`, `exclude_sellers`, `seller_locations`, `rating`, `notify`, the AI prompts — take effect on the very next listing. Anything that went into the URL it is paging through — `search_phrases`, `search_city`, `city_name`, `search_region`, `radius`, `min_price`, `max_price`, `condition`, `date_listed`, `delivery_method`, `availability`, `sort_by`, `currency`, `site`, `free_shipping`, `shipping_origin`, `max_pages`, `language` — applies from that search's next run, and is reported as waiting rather than counted as applied. See `docs/webui.md`.
+  - `on_delete_running` decides what deleting the running search means. `"stop"` ends it at the next checkpoint, which is the natural reading of deleting something. `"finish"` lets it run to the end and notify first, which is worth choosing when a search that is nearly done is worth more than the tidiness. Either way the scraper carries straight on to the next search.
+- Searching is scheduled from when each `(search, platform)` pair **actually last ran**, remembered across restarts in the `search-runs` cache namespace. This is what makes the intervals above mean what they say: `schedule` starts a job's clock when the job is built, and the schedule is rebuilt on every start and on every configuration change, so without this a restart searched everything at once and editing one search postponed all the others by a whole interval. A pair that has never run is due immediately — an interval is a gap *between* runs and cannot precede the first one.
+- `parallel_marketplaces` decides whether the platforms are searched side by side (`true`, the default) or one after another (`false`). On, each platform gets a browser and a thread of its own and keeps its own cycle: one being slow, being cancelled or failing does not hold up the other. Off, the monitor works through a single queue — which **alternates between platforms** rather than emptying one before starting the next. That ordering is not cosmetic: built platform by platform and worked through in that order, the last platform in the file was not touched until every search on the first had finished, and with a forced stop or a restart sending the pass back to the top of the queue it could be scheduled, reported as configured, and never actually run. On is the default because a Facebook pass over a handful of products is the better part of an hour to wait through; turn it off on a machine where a browser per platform hurts.
+- **Why parallelism means a second browser, not a second tab.** Playwright's synchronous API is bound to the thread that created it: touching a page from another thread does not race, it fails. And Chromium takes an exclusive lock on its user-data directory, so two browsers cannot share one profile. Each lane therefore gets `browser-profile-<name>` beside the main one, seeded from the same stored sessions, so the second window opens already signed in. The first marketplace in the file keeps the monitor's own browser and profile, so the one holding your session is never copied.
+- A lane that cannot open a browser is not a platform that gets skipped: it is logged and that platform is searched in turn on the main browser instead.
+- **Each platform keeps one browser.** Which browser a platform runs on is decided the first time it is searched and does not change afterwards. It used to be decided per pass — "the first platform in this pass gets the monitor's own browser, the rest get lanes" — from whatever happened to be due at that instant, so a platform that had a lane at 14:00 ran on the monitor's browser at 14:20 when it was the only one due. From outside that reads as a search inheriting the browser another platform had been using.
+- **A parallel pass is not a barrier.** A lane whose queue empties has its searches marked as run, the schedule republished and anything newly due handed straight back to it, rather than waiting for the slowest platform. Before, two searches ran at once but their *cycles* were locked together: a lane that finished in two minutes sat holding an open browser for the fifty another platform took, with its next search not even chosen and its "next run" still showing a slot that had gone by.
+- **The browsers are closed while there is nothing to search.** A gap longer than two minutes before the next search releases every window and Chromium process (the review lane excepted, because it is using its browser right then); the next search opens them again on the same persistent profiles, which costs a browser start and no sign-in. And a browser that goes away on its own — closed by hand, or crashed — is noticed and replaced rather than left as a handle the monitor believes in.
+
+### Notifications: when they go out, and how long they are
+
+```toml
+[monitor]
+notify_immediately = false
+max_description_words = 25
+```
+
+- `notify_immediately` decides *when*. Off (the default), one message goes out at the end of each platform's search, covering everything it found. On, a listing is notified the moment it has passed every filter and been scored, without waiting for the rest of the platform.
+  - Off is the default because the *message* is better batched: a search that turns up six listings sends one notification about six of them, and switching this on makes it six notifications. It is worth turning on when a platform takes half an hour to search and the good listing is gone in ten — which is a judgement about the market being watched, not one the monitor can make for you.
+  - Either way, **nothing is sent on the scraping thread**. A channel blocks for as long as its service wants — Telegram waits out an HTTP 429, SMTP waits for a handshake — and the checkpoints that read the pause and cancel flags live in the scraping code, so a notification sent inline is a page left open and a "stop" button that does not answer. Sends go to a single worker thread behind a queue, in the order the listings were found, and a channel that fails is logged rather than allowed to hold up the ones behind it. Stopping the monitor drains that queue rather than dropping it.
+- `max_description_words` decides *how much of the listing* the message carries: how many words of the text the seller wrote. Only the notification's copy is shortened — what the scraper stores is the seller's whole text, and the dashboard, the export and the AI all still read it.
+  - 25 by default, because Mercado Libre sellers in particular paste their catalogue, their shipping policy and their opening hours into the description, and that buries the price in the middle of a wall of text. `0` (or `false`) means no limit.
+  - **Words rather than lines**, which is what this counted at first and was wrong: a line is not a property of the text, it is a property of the screen showing it. The same "five lines" is five short ones on a desktop and fifteen wrapped ones on a phone — and a seller who writes one unbroken paragraph has a description of *one* line, so a line limit left it entirely untouched while the message stayed enormous. `max_description_lines` is still accepted and ignored, so an older file loads; the web UI drops it from the file the next time the notification settings are saved.
+  - Whitespace is not a word: the line breaks inside what is kept are the seller's own, and only the tail is dropped. Over the limit, the text ends in `...`.
+  - **The line limit is not what keeps a message deliverable**, and the two should not be confused. Telegram refuses any message over 4096 characters with "Message is too long" and delivers *nothing*; Pushover refuses over 1024; ntfy over 4096. The AI's commentary and a long title can exceed those between them with no description at all. So every channel declares the limit it actually has and the card is *rebuilt shorter* until it fits — description first, then the AI's comment, then the title, never the price or the link. Rebuilt rather than cut, because cutting rendered MarkdownV2 can strand a backslash from the character it escapes, which Telegram rejects just as firmly for a different reason. A batch too big for one message becomes several messages rather than fewer listings.
+
+```toml
+[monitor]
+# every 5 to 15 minutes, plus a sweep at 09:00 and 18:30
+search_interval = '5m'
+max_search_interval = '15m'
+start_at = ['09:00', '18:30']
+
+# re-read each stored listing at most once every six hours
+listing_recheck_interval = '6h'
+
+# a round of 25 listings every 30 to 90 minutes, plus one at 09:00 and 21:00
+listing_review_interval = '30m'
+listing_review_max_interval = '90m'
+listing_review_start_at = ['09:00', '21:00']
+listing_review_batch = 25
+
+# both on by default: a browser per platform, plus one for the re-checks
+parallel_listing_updates = true
+parallel_marketplaces = true
+
+# editing the search that is running takes effect in it, and does not stop it;
+# deleting it stops it there and then
+apply_changes_while_running = true
+on_delete_running = "stop"
+
+# one notification per search, with 25 words of the seller's description
+notify_immediately = false
+max_description_words = 25
+```
+
+### Removing sold and dead listings
+
+While re-checking a Facebook Marketplace listing, the monitor reads the page to
+see whether the listing still exists. It is removed from the store — permanently,
+with a tombstone, so a later search does not bring it back — in exactly two
+cases:
+
+- the listing's own heading starts with **Sold** (`Vendido`, and whatever the
+  configured `language` translates it to), which is what Facebook stamps on a
+  listing whose item is gone; or
+- the page is Facebook's "this content isn't available right now" card, with no
+  listing heading of its own.
+
+Everything else leaves the listing exactly where it was and simply tries again
+later: a timeout, a dropped connection, a rate limit, a bounce to the login page,
+or a layout none of the parsers recognise. These are indistinguishable from a
+deleted listing at a glance, and none of them is evidence that one is gone.
+
+Mercado Libre listings are re-read for their price but never removed this way:
+it leaves finished listings up under a different label, and the monitor has no
+tested reading of those states.
 
 ### Additional options
 

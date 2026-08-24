@@ -1,10 +1,10 @@
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from itertools import chain
 from logging import Logger
 from pathlib import Path
-from typing import Any, Dict, Generic, List
+from typing import Any, Dict, Generic, List, Tuple
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -21,12 +21,54 @@ from .ai import (
 )
 from .facebook import FacebookMarketplace
 from .marketplace import TItemConfig, TMarketplaceConfig
+from .mercadolibre import MercadoLibreMarketplace
 from .notification import NotificationConfig
 from .region import RegionConfig
 from .user import User, UserConfig
 from .utils import MonitorConfig, Translator, hilight, merge_dicts
 
-supported_marketplaces = {"facebook": FacebookMarketplace}
+supported_marketplaces = {
+    "facebook": FacebookMarketplace,
+    "mercadolibre": MercadoLibreMarketplace,
+}
+
+
+def market_type_of(marketplace_name: str, marketplace_config: Dict[str, Any]) -> str:
+    """Which marketplace implementation a ``[marketplace.*]`` section asks for.
+
+    Explicit ``market_type`` wins.  Otherwise the section name is used when it
+    names a supported marketplace, so ``[marketplace.mercadolibre]`` needs no
+    boilerplate, and anything else (``[marketplace.houston]``) keeps falling
+    back to Facebook as it always did.
+    """
+    declared = marketplace_config.get("market_type")
+    if declared:
+        return str(declared)
+    if marketplace_name in supported_marketplaces:
+        return marketplace_name
+    return "facebook"
+
+
+#: Radius used for a region city that names none of its own.
+#:
+#: Mirrors ``RegionConfig.handle_radius``, which fills the column in for a
+#: region that only lists cities; this is the same number for the rare case of
+#: a region whose radius column is shorter than its city list.
+DEFAULT_REGION_RADIUS = 500
+
+#: Marketplace options that used to exist, and what happens instead now.
+#:
+#: Dropped with a warning rather than rejected: a file that was valid before an
+#: upgrade must keep loading, and a monitor that refuses to start over a setting
+#: it decided to stop having is the worst of both.
+RETIRED_MARKETPLACE_KEYS: Dict[str, str] = {
+    "require_login": (
+        "Mercado Libre is now always searched, with or without a signed-in session; "
+        "if it starts asking for an account, the monitor waits it out and says so."
+    ),
+}
+
+
 supported_ai_backends = {
     "deepseek": DeepSeekBackend,
     "gemini": GeminiBackend,
@@ -34,6 +76,35 @@ supported_ai_backends = {
     "anthropic": AnthropicBackend,
     "ollama": OllamaBackend,
 }
+
+
+def split_options(
+    options: Dict[str, Any], factory: Any, item_name: str
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Split an item's options into the ones this marketplace understands.
+
+    A filter that exists on another platform but not on this one is dropped
+    rather than applied approximately -- a Facebook radius means nothing to
+    Mercado Libre, which has no location filter at all.  An option no
+    marketplace knows is still an error, so a typo does not pass silently.
+    """
+    accepted_names = {f.name for f in fields(factory)}
+    known_elsewhere = set()
+    for other in supported_marketplaces.values():
+        known_elsewhere |= {f.name for f in fields(other.item_config_class())}
+
+    accepted: Dict[str, Any] = {}
+    ignored: List[str] = []
+    for key, value in options.items():
+        if key in accepted_names:
+            accepted[key] = value
+        elif key in known_elsewhere:
+            ignored.append(key)
+        else:
+            raise ValueError(
+                f"Item {hilight(item_name)} has an unknown option {hilight(key)}."
+            )
+    return accepted, ignored
 
 
 class ConfigItem(Enum):
@@ -54,11 +125,15 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
     user: Dict[str, UserConfig] = field(init=False)
     notification: Dict[str, NotificationConfig] = field(init=False)
     marketplace: Dict[str, TMarketplaceConfig] = field(init=False)
-    item: Dict[str, TItemConfig] = field(init=False)
+    #: One configuration per (marketplace, item): the same product searched
+    #: on Facebook and on Mercado Libre needs one config each, because the
+    #: platforms accept different options.
+    items: Dict[Tuple[str, str], TItemConfig] = field(init=False)
     translator: Dict[str, Translator] = field(init=False)
     region: Dict[str, RegionConfig] = field(init=False)
 
     def __init__(self: "Config", config_files: List[Path], logger: Logger | None = None) -> None:
+        self.logger = logger
         configs = []
         system_config = Path(__file__).parent / "config.toml"
 
@@ -139,31 +214,92 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
                 self.notification[key] = cfg
 
     def get_marketplace_config(self: "Config", config: Dict[str, Any]) -> None:
+        """Build one config per platform the monitor knows how to search.
+
+        Every supported marketplace exists, always.  A platform is a capability
+        of this program, not something the user installs: there is nothing
+        sensible to say about "Mercado Libre has not been added yet", and making
+        people add it before a search could offer it only ever produced a
+        config that looked complete and searched nowhere.
+
+        A ``[marketplace.<name>]`` section is therefore optional, and carries
+        only what *is* the user's business about a platform -- how to sign in to
+        it.  A section named after something other than a supported marketplace
+        (``[marketplace.houston]``) still creates one of its own, so a
+        configuration written before this keeps working.
+        """
         # check for required fields in each marketplace
         self.marketplace = {}
-        for marketplace_name, marketplace_config in config["marketplace"].items():
-            market_type = marketplace_config.get("market_type", "facebook")
+        sections: Dict[str, Dict[str, Any]] = dict(config.get("marketplace", {}) or {})
+        # Built-ins first, so they keep a stable order regardless of what the
+        # file happens to mention; a section for one of them is merged in below
+        # rather than added a second time.
+        declared = {
+            name: sections.pop(name, {}) or {} for name in supported_marketplaces
+        }
+        declared.update(sections)
+        for marketplace_name, marketplace_config in declared.items():
+            marketplace_config = self._drop_retired_keys(marketplace_name, marketplace_config)
+            market_type = market_type_of(marketplace_name, marketplace_config)
             if market_type not in supported_marketplaces:
                 raise ValueError(
                     f"Marketplace {hilight(market_type)} is not supported. Supported marketplaces are: {supported_marketplaces.keys()}"
                 )
             marketplace_class = supported_marketplaces[market_type]
             self.marketplace[marketplace_name] = marketplace_class.get_config(
-                name=marketplace_name, monitor_config=self.monitor, **marketplace_config
+                name=marketplace_name,
+                monitor_config=self.monitor,
+                # Pass the resolved type, so a section named after its
+                # marketplace does not have to repeat it.
+                **{**marketplace_config, "market_type": market_type},
             )
-            lan = self.marketplace[marketplace_name].language
-            if lan is None:
-                continue
-            # no exact match is required
-            if lan.split("_")[0] not in {
-                x.split("_")[0] for x in config[ConfigItem.TRANSLATION.value].keys()
-            }:
-                raise ValueError(f"Translation for language {lan} is not supported.")
+            self.validate_language(config, self.marketplace[marketplace_name].language)
+
+    def _drop_retired_keys(
+        self: "Config", marketplace_name: str, section: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Ignore a marketplace option this version no longer has.
+
+        A retired option is not a typo, and refusing to load the file over one
+        would strand a configuration that was valid yesterday.  It is dropped
+        and said out loud instead, so the behaviour change is visible.
+        """
+        retired = {key: RETIRED_MARKETPLACE_KEYS[key] for key in section if key in RETIRED_MARKETPLACE_KEYS}
+        if not retired:
+            return section
+        for key, why in retired.items():
+            if self.logger:
+                self.logger.warning(
+                    f"""{hilight("[Config]", "fail")} [marketplace.{marketplace_name}] """
+                    f"""{hilight(key)} no longer exists and is ignored. {why}"""
+                )
+        return {key: value for key, value in section.items() if key not in retired}
+
+    @staticmethod
+    def validate_language(config: Dict[str, Any], language: str | None) -> None:
+        """Refuse a language the scrapers have no vocabulary for.
+
+        The parsers find things on the page by their label, so the language is
+        the difference between reading a listing and reading half of one.  No
+        exact match is required: ``es_LA`` is served by the ``es`` table.
+        """
+        if not language:
+            return
+        base = language.split("_")[0]
+        # English needs no table: it is the language the parsers are written in,
+        # so `en_US` is always available even though nothing translates to it.
+        if base.lower() == "en":
+            return
+        available = config.get(ConfigItem.TRANSLATION.value, {}) or {}
+        if base not in {x.split("_")[0] for x in available}:
+            raise ValueError(f"Translation for language {language} is not supported.")
 
     def get_user_config(self: "Config", config: Dict[str, Any]) -> None:
-        # check for required fields in each user
+        # Zero users is a legitimate state: a fresh install has none, and a
+        # monitor with nobody to notify still searches, stores and shows what it
+        # finds in the web UI.  So the section is optional, like `item`.
         self.user: Dict[str, UserConfig] = {}
-        for user_name, user_config in config["user"].items():
+        for user_name, user_config in (config.get("user", {}) or {}).items():
             self.user[user_name] = User.get_config(name=user_name, **user_config)
 
     def get_region_config(self: "Config", config: Dict[str, Any]) -> None:
@@ -173,38 +309,162 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
             self.region[region_name] = RegionConfig(name=region_name, **region_config)
 
     def get_item_config(self: "Config", config: Dict[str, Any]) -> None:
-        # check for required fields in each user
+        """Build one item configuration per marketplace the item runs on.
 
-        self.item = {}
-        for item_name, item_config in config["item"].items():
-            # if marketplace is specified, it must exist
-            if "marketplace" in item_config:
-                if item_config["marketplace"] not in config["marketplace"]:
+        An item is a *product the user wants*, not a platform: unless it names a
+        marketplace, it is searched on every configured one.  Since the
+        platforms take different options, each pair gets its own config object,
+        built from the item's shared options plus its
+        ``[item.<name>.<marketplace>]`` overrides, minus whatever that platform
+        has no filter for.
+        """
+        self.items = {}
+        # Zero searches is a legitimate state -- a fresh install has none, and a
+        # user may delete the last one -- so the section is optional.
+        for item_name, item_config in config.get("item", {}).items():
+            # A nested table is a per-marketplace override; everything else is
+            # shared by all of them.
+            overrides = {
+                key: value for key, value in item_config.items() if isinstance(value, dict)
+            }
+            shared = {
+                key: value for key, value in item_config.items() if not isinstance(value, dict)
+            }
+
+            # The platforms are the ones this program knows how to search, plus
+            # any extra section the file declares -- never something the user
+            # had to add first.
+            for override_name in overrides:
+                if override_name not in self.marketplace:
                     raise ValueError(
-                        f"Item {hilight(item_name)} specifies a marketplace that does not exist."
+                        f"Item {hilight(item_name)} has a section for marketplace "
+                        f"{hilight(override_name)}, which this monitor does not know. "
+                        f"Known marketplaces: {', '.join(sorted(self.marketplace))}."
                     )
 
-            for marketplace_name, markerplace_config in config["marketplace"].items():
+            # `marketplace` restricts an item to one platform.
+            restricted_to = shared.pop("marketplace", None)
+            if restricted_to is not None and restricted_to not in self.marketplace:
+                raise ValueError(
+                    f"Item {hilight(item_name)} specifies a marketplace that does not exist."
+                )
+
+            for marketplace_name, marketplace_config in self.marketplace.items():
+                if restricted_to is not None and restricted_to != marketplace_name:
+                    continue
                 marketplace_class = supported_marketplaces[
-                    markerplace_config.get("market_type", "facebook")
+                    (marketplace_config.market_type or "facebook").lower()
                 ]
-                if (
-                    "marketplace" not in item_config
-                    or item_config["marketplace"] == marketplace_name
-                ):
-                    # use the first available marketplace
-                    self.item[item_name] = marketplace_class.get_item_config(
-                        name=item_name,
-                        marketplace=marketplace_name,
-                        **{x: y for x, y in item_config.items() if x != "marketplace"},
+                options = {**shared, **overrides.get(marketplace_name, {})}
+                accepted, ignored = split_options(
+                    options, marketplace_class.item_config_class(), item_name
+                )
+                if ignored and self.logger:
+                    self.logger.debug(
+                        f"""{hilight("[Config]", "info")} {marketplace_name} has no """
+                        f"""{", ".join(sorted(ignored))} filter, so it is not applied to """
+                        f"""{hilight(item_name)} there."""
                     )
-                    break
+                built = marketplace_class.get_item_config(
+                    name=item_name, marketplace=marketplace_name, **accepted
+                )
+                # A search may name the language its platform is read in, so it
+                # is checked against the available vocabularies here, the same
+                # way the platform's own is.
+                self.validate_language(config, getattr(built, "language", None))
+                self.items[(marketplace_name, item_name)] = built
+
+    @property
+    def item(self: "Config") -> Dict[str, TItemConfig]:
+        """One configuration per item, for callers that do not care which
+        marketplace it belongs to (the first one wins)."""
+        first: Dict[str, TItemConfig] = {}
+        for (_marketplace_name, item_name), item_config in self.items.items():
+            first.setdefault(item_name, item_config)
+        return first
+
+    def items_of(self: "Config", marketplace_name: str) -> Dict[str, TItemConfig]:
+        """Every item configured to run on one marketplace."""
+        return {
+            item_name: item_config
+            for (name, item_name), item_config in self.items.items()
+            if name == marketplace_name
+        }
+
+    def describe(self: "Config") -> Dict[str, Any]:
+        """A plain-data picture of this configuration, for the web UI.
+
+        The point is not to re-render the file -- the interface can already read
+        that -- but to show the configuration *as resolved*: every default
+        applied, every inherited option folded in, one entry per (item,
+        marketplace) pair exactly as the scraping loop will use it.  That is
+        what makes "the scraper is running your old maximum price" a statement
+        the interface can prove rather than guess.
+
+        Secrets are left in place here and masked on the way out of the web
+        server, which is the layer that knows what a browser may see.
+        """
+
+        def plain(value: Any) -> Any:
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            if isinstance(value, (list, tuple, set)):
+                return [plain(item) for item in value]
+            if isinstance(value, dict):
+                return {str(key): plain(item) for key, item in value.items()}
+            return str(value)
+
+        def fields_of(config: Any) -> Dict[str, Any]:
+            return {
+                f.name: plain(getattr(config, f.name, None))
+                for f in fields(config)
+                # A back-reference, not a setting: rendering it would repeat the
+                # whole [monitor] section inside every marketplace.
+                if f.name != "monitor_config"
+            }
+
+        searches: List[Dict[str, Any]] = []
+        for (marketplace_name, item_name), item_config in sorted(
+            self.items.items(), key=lambda pair: (pair[0][1], pair[0][0])
+        ):
+            marketplace_config = self.marketplace.get(marketplace_name)
+            searches.append(
+                {
+                    "item": item_name,
+                    "marketplace": marketplace_name,
+                    "market_type": (
+                        getattr(marketplace_config, "market_type", None)
+                        if marketplace_config
+                        else None
+                    ),
+                    # Disabled either way: an item switched off, or a platform
+                    # switched off under it.  Both mean it will not be searched.
+                    "enabled": getattr(item_config, "enabled", None) is not False
+                    and getattr(marketplace_config, "enabled", None) is not False,
+                    "search_phrases": plain(getattr(item_config, "search_phrases", []) or []),
+                    "options": fields_of(item_config),
+                }
+            )
+
+        return {
+            "monitor": fields_of(self.monitor),
+            "marketplaces": {
+                name: fields_of(config) for name, config in sorted(self.marketplace.items())
+            },
+            "items": sorted({item_name for _marketplace, item_name in self.items}),
+            "searches": searches,
+            "users": sorted(self.user),
+            "ai": sorted(self.ai),
+            "notifications": sorted(self.notification),
+            "regions": sorted(self.region),
+        }
 
     def validate_sections(self: "Config", config: Dict[str, Any]) -> None:
-        # check for required sections
-        for required_section in ["marketplace", "user", "item"]:
-            if required_section not in config:
-                raise ValueError(f"Config file does not contain a {required_section} section.")
+        # No section is required.  A monitor with no searches is idle rather
+        # than broken (refusing such a file is what used to make the last search
+        # undeletable), the platforms are built in rather than declared, and a
+        # monitor with nobody to notify still searches and shows what it finds.
+        # An empty file is a valid starting point.
 
         # check allowed keys in config
         for key in config:
@@ -214,7 +474,7 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
     def validate_users(self: "Config") -> None:
         """Check if notified users exists"""
         # if user is specified in other section, they must exist
-        for config in chain(self.marketplace.values(), self.item.values()):
+        for config in chain(self.marketplace.values(), self.items.values()):
             for user in config.notify or []:
                 if user not in self.user:
                     raise ValueError(
@@ -223,7 +483,7 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
 
     def validate_ais(self: "Config") -> None:
         # if ai is specified in other section, they must exist
-        for config in chain(self.marketplace.values(), self.item.values()):
+        for config in chain(self.marketplace.values(), self.items.values()):
             for ai in config.ai or []:
                 if ai not in self.ai:
                     raise ValueError(
@@ -265,49 +525,82 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
                         setattr(config, key, value)
 
     def expand_regions(self: "Config") -> None:
-        # if region is specified in other section, they must exist
-        for config in chain(self.marketplace.values(), self.item.values()):
+        """Turn every named region into the cities the search will actually use.
+
+        Regions are the user's own now -- nothing is shipped with the package --
+        so the interesting failure is a search naming one that has been renamed
+        or deleted since.  That is said in those words, and checked before the
+        lookup rather than after it: reading the missing key first turned a
+        deleted region into a bare ``KeyError`` with no name in it.
+        """
+        for config in chain(self.marketplace.values(), self.items.values()):
             if config.search_region is None:
                 continue
             config.city_name = []
             config.search_city = []
             config.radius = []
             config.currency = []
+            missing_currency = False
 
             for region in config.search_region:
-                region_config: RegionConfig = self.region[region]
                 if region not in self.region:
                     raise ValueError(
-                        f"Region {hilight(region)} specified in {hilight(config.name)} does not exist."
+                        f"Region {hilight(region)} used by {hilight(config.name)} does not "
+                        "exist. Saved regions are defined in the web UI under Ajustes -> "
+                        "Regiones guardadas; pick another one there, or add its cities to "
+                        "the search directly."
                     )
+                region_config: RegionConfig = self.region[region]
                 if region_config.enabled is False:
                     continue
-                # avoid duplicated addition of search_city
-                for search_city, city_name, radius, currency in zip(
-                    region_config.search_city or [],
-                    region_config.city_name or [],
-                    region_config.radius or [],
-                    region_config.currency or [],
-                ):
-                    if search_city not in config.search_city:
-                        config.search_city.append(search_city)
-                        config.city_name.append(city_name)
-                        config.radius.append(radius)
-                        config.currency.append(currency)
+                # Driven by the cities, not by a zip of all four columns.  A
+                # region only has to name its cities -- ``city_name`` and
+                # ``radius`` are filled in by RegionConfig, and ``currency`` is
+                # genuinely optional -- and zipping the four together made an
+                # absent column silently truncate the whole region to nothing.
+                # The search then had no city at all and the marketplace
+                # rejected it with "No search_city or search_region is
+                # specified", naming the one thing the user *had* set.
+                cities = region_config.search_city or []
+                names = region_config.city_name or []
+                radii = region_config.radius or []
+                currencies = region_config.currency or []
+                for index, search_city in enumerate(cities):
+                    if search_city in config.search_city:
+                        continue
+                    config.search_city.append(search_city)
+                    config.city_name.append(
+                        names[index] if index < len(names) else search_city.capitalize()
+                    )
+                    config.radius.append(
+                        radii[index] if index < len(radii) else DEFAULT_REGION_RADIUS
+                    )
+                    if index < len(currencies):
+                        config.currency.append(currencies[index])
+                    else:
+                        missing_currency = True
+                        config.currency.append("")
+            if missing_currency:
+                # A currency is optional -- it only converts a price written as
+                # "100 USD" -- and the four lists are read in parallel, so a
+                # half-filled column would attach the wrong currency to a city.
+                # Better none at all than one that is quietly wrong.
+                config.currency = []
 
     def validate_items(self: "Config") -> None:
-        # if item is specified in other section, they must exist
-        for marketplace_config in self.marketplace.values():
+        """Let each marketplace say whether it can run the items assigned to it.
+
+        What an item needs depends on the platform -- Facebook cannot search
+        without a city, Mercado Libre searches a whole site -- so the check
+        belongs to the marketplace class rather than here.
+        """
+        for marketplace_name, marketplace_config in self.marketplace.items():
             if marketplace_config.enabled is False:
                 continue
-            for item_config in self.item.values():
+            marketplace_class = supported_marketplaces[
+                (marketplace_config.market_type or "facebook").lower()
+            ]
+            for item_config in self.items_of(marketplace_name).values():
                 if item_config.enabled is False:
                     continue
-                if (
-                    item_config.marketplace is None
-                    or item_config.marketplace == marketplace_config.name
-                ):
-                    if not item_config.search_city and not marketplace_config.search_city:
-                        raise ValueError(
-                            f"No search_city or search_region is specified for {item_config.name} or market {marketplace_config.name}"
-                        )
+                marketplace_class.validate_item_config(item_config, marketplace_config)

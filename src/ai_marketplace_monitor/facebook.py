@@ -14,9 +14,11 @@ from currency_converter import CurrencyConverter  # type: ignore
 from playwright.sync_api import BrowserContext, ElementHandle, Page  # type: ignore
 from rich.pretty import pretty_repr
 
+from .control import claim, raise_if_cancelled
 from .listing import Listing
-from .marketplace import ItemConfig, Marketplace, MarketplaceConfig, WebPage
+from .marketplace import ItemConfig, ListingStatus, Marketplace, MarketplaceConfig, WebPage
 from .observations import record_observation
+from .refresh import SEARCH_RECHECK_COOLDOWN, was_checked_recently
 from .session import save_device_state
 from .utils import (
     BaseConfig,
@@ -27,6 +29,7 @@ from .utils import (
     convert_to_seconds,
     counter,
     extract_price,
+    fold_text as _fold,
     hilight,
     is_substring,
 )
@@ -243,6 +246,27 @@ class FacebookMarketplaceConfig(MarketplaceConfig, FacebookMarketItemCommonConfi
     password: str | None = None
     username: str | None = None
 
+    #: The interface language assumed when the configuration does not name one.
+    #:
+    #: Facebook serves Marketplace in whatever language the account is set to,
+    #: and every label the parser looks for -- the sold badge, the "Ver
+    #: detalles" link, the seller and condition rows -- is that language's.  A
+    #: monitor with no language configured falls back to matching English on a
+    #: Spanish page, which does not fail loudly: it parses a listing with no
+    #: seller and no condition, and the search quietly returns nothing useful.
+    #: Naming a default is what stops an unset field from meaning "English".
+    DEFAULT_LANGUAGE = "es_LA"
+
+    def handle_language(self: "FacebookMarketplaceConfig") -> None:
+        if self.language is not None and not isinstance(self.language, str):
+            raise ValueError(
+                f"Marketplace {hilight(self.name)} language, if specified, must be a string."
+            )
+        # Empty counts as unset: a config written by an older web UI leaves
+        # `language = ""` behind, and an empty string is not a language.
+        if not self.language:
+            self.language = self.DEFAULT_LANGUAGE
+
     def handle_username(self: "FacebookMarketplaceConfig") -> None:
         if self.username is None:
             self.username = os.environ.get("FACEBOOK_USERNAME")
@@ -281,7 +305,26 @@ class FacebookMarketplaceConfig(MarketplaceConfig, FacebookMarketItemCommonConfi
 
 @dataclass
 class FacebookItemConfig(ItemConfig, FacebookMarketItemCommonConfig):
-    pass
+    #: The interface language Facebook serves *this* search in.
+    #:
+    #: It belongs to the search rather than to the platform because it is a
+    #: property of the pages being read, and two searches can legitimately want
+    #: different ones -- a Chilean search read in ``es_LA`` and a US one read in
+    #: ``en_US``, from the same monitor.  Unset falls back to the marketplace's
+    #: own ``language``, and then to
+    #: :attr:`FacebookMarketplaceConfig.DEFAULT_LANGUAGE`, so a configuration
+    #: written before the move keeps behaving exactly as it did.
+    language: str | None = None
+
+    def handle_language(self: "FacebookItemConfig") -> None:
+        if self.language is None:
+            return
+        if not isinstance(self.language, str):
+            raise ValueError(f"Item {hilight(self.name)} language must be a string.")
+        # An older web UI wrote `language = ""`, which is not a language: it
+        # means "whatever the platform says", same as leaving it out.
+        if not self.language.strip():
+            self.language = None
 
 
 class FacebookMarketplace(Marketplace):
@@ -310,6 +353,42 @@ class FacebookMarketplace(Marketplace):
     #: URL fragments that mean Facebook is still asking us to authenticate.
     AUTH_WALL_MARKERS = ("/login", "/checkpoint", "two_step_verification", "/recover")
 
+    #: Words Facebook stamps on the heading of a listing whose item is gone.
+    #:
+    #: The translator supplies the one for the configured interface language;
+    #: these are the fallback for a monitor whose ``language`` was never set, and
+    #: they are matched only against the *start* of the listing's own heading.
+    #: Anywhere else the same word is ordinary prose ("vendido por", "sold by")
+    #: and matching it would delete a listing that is perfectly alive.
+    SOLD_MARKERS = (
+        "sold",
+        "vendido",
+        "vendida",
+        "vendu",
+        "vendue",
+        "verkauft",
+        "venduto",
+    )
+
+    #: Phrases Facebook shows *instead of* a listing when there is none.
+    #:
+    #: Whole phrases rather than words, because this is the evidence that
+    #: justifies deleting a stored listing and a single word would be far too
+    #: easy to hit by accident.
+    MISSING_PAGE_MARKERS = (
+        "this content isn't available right now",
+        "this content isn't available at the moment",
+        "this page isn't available",
+        "esta pagina no esta disponible",
+        "este contenido no esta disponible en este momento",
+        "este contenido no esta disponible",
+        "contenido no disponible",
+        "el enlace que has seguido puede estar roto",
+        "the link you followed may be broken",
+        "cette page n'est pas disponible",
+        "diese seite ist nicht verfugbar",
+    )
+
     def __init__(
         self: "FacebookMarketplace",
         name: str,
@@ -324,6 +403,50 @@ class FacebookMarketplace(Marketplace):
     @classmethod
     def get_config(cls: Type["FacebookMarketplace"], **kwargs: Any) -> FacebookMarketplaceConfig:
         return FacebookMarketplaceConfig(**kwargs)
+
+    @classmethod
+    def item_config_class(cls: Type["FacebookMarketplace"]) -> Type[FacebookItemConfig]:
+        return FacebookItemConfig
+
+    @classmethod
+    def session_domains(cls: Type["FacebookMarketplace"]) -> Tuple[str, ...]:
+        return ("facebook.com", "messenger.com")
+
+    @classmethod
+    def handles_url(cls: Type["FacebookMarketplace"], url: str) -> bool:
+        return url.startswith("https://www.facebook.com/marketplace/item")
+
+    @classmethod
+    def validate_item_config(
+        cls: Type["FacebookMarketplace"],
+        item_config: ItemConfig,
+        marketplace_config: MarketplaceConfig,
+    ) -> None:
+        """Facebook Marketplace searches from a city, so one has to be known.
+
+        ``search_city`` is what is checked, not ``search_region``: a region is
+        expanded into its cities before this runs, so a search that names a
+        region with no cities of its own lands here too.  The message says so,
+        because "no city is specified" about a search that plainly specifies a
+        region is the kind of complaint that sends people looking in the wrong
+        place.
+        """
+        if item_config.search_city or marketplace_config.search_city:
+            return
+        named = list(item_config.search_region or []) or list(
+            marketplace_config.search_region or []
+        )
+        if named:
+            raise ValueError(
+                f"{item_config.name} searches Facebook from the region(s) "
+                f"{', '.join(named)}, but no city came out of them: the region has no "
+                f"search_city, or every one of its cities is disabled. Add its cities in "
+                f"Ajustes -> Regiones guardadas, or give the search a city of its own."
+            )
+        raise ValueError(
+            f"No search_city or search_region is specified for {item_config.name} "
+            f"or market {marketplace_config.name}"
+        )
 
     @classmethod
     def get_item_config(cls: Type["FacebookMarketplace"], **kwargs: Any) -> FacebookItemConfig:
@@ -379,6 +502,20 @@ class FacebookMarketplace(Marketplace):
         deadline = time.time() + timeout
         announced = False
         while time.time() < deadline:
+            # A checkpoint, like every other long wait in the scraping path.
+            # Without it this loop was the one place the monitor stopped
+            # listening: "Detener búsqueda de esta plataforma" sat on
+            # "deteniéndose…" for up to five minutes, and so did a pause, a
+            # stop, and a configuration change that deleted this very search --
+            # because the flags are only ever read at checkpoints and this
+            # loop had none.  Raising here unwinds through `login`, which is
+            # inside `search_item`, so the search ends exactly as it would at
+            # any other checkpoint.
+            #
+            # `--login` is unaffected: nothing has asked for a cancellation and
+            # no guard is installed, so this is a no-op there -- which is what
+            # keeps the untimed manual sign-in untimed.
+            raise_if_cancelled()
             if self.is_logged_in():
                 return True
             if not announced and self.logger:
@@ -740,29 +877,43 @@ class FacebookMarketplace(Marketplace):
                         continue
                     if self.keyboard_monitor is not None and self.keyboard_monitor.is_paused():
                         return
+                    # A forced pause from the web UI ends the search here, between
+                    # two listings, where nothing is half-written.
+                    raise_if_cancelled()
                     counter.increment(CounterItem.LISTING_EXAMINED, item_config.name)
                     found[listing.post_url.split("?")[0]] = True
                     # filter by title and location; skip keyword filtering since we do not have description yet.
                     if not self.check_listing(listing, item_config, description_available=False):
                         counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
                         continue
-                    try:
-                        details, from_cache = self.get_listing_details(
-                            listing.post_url,
-                            item_config,
-                            price=listing.price,
-                            title=listing.title,
-                        )
-                        if not from_cache:
-                            time.sleep(5)
-                    except KeyboardInterrupt:
-                        raise
-                    except Exception as e:
-                        if self.logger:
-                            self.logger.error(
-                                f"""{hilight("[Retrieve]", "fail")} Failed to get item details: {e}"""
+                    # One reader per listing.  The refresher walks the same
+                    # listings from the other end, and both opening the same page
+                    # is duplicated traffic at best and a lost update at worst.
+                    with claim(listing.marketplace, listing.id) as mine:
+                        if not mine:
+                            if self.logger:
+                                self.logger.debug(
+                                    f"""{hilight("[Skip]", "info")} {listing.title} is being """
+                                    """re-checked right now; leaving it to that."""
+                                )
+                            continue
+                        try:
+                            details, from_cache = self.get_listing_details(
+                                listing.post_url,
+                                item_config,
+                                price=listing.price,
+                                title=listing.title,
                             )
-                        continue
+                            if not from_cache:
+                                time.sleep(5)
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception as e:
+                            if self.logger:
+                                self.logger.error(
+                                    f"""{hilight("[Retrieve]", "fail")} Failed to get item details: {e}"""
+                                )
+                            continue
                     # currently we trust the other items from summary page a bit better
                     # so we do not copy title, description etc from the detailed result
                     for attr in ("condition", "seller", "description"):
@@ -802,6 +953,7 @@ class FacebookMarketplace(Marketplace):
         item_config: ItemConfig,
         price: str | None = None,
         title: str | None = None,
+        recheck_cooldown: float | None = None,
     ) -> Tuple[Listing, bool]:
         assert post_url.startswith("https://www.facebook.com")
         details = Listing.from_cache(post_url)
@@ -811,6 +963,23 @@ class FacebookMarketplace(Marketplace):
             and (title is None or details.title == title)
         ):
             # if the price and title are the same, we assume everything else is unchanged.
+            return details, True
+
+        cooldown = SEARCH_RECHECK_COOLDOWN if recheck_cooldown is None else recheck_cooldown
+        if (
+            details is not None
+            and cooldown > 0
+            and was_checked_recently(details.marketplace, details.id, cooldown)
+        ):
+            # Somebody read this listing's page minutes ago -- the refresher,
+            # or an earlier search phrase in this same cycle.  Whatever the
+            # search card says now, opening the page again this soon would only
+            # repeat a reading we already have; the next cycle picks it up.
+            if self.logger:
+                self.logger.debug(
+                    f"""{hilight("[Skip]", "info")} {post_url} was checked moments ago; """
+                    """not opening it again."""
+                )
             return details, True
 
         if not self.page and not self.login():
@@ -834,6 +1003,102 @@ class FacebookMarketplace(Marketplace):
             )
         details.to_cache(post_url)
         return details, False
+
+    def _sold_words(self: "FacebookMarketplace") -> Tuple[str, ...]:
+        """Every spelling of "sold" worth looking for, translation included."""
+        return tuple({*self.SOLD_MARKERS, _fold(self.translator("Sold"))} - {""})
+
+    def _heading_text(self: "FacebookMarketplace") -> str:
+        """The listing's own heading, or "" when the page has none.
+
+        Only the heading: the sold badge sits at the start of it, and reading a
+        wider slice of the page would pick up the same word from the unrelated
+        listings in the "more like this" rail below.
+        """
+        assert self.page is not None
+        for selector in ("h1", '[role="main"] h1', "h1 span"):
+            try:
+                node = self.page.query_selector(selector)
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                continue
+            if node is None:
+                continue
+            text = (node.text_content() or "").strip()
+            if text:
+                return text
+        return ""
+
+    def _page_status(self: "FacebookMarketplace") -> ListingStatus:
+        """Read the open page and decide whether the listing still exists.
+
+        Deliberately biased towards :attr:`ListingStatus.UNKNOWN`: this verdict
+        can delete a stored listing, so anything short of Facebook saying the
+        item is sold, or that the page does not exist, is treated as "cannot
+        tell".  A bounce to the login page is the clearest example -- it looks
+        exactly like a missing listing and means nothing of the sort.
+        """
+        assert self.page is not None
+        try:
+            url = self.page.url or ""
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            return ListingStatus.UNKNOWN
+
+        if any(marker in url for marker in self.AUTH_WALL_MARKERS):
+            return ListingStatus.UNKNOWN
+
+        heading = _fold(self._heading_text())
+        for word in self._sold_words():
+            # Start of the heading only -- see SOLD_MARKERS.
+            if heading == word or heading.startswith(word + " ") or heading.startswith(word + ":"):
+                return ListingStatus.SOLD
+
+        try:
+            body = _fold(self.page.inner_text("body", timeout=5000))
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            return ListingStatus.UNKNOWN
+        if not body:
+            # An empty body is a page that never rendered, not a deleted one.
+            return ListingStatus.UNKNOWN
+
+        translated = _fold(self.translator("This content isn't available right now"))
+        markers = tuple({*self.MISSING_PAGE_MARKERS, translated} - {""})
+        # A live listing page carries a heading; the "not available" card does
+        # not.  Requiring both keeps the phrase from condemning a real listing
+        # that happens to quote it somewhere in its description.
+        if not heading and any(marker in body for marker in markers):
+            return ListingStatus.GONE
+
+        return ListingStatus.ACTIVE
+
+    def recheck_listing(
+        self: "FacebookMarketplace", post_url: str, item_config: ItemConfig
+    ) -> Tuple[ListingStatus, Listing | None]:
+        """Open a stored listing again and report what became of it."""
+        if (not self.page or not self.is_logged_in()) and not self.login():
+            # Not signed in: every listing page would look like a login wall.
+            # That is a fact about us, not about the listing.
+            return ListingStatus.UNKNOWN, None
+
+        assert self.page is not None
+        self.goto_url(post_url)
+        counter.increment(CounterItem.LISTING_RECHECKED, item_config.name)
+
+        status = self._page_status()
+        if status in (ListingStatus.SOLD, ListingStatus.GONE):
+            return status, None
+
+        details = parse_listing(self.page, post_url, self.translator, self.logger)
+        if details is None:
+            # A layout none of the parsers recognised.  Unreadable is not gone.
+            return ListingStatus.UNKNOWN, None
+        details.to_cache(post_url)
+        return ListingStatus.ACTIVE, details
 
     def check_listing(
         self: "FacebookMarketplace",
