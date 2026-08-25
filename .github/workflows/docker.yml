@@ -49,5 +49,12 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # steps.meta.outputs.version is the bare semver ("1.2.3") the tag
+          # step above derived from the pushed "v1.2.3" — the version the
+          # backend reports in /api/status and in its log banner (see
+          # Dockerfile). Without this the image falls back to pyproject's
+          # number, which in this fork still tracks upstream.
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

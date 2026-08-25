@@ -12,7 +12,7 @@ from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.text import Text
 
-from . import __version__
+from . import __version__, app_version
 from .session import clear_all_sessions, clear_profile
 from .utils import CacheType, amm_home, cache, counter, hilight
 
@@ -167,7 +167,16 @@ def version_callback(value: bool) -> None:
         printing the Awesome CLI version and exiting the program.
     """
     if value:
-        typer.echo(f"AI Marketplace Monitor, version {__version__}")
+        running = app_version()
+        # Both numbers, because they disagree on purpose and only one of
+        # them is the release: "1.0.2" is the tag the image was published
+        # under, "0.10.2" is what pyproject still says (this fork tracks
+        # upstream's number).  Printing only the second is what made a
+        # freshly pulled image look like it had not updated.
+        if running.source == "tag":
+            typer.echo(f"AI Marketplace Monitor {running.value} (paquete {__version__})")
+        else:
+            typer.echo(f"AI Marketplace Monitor, paquete {__version__} (sin tag de imagen)")
         raise typer.Exit()
 
 
@@ -298,9 +307,19 @@ def main(
     _silence_noisy_loggers()
 
     logger = logging.getLogger("monitor")
-    logger.info(
-        f"""{hilight("[VERSION]", "info")} AI Marketplace Monitor, version {hilight(__version__, "name")}"""
-    )
+    # One line, and it names which half of the stack it is talking about: the
+    # web UI logs its own version to the browser console, and this stream is
+    # the only place the *backend* says what it is.  `source` is what stops the
+    # line from being read as a tag when it is not one -- see `app_version`.
+    running = app_version()
+    if running.source == "tag":
+        logger.info(
+            f"""{hilight("[VERSION]", "info")} Backend (monitor) {hilight(running.value, "name")} — tag de git de la imagen · paquete {__version__}"""
+        )
+    else:
+        logger.info(
+            f"""{hilight("[VERSION]", "info")} Backend (monitor) {hilight(__version__, "name")} — versión del paquete, sin tag de imagen (ejecución desde el código fuente)"""
+        )
     _handle_termination(logger)
 
     if clear_cache is not None:

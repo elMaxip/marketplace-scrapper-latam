@@ -21,15 +21,44 @@ runner = CliRunner()
         (["--help"], "Usage: "),
         (
             ["--version"],
-            f"AI Marketplace Monitor, version {ai_marketplace_monitor.__version__}\n",
+            f"AI Marketplace Monitor, paquete {ai_marketplace_monitor.__version__} "
+            "(sin tag de imagen)\n",
         ),
     ],
 )
-def test_command_line_interface(options: List[str], expected: str) -> None:
+def test_command_line_interface(
+    options: List[str], expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Test the CLI."""
+    # Outside a container there is no tag, and that is the case being asserted:
+    # a stray AIMM_VERSION in the developer's shell would otherwise silently
+    # switch the branch under the test.
+    monkeypatch.delenv(ai_marketplace_monitor.VERSION_ENV, raising=False)
     result = runner.invoke(cli.app, options)
     assert result.exit_code == 0
     assert expected in result.stdout
+
+
+def test_version_prefers_image_tag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tag the image was built from wins over pyproject's number.
+
+    The two disagree on purpose in this fork — releases are tagged v1.x while
+    pyproject still tracks upstream's 0.10.x — so reporting the package number
+    made an updated container look like it had not updated.
+    """
+    monkeypatch.setenv(ai_marketplace_monitor.VERSION_ENV, "1.0.3")
+    assert ai_marketplace_monitor.app_version() == ("1.0.3", "tag")
+    result = runner.invoke(cli.app, ["--version"])
+    assert result.exit_code == 0
+    assert "AI Marketplace Monitor 1.0.3" in result.stdout
+
+
+def test_version_falls_back_to_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty build arg is not a version: a local build must not invent one."""
+    monkeypatch.setenv(ai_marketplace_monitor.VERSION_ENV, "  ")
+    value, source = ai_marketplace_monitor.app_version()
+    assert source == "package"
+    assert value == ai_marketplace_monitor.__version__
 
 
 @pytest.fixture(scope="session")

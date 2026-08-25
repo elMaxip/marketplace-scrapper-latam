@@ -35,7 +35,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .. import control
+from .. import app_version, control
 from ..config import supported_marketplaces
 from ..pause import is_paused, pause_state, run_state, set_paused
 from ..session import (
@@ -317,6 +317,13 @@ def create_app(
             # not read yet is worth saying wherever the user is looking.
             "phase": control.phase(),
             "config_sync": config_sync(list(config.config_files)),
+            # Which build is answering.  Carried on the poll every screen
+            # already makes because the question it answers -- "did the update
+            # actually land?" -- is asked from the outside, by someone who has
+            # just pushed a tag and cannot see this container's logs.
+            # `source` travels with it so the interface never presents the
+            # package number as if it were the released tag: see `app_version`.
+            "version": app_version()._asdict(),
             "vnc_enabled": os.environ.get("AIMM_ENABLE_VNC") == "1"
             and Path(os.environ.get("AIMM_NOVNC_DIR", "/usr/share/novnc")).is_dir(),
         }

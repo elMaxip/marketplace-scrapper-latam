@@ -61,7 +61,17 @@ RUN pip install --no-cache-dir --no-deps .
 # --------------------------------------------------------------------------- #
 FROM python:3.12-slim-bookworm AS runtime
 
+# The git tag CI built this image from (see .github/workflows/docker.yml).
+# An image has no git checkout to ask, so the tag has to be frozen in at build
+# time or the running process cannot know it -- and the number in pyproject.toml
+# is not it: this fork still carries upstream's 0.10.x there while its own
+# releases are tagged v1.x, which is exactly why a freshly pulled image kept
+# reporting "0.10.2".  Empty by default, so a local `docker build` falls back to
+# the package version and says so rather than inventing a tag.
+ARG APP_VERSION=""
+
 ENV DEBIAN_FRONTEND=noninteractive \
+    AIMM_VERSION=$APP_VERSION \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
