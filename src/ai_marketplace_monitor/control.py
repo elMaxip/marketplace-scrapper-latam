@@ -166,6 +166,14 @@ MAIN_LANE = "main"
 #: The lane the listing re-checks run on when they are given one of their own.
 UPDATES_LANE = "updates"
 
+#: The lane a tracker's first read runs on.
+#:
+#: Its own, and only for as long as the read takes: adding a tracker is a thing
+#: the user does while the monitor may be in the middle of a search, and neither
+#: should wait for the other.  The browser is opened for it and closed after it,
+#: which is why this is not one of the lanes the monitor keeps.
+TRACKED_LANE = "tracked"
+
 #: lane name -> what that lane is doing, absent when the lane is between jobs.
 #:
 #: A dictionary rather than the single slot this used to be, because searching
@@ -184,6 +192,9 @@ _cancel = threading.Event()
 _claims: Set[Tuple[str, str]] = set()
 #: Marketplace name -> ``{"until": monotonic deadline, "strikes": int, ...}``.
 _blocks: Dict[str, Dict[str, Any]] = {}
+
+#: Refusals waiting to be told to the user.  See `take_new_blocks`.
+_new_blocks: List[Dict[str, Any]] = []
 #: Marketplaces whose stored session has changed and needs loading into the
 #: live browser.  Set by the web UI thread, drained by the scraping one.
 _session_imports: Set[str] = set()
@@ -386,13 +397,22 @@ def lanes() -> List[Dict[str, Any]]:
 
 
 def block_marketplace(
-    marketplace: str, reason: str = "", seconds: float | None = None
+    marketplace: str,
+    reason: str = "",
+    seconds: float | None = None,
+    announce: bool = False,
 ) -> Dict[str, Any]:
     """Stop opening pages on ``marketplace`` for a while.
 
     Called when a site serves a sign-in or verification wall instead of the page
     that was asked for.  Consecutive refusals back off further (see
     :data:`BLOCK_BACKOFF`); an explicit ``seconds`` overrides that.
+
+    ``announce`` queues the refusal to be told to the user (see
+    :func:`take_new_blocks`), and is off by default because this is also a
+    plain state setter: putting a marketplace on cooldown to see what the loop
+    does with it is not a site refusing anybody, and should not send anything.
+    The two places where a site really did refuse us pass it.
     """
     with _lock:
         entry = _blocks.get(marketplace) or {"strikes": 0}
@@ -413,7 +433,26 @@ def block_marketplace(
             ).isoformat(timespec="seconds"),
         }
         _blocks[marketplace] = entry
+        if announce:
+            # Queued for whoever tells the user.  Once per refusal and claimed
+            # by the reader, because a cooldown is read on every poll and a
+            # message per poll is a message nobody reads.
+            _new_blocks.append({"marketplace": marketplace, **entry})
         return dict(entry)
+
+
+def take_new_blocks() -> List[Dict[str, Any]]:
+    """Refusals that have not been announced yet.  Handed out exactly once.
+
+    Same shape as :func:`take_session_imports`, and for the same reason: only
+    the monitor thread may send anything, and the refusal is noticed inside a
+    marketplace object that has no idea who the users are.
+    """
+    global _new_blocks
+    with _lock:
+        pending = list(_new_blocks)
+        _new_blocks = []
+        return pending
 
 
 def marketplace_blocked(marketplace: str) -> bool:
@@ -1050,16 +1089,27 @@ def search_stops() -> List[Dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 
 
-def set_next_search(item: str | None, reason: str = "web UI") -> Optional[Dict[str, Any]]:
+def set_next_search(
+    item: str | None, reason: str = "web UI", now: bool = False
+) -> Optional[Dict[str, Any]]:
     """Put one product at the head of the queue, without touching what is running.
 
     ``None`` clears the choice and hands the order back to the schedule.  The
     search under way is deliberately left alone: the button says *next*, and a
     button that stopped the current search would be the other one.
+
+    ``now`` marks the promotion as one that should not be waited for -- see
+    :func:`request_search_now`.  It is a note on the same fact rather than a
+    second register, so there is still one answer to "what runs next" and one
+    place that claims it.
     """
     global _next_search
     with _lock:
-        _next_search = None if item is None else {"item": item, "reason": reason, "at": _now()}
+        _next_search = (
+            None
+            if item is None
+            else {"item": item, "reason": reason, "at": _now(), "now": bool(now)}
+        )
         return dict(_next_search) if _next_search else None
 
 
@@ -1067,6 +1117,64 @@ def next_search() -> Optional[Dict[str, Any]]:
     """The product the user picked to go next, or None for the usual order."""
     with _lock:
         return dict(_next_search) if _next_search else None
+
+
+def next_search_now() -> Optional[str]:
+    """The product asked for *now*, if one is pending.  A peek, not a claim.
+
+    Read by the places that are already deciding what to run next -- the sleep
+    between passes, a lane between two of its searches -- so that "ejecutar
+    ahora" is not silently a promise about the next hour.  Everything that acts
+    on it claims it with :func:`take_next_search` in the same breath, because a
+    promotion nobody claims is one that promotes the same product for ever.
+    """
+    with _lock:
+        if _next_search and _next_search.get("now"):
+            return str(_next_search["item"])
+        return None
+
+
+def take_next_search_if(item: str) -> bool:
+    """Claim the promotion only if it is for ``item``.  True when it was.
+
+    What a lane needs: it can see the promoted product in the queue it is about
+    to work through, and taking the choice unconditionally would swallow a
+    promotion meant for a platform it is not running.
+    """
+    global _next_search
+    with _lock:
+        if _next_search and str(_next_search["item"]) == item:
+            _next_search = None
+            return True
+        return False
+
+
+def request_search_now(item: str, reason: str = "web UI") -> Dict[str, Any]:
+    """Search one product now: end what is running and put this at the front.
+
+    Two requests that already existed, sent together, because that is exactly
+    what "ahora" means and neither half alone says it: the promotion answers
+    *what* runs next, and the stop is what makes "next" arrive in seconds
+    instead of at the end of whatever is under way.  The stopped searches end
+    the way the button beside them ends one -- as if they had finished, browser
+    kept, queue continued -- so this is not a cancellation and the scraper never
+    leaves the state it is in.
+
+    The review lane is left alone: re-checking stored listings is not "la
+    búsqueda en curso", and it is the flow this button's own results will be
+    read by later.
+    """
+    with _lock:
+        running_items = sorted(
+            {str(entry["item"]) for entry in _lanes.values() if entry.get("item")}
+        )
+    stopped = [
+        request_search_stop(name, None, reason) for name in running_items if name != item
+    ]
+    return {
+        "next_search": set_next_search(item, reason=reason, now=True),
+        "stopped": stopped,
+    }
 
 
 def take_next_search() -> Optional[str]:
@@ -1167,6 +1275,7 @@ def reset_for_tests() -> None:
         _run_requested = None
         _claims.clear()
         _blocks.clear()
+        _new_blocks.clear()
         _session_imports.clear()
         _phase = {"name": "starting", "since": _now(), "detail": ""}
         _loaded_config = None

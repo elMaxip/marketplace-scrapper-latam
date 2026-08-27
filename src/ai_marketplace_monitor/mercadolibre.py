@@ -31,7 +31,7 @@ from playwright.sync_api import BrowserContext, Page  # type: ignore
 from . import control
 from .listing import Listing
 from .marketplace import ItemConfig, ListingStatus, Marketplace, MarketplaceConfig
-from .observations import record_observation
+from .observations import is_known, record_observation
 from .session import load_session
 from .utils import (
     BaseConfig,
@@ -609,7 +609,7 @@ class MercadoLibreMarketplace(Marketplace):
         from being read anonymously, so a wall always means "wait, then try
         again" rather than "give up until somebody signs in".
         """
-        block = control.block_marketplace(self.name, reason=reason)
+        block = control.block_marketplace(self.name, reason=reason, announce=True)
         if self.logger:
             minutes = int(block["seconds"] // 60)
             self.logger.warning(
@@ -882,6 +882,18 @@ class MercadoLibreMarketplace(Marketplace):
                         return
                     counter.increment(CounterItem.LISTING_EXAMINED, item_config.name)
 
+                    # Only listings nobody has recorded yet: see
+                    # `observations.is_known`.  A stored listing's price and
+                    # stock are the review's business, read off its own page,
+                    # and re-reading it here is the same page load done twice.
+                    if is_known(listing.marketplace, listing.id):
+                        if self.logger:
+                            self.logger.debug(
+                                f"""{hilight("[Skip]", "info")} {listing.title} is already """
+                                """stored; the review keeps it up to date."""
+                            )
+                        continue
+
                     if not self.check_listing(listing, item_config, description_available=False):
                         counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
                         continue
@@ -1041,6 +1053,11 @@ class MercadoLibreMarketplace(Marketplace):
         description_available: bool = True,
     ) -> bool:
         """The filters that are applied to results rather than to the URL."""
+        # Before everything else, including the price bounds baked into the
+        # search URL: an excluded pattern says this number is not a price.
+        if self.junk_price(item, item_config):
+            return False
+
         antikeywords = item_config.antikeywords or getattr(self.config, "antikeywords", None)
         if antikeywords and is_substring(
             antikeywords, f"{item.title} {item.description}", logger=self.logger
