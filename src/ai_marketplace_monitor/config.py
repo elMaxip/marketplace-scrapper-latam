@@ -20,8 +20,11 @@ from .ai import (
     TAIConfig,
 )
 from .facebook import FacebookMarketplace
+from .lider import LiderMarketplace
 from .marketplace import TItemConfig, TMarketplaceConfig
 from .mercadolibre import MercadoLibreMarketplace
+from .sodimac import SodimacMarketplace
+from .tracking import PLATFORM as TRACKED_PLATFORM, TrackedMarketplace
 from .notification import NotificationConfig
 from .region import RegionConfig
 from .user import User, UserConfig
@@ -30,6 +33,22 @@ from .utils import MonitorConfig, Translator, hilight, merge_dicts
 supported_marketplaces = {
     "facebook": FacebookMarketplace,
     "mercadolibre": MercadoLibreMarketplace,
+    "lider": LiderMarketplace,
+    "sodimac": SodimacMarketplace,
+}
+
+#: Every implementation there is, including the one that is not a marketplace.
+#:
+#: The split matters in exactly one way, and it is the reason for it: everything
+#: in ``supported_marketplaces`` is *created automatically*, listed as a platform
+#: in the interface and offered a browser session.  ``tracked`` must not be any
+#: of those -- it is one product page watched on purpose, there is no session to
+#: import for it and nothing to search on it -- but it still has to be findable
+#: by name when a listing says it came from there.  So the class lookups use this
+#: mapping and the "which platforms exist" question uses the one above.
+all_marketplaces = {
+    **supported_marketplaces,
+    TRACKED_PLATFORM: TrackedMarketplace,
 }
 
 
@@ -90,7 +109,7 @@ def split_options(
     """
     accepted_names = {f.name for f in fields(factory)}
     known_elsewhere = set()
-    for other in supported_marketplaces.values():
+    for other in all_marketplaces.values():
         known_elsewhere |= {f.name for f in fields(other.item_config_class())}
 
     accepted: Dict[str, Any] = {}
@@ -116,6 +135,9 @@ class ConfigItem(Enum):
     REGION = "region"
     NOTIFICATION = "notification"
     TRANSLATION = "translation"
+    #: One product page followed by address.  A sibling of `item` rather than a
+    #: kind of it: a search has phrases and filters, a tracker has a URL.
+    TRACK = "track"
 
 
 @dataclass
@@ -241,11 +263,11 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
         for marketplace_name, marketplace_config in declared.items():
             marketplace_config = self._drop_retired_keys(marketplace_name, marketplace_config)
             market_type = market_type_of(marketplace_name, marketplace_config)
-            if market_type not in supported_marketplaces:
+            if market_type not in all_marketplaces:
                 raise ValueError(
                     f"Marketplace {hilight(market_type)} is not supported. Supported marketplaces are: {supported_marketplaces.keys()}"
                 )
-            marketplace_class = supported_marketplaces[market_type]
+            marketplace_class = all_marketplaces[market_type]
             self.marketplace[marketplace_name] = marketplace_class.get_config(
                 name=marketplace_name,
                 monitor_config=self.monitor,
@@ -355,6 +377,13 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
                 marketplace_class = supported_marketplaces[
                     (marketplace_config.market_type or "facebook").lower()
                 ]
+                if marketplace_class.opt_in and marketplace_name not in overrides:
+                    # A shop runs only for a search that asked for it -- see
+                    # `Marketplace.opt_in`.  Asking for it is having a
+                    # `[item.<name>.<shop>]` section, which is exactly what the
+                    # interface writes when the platform is switched on, so
+                    # nothing in the file has to say `enabled = true` as well.
+                    continue
                 options = {**shared, **overrides.get(marketplace_name, {})}
                 accepted, ignored = split_options(
                     options, marketplace_class.item_config_class(), item_name
@@ -373,6 +402,61 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
                 # way the platform's own is.
                 self.validate_language(config, getattr(built, "language", None))
                 self.items[(marketplace_name, item_name)] = built
+
+        self.get_tracker_config(config)
+
+    def get_tracker_config(self: "Config", config: Dict[str, Any]) -> None:
+        """Turn every ``[track.<name>]`` into an item on the tracked platform.
+
+        A tracker is a listing with no search behind it, so it becomes an
+        ordinary entry in ``self.items`` and everything downstream -- the
+        schedule, the review, the notifications, the dashboard -- treats it as
+        one.  That reuse is the whole design; see
+        :mod:`ai_marketplace_monitor.tracking`.
+
+        A name collision with a search is refused rather than resolved: both
+        would be labelled with the same name in every log line, every counter
+        and every group on the dashboard, and whichever one the user then looked
+        at would be the wrong one.  A tracker's ``group`` is refused on the same
+        grounds and for a sharper reason: the top-1 record is keyed by the name
+        it is asked about, so a group sharing a name with a search would share
+        that search's cheapest-so-far and announce each other's bargains.
+        """
+        sections = config.get("track", {}) or {}
+        if not sections:
+            return
+        if TRACKED_PLATFORM not in self.marketplace:
+            self.marketplace[TRACKED_PLATFORM] = TrackedMarketplace.get_config(
+                name=TRACKED_PLATFORM, monitor_config=self.monitor,
+                market_type=TRACKED_PLATFORM,
+            )
+        existing = {item_name for (_marketplace, item_name) in self.items}
+        for name, options in sections.items():
+            if name in existing:
+                raise ValueError(
+                    f"There is already a search called {hilight(name)}, so a tracker "
+                    "cannot have that name too: they would be impossible to tell apart "
+                    "in the log, the counters and the dashboard."
+                )
+            if not isinstance(options, dict):
+                raise ValueError(f"Tracker {hilight(name)} must be a section of settings.")
+            built = TrackedMarketplace.get_item_config(
+                name=name, marketplace=TRACKED_PLATFORM, **options
+            )
+            self.items[(TRACKED_PLATFORM, name)] = built
+
+        # After the loop, not inside it: a group is checked against every name
+        # in the file, and half the trackers did not exist yet a moment ago.
+        taken = {item_name for (_marketplace, item_name) in self.items}
+        for name in sections:
+            group = getattr(self.items[(TRACKED_PLATFORM, name)], "group", None)
+            if group and group in taken:
+                raise ValueError(
+                    f"Tracker {hilight(name)} is in a group called {hilight(group)}, "
+                    "and that is already the name of a search or of another tracker. "
+                    "They share the record of the cheapest offer seen so far, so one "
+                    "would announce the other's bargains."
+                )
 
     @property
     def item(self: "Config") -> Dict[str, TItemConfig]:
@@ -427,6 +511,13 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
         for (marketplace_name, item_name), item_config in sorted(
             self.items.items(), key=lambda pair: (pair[0][1], pair[0][0])
         ):
+            # A tracker shares this dict with the searches (see
+            # `get_tracker_config`) and is not one: `schedule_jobs` skips the
+            # tracked platform outright, so publishing it here offered the
+            # interface a "run now" and a "search this next" that the monitor
+            # had no job to honour, and counted it in `search_count` besides.
+            if marketplace_name == TRACKED_PLATFORM:
+                continue
             marketplace_config = self.marketplace.get(marketplace_name)
             searches.append(
                 {
@@ -597,7 +688,7 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
         for marketplace_name, marketplace_config in self.marketplace.items():
             if marketplace_config.enabled is False:
                 continue
-            marketplace_class = supported_marketplaces[
+            marketplace_class = all_marketplaces[
                 (marketplace_config.market_type or "facebook").lower()
             ]
             for item_config in self.items_of(marketplace_name).values():
