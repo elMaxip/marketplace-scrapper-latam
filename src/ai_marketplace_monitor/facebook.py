@@ -17,8 +17,7 @@ from rich.pretty import pretty_repr
 from .control import claim, raise_if_cancelled
 from .listing import Listing
 from .marketplace import ItemConfig, ListingStatus, Marketplace, MarketplaceConfig, WebPage
-from .observations import record_observation
-from .refresh import SEARCH_RECHECK_COOLDOWN, was_checked_recently
+from .observations import is_known, record_observation
 from .session import save_device_state
 from .utils import (
     BaseConfig,
@@ -882,6 +881,20 @@ class FacebookMarketplace(Marketplace):
                     raise_if_cancelled()
                     counter.increment(CounterItem.LISTING_EXAMINED, item_config.name)
                     found[listing.post_url.split("?")[0]] = True
+                    # Searching answers "what is new?" and nothing else.  A
+                    # listing already in the store is not new, and everything
+                    # that happens to it afterwards -- the price, the stock, the
+                    # sold badge -- is the review's job, on the listing's own
+                    # page, where those things can actually be read.  Checked
+                    # before the filters because the cheapest possible answer is
+                    # the right one here: no page load, no parse, no AI call.
+                    if is_known(listing.marketplace, listing.id):
+                        if self.logger:
+                            self.logger.debug(
+                                f"""{hilight("[Skip]", "info")} {listing.title} is already """
+                                """stored; the review keeps it up to date."""
+                            )
+                        continue
                     # filter by title and location; skip keyword filtering since we do not have description yet.
                     if not self.check_listing(listing, item_config, description_available=False):
                         counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
@@ -953,7 +966,6 @@ class FacebookMarketplace(Marketplace):
         item_config: ItemConfig,
         price: str | None = None,
         title: str | None = None,
-        recheck_cooldown: float | None = None,
     ) -> Tuple[Listing, bool]:
         assert post_url.startswith("https://www.facebook.com")
         details = Listing.from_cache(post_url)
@@ -965,23 +977,13 @@ class FacebookMarketplace(Marketplace):
             # if the price and title are the same, we assume everything else is unchanged.
             return details, True
 
-        cooldown = SEARCH_RECHECK_COOLDOWN if recheck_cooldown is None else recheck_cooldown
-        if (
-            details is not None
-            and cooldown > 0
-            and was_checked_recently(details.marketplace, details.id, cooldown)
-        ):
-            # Somebody read this listing's page minutes ago -- the refresher,
-            # or an earlier search phrase in this same cycle.  Whatever the
-            # search card says now, opening the page again this soon would only
-            # repeat a reading we already have; the next cycle picks it up.
-            if self.logger:
-                self.logger.debug(
-                    f"""{hilight("[Skip]", "info")} {post_url} was checked moments ago; """
-                    """not opening it again."""
-                )
-            return details, True
-
+        # There used to be a fifteen-minute cooldown here: a listing read in
+        # the last quarter of an hour was served from the cache rather than
+        # re-opened.  It is gone, and nothing replaced it at this level.  The
+        # clock was never the right question -- see `observations.is_known` --
+        # and asking it here also meant the *review*, which exists precisely to
+        # re-read listing pages, was silently answered from the cache whenever
+        # a search had passed by recently.
         if not self.page and not self.login():
             # Listing pages are gated too, so an unauthenticated fetch would
             # parse a login wall into a bogus Listing. Fail loudly instead.
@@ -1106,6 +1108,12 @@ class FacebookMarketplace(Marketplace):
         item_config: FacebookItemConfig,
         description_available: bool = True,
     ) -> bool:
+        # First, before any comparison with min_price, max_price or the target:
+        # a price matching an excluded pattern is not a number to compare, it is
+        # a field the seller filled in to get past the form.
+        if self.junk_price(item, item_config):
+            return False
+
         # get antikeywords from both item_config or config
         antikeywords = item_config.antikeywords
         if antikeywords and (

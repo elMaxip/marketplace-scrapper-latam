@@ -106,7 +106,7 @@ def test_no_marketplace_section_is_needed(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text('[user.me]\npushbullet_token = "x"\n', encoding="utf-8")
     config = Config([path])
-    assert sorted(config.marketplace) == ["facebook", "mercadolibre"]
+    assert sorted(config.marketplace) == ["facebook", "lider", "mercadolibre", "sodimac"]
 
 
 def test_a_completely_empty_file_loads(tmp_path: Path) -> None:
@@ -116,7 +116,7 @@ def test_a_completely_empty_file_loads(tmp_path: Path) -> None:
     config = Config([path])
     assert config.items == {}
     assert config.user == {}
-    assert sorted(config.marketplace) == ["facebook", "mercadolibre"]
+    assert sorted(config.marketplace) == ["facebook", "lider", "mercadolibre", "sodimac"]
 
 
 def test_an_unknown_section_is_still_refused(tmp_path: Path) -> None:

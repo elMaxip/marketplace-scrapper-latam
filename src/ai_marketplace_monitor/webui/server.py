@@ -38,6 +38,11 @@ from fastapi.staticfiles import StaticFiles
 from .. import app_version, control
 from ..config import supported_marketplaces
 from ..pause import is_paused, pause_state, run_state, set_paused
+from ..tracking import (
+    is_watchable as track_is_watchable,
+    preview as track_preview,
+    reader_for as track_reader_for,
+)
 from ..session import (
     clear_session,
     import_session,
@@ -523,6 +528,40 @@ def create_app(
         chosen = control.set_next_search(item)
         return {"ok": True, "next_search": chosen, "scraping": control.state()}
 
+    @app.post("/api/scraper/search/run")
+    async def run_search_now(
+        body: Dict[str, Any],
+        _: str = Depends(require_session),
+        __: None = Depends(require_csrf),
+    ) -> Dict[str, Any]:
+        """Search one product now, ending whatever is running to get to it.
+
+        The two requests above, sent together, because that is what "ahora"
+        means: the promotion says what runs next, and the stop is what makes
+        "next" arrive in seconds rather than at the end of a pass.  The searches
+        it ends finish the way the button beside them ends one -- as if they had
+        run out, browser kept, queue continued -- so the scraper stays in
+        exactly the state it was in.
+
+        Still a request, like everything else here: the answer says what was
+        asked for, and the caller watches `scraping` to see it land.  It does
+        not release the pause switch, for the same reason ``/api/monitor/run``
+        does not: a paused monitor told to search would be obeying two
+        contradictory instructions.  `paused` is in the answer so the caller can
+        say so instead of promising something that will not happen yet.
+        """
+        item = body.get("item")
+        if not isinstance(item, str) or not item:
+            raise HTTPException(status_code=400, detail="Missing 'item' field")
+        result = control.request_search_now(item)
+        return {
+            "ok": True,
+            **result,
+            "paused": is_paused(),
+            "run_state": run_state(),
+            "scraping": control.state(),
+        }
+
     @app.post("/api/monitor/run")
     async def force_run(
         _: str = Depends(require_session),
@@ -597,6 +636,66 @@ def create_app(
         """The implementation behind a configured marketplace section."""
         kind = _configured_marketplaces().get(name)
         return supported_marketplaces.get(kind) if kind else None
+
+    def _ai_reader() -> Any:
+        """The AI service to fall back on when a page publishes nothing.
+
+        Loaded from the file here rather than borrowed from the monitor: the
+        monitor keeps its `Config` on the scraping thread and publishes only a
+        summary of it, and the backends are objects rather than summary.
+        Building one costs a parse of a file that is already in the page cache
+        and happens only when a preview is asked for.
+
+        None whenever the configuration cannot be read, which is the honest
+        answer: a preview that failed because the file was mid-save would be a
+        spinner failing for a reason having nothing to do with the page.
+        """
+        try:
+            from ..config import Config
+
+            return track_reader_for(Config([config_service.editable_path]))
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            return None
+
+    @app.post("/api/track/analyze")
+    def analyze_tracked_page(
+        body: Dict[str, Any],
+        _: str = Depends(require_session),
+        __: None = Depends(require_csrf),
+    ) -> Dict[str, Any]:
+        """Read a product page and say what could be found on it.
+
+        The "analizar página" step, before anything is written to the config.
+        The answer names the strategy behind every field -- see
+        :func:`ai_marketplace_monitor.tracking.preview` -- because a title from
+        JSON-LD and a title guessed from an ``<h1>`` are worth different amounts
+        of confidence, and this is the only moment somebody can be told which
+        they are looking at.
+
+        Sync def: it fetches a page, which is blocking work, so it runs on the
+        thread pool rather than on the event loop.
+
+        ``skip`` is what "reintentar extracción" sends: the strategies that
+        produced the field the user says is wrong.  Dropping them makes the next
+        one down speak, instead of asking again and getting the same answer.
+        """
+        url = str(body.get("url") or "").strip()
+        if not track_is_watchable(url):
+            raise HTTPException(
+                status_code=400,
+                detail="Pega la dirección completa de la página del producto, "
+                "empezando con http:// o https://, o un archivo .html guardado "
+                "(file:///…).",
+            )
+        raw_skip = body.get("skip")
+        skip = tuple(str(name) for name in raw_skip) if isinstance(raw_skip, list) else ()
+        # The AI is the last strategy and is only reached when the page
+        # published nothing the other five could read -- see `extract`.  Built
+        # per request rather than held, because the configured services change
+        # whenever the file does.
+        return track_preview(url, skip=skip, ai=_ai_reader())
 
     @app.get("/api/marketplace/sessions")
     async def list_sessions(_: str = Depends(require_session)) -> Dict[str, Any]:

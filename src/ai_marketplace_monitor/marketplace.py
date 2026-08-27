@@ -8,6 +8,7 @@ from playwright.sync_api import BrowserContext, ElementHandle, Locator, Page  # 
 
 from .control import raise_if_cancelled
 from .listing import Listing
+from .price_patterns import compile_patterns, matches as price_pattern_match, validate_patterns
 from .session import load_session, save_session
 from .utils import (
     BaseConfig,
@@ -70,6 +71,16 @@ class MarketItemCommonConfig(BaseConfig):
     #: the best price found against, which is why it lives per platform: the
     #: same product is worth a different price on Facebook and on Mercado Libre.
     target_price: str | None = None
+    #: Prices that are not asking prices: 999999, 123456, 0, "gratis".
+    #:
+    #: Per platform because the noise is: Facebook's placeholder of choice is a
+    #: run of nines typed to get past a required field, Mercado Libre's is the
+    #: 1 that means "write to me".  See
+    #: :mod:`ai_marketplace_monitor.price_patterns` for the syntax, and
+    #: :meth:`Marketplace.junk_price` for where in the filtering it applies --
+    #: before every other price test, because a junk price is not a cheap
+    #: listing or an expensive one, it is a listing whose price is unknown.
+    excluded_price_patterns: List[str] | None = None
     rating: List[int] | None = None
     prompt: str | None = None
     extra_prompt: str | None = None
@@ -332,6 +343,35 @@ class MarketItemCommonConfig(BaseConfig):
                     f"Item {hilight(self.name)} target_price currency {currency} is not recognized."
                 ) from e
 
+    def handle_excluded_price_patterns(self: "MarketItemCommonConfig") -> None:
+        """Accept one pattern or a list, and refuse anything unparseable here.
+
+        Validated at load time rather than at match time on purpose: a pattern
+        that cannot be compiled would otherwise fail silently in the middle of a
+        search -- and a filter that quietly matches nothing looks exactly like a
+        filter that is working and finding nothing to exclude.
+        """
+        if self.excluded_price_patterns is None:
+            return
+
+        if isinstance(self.excluded_price_patterns, str):
+            self.excluded_price_patterns = [self.excluded_price_patterns]
+
+        if not isinstance(self.excluded_price_patterns, list) or not all(
+            isinstance(x, str) for x in self.excluded_price_patterns
+        ):
+            raise ValueError(
+                f"Item {hilight(self.name)} excluded_price_patterns must be a string "
+                "or a list of strings."
+            )
+
+        self.excluded_price_patterns = [
+            pattern.strip() for pattern in self.excluded_price_patterns if pattern.strip()
+        ]
+        problems = validate_patterns(self.excluded_price_patterns)
+        if problems:
+            raise ValueError(f"Item {hilight(self.name)}: {' '.join(problems)}")
+
     def handle_start_at(self: "MarketItemCommonConfig") -> None:
         """Deprecated, like :meth:`handle_search_interval`."""
         if self.start_at is None:
@@ -461,6 +501,20 @@ TItemConfig = TypeVar("TItemConfig", bound=ItemConfig)
 
 
 class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
+    #: Whether a search has to ask for this platform before it runs there.
+    #:
+    #: False for the marketplaces the monitor was built around: a search that
+    #: says nothing runs on all of them, which is what "a platform is a
+    #: capability of the program, not something you install" means in practice.
+    #:
+    #: True for the shops, and the reason is that they are a different kind of
+    #: result rather than more of the same.  A search watching for a used PS5 on
+    #: Facebook does not want a page of retail boxes at list price, and switching
+    #: one on for every existing search on upgrade is a change nobody asked for
+    #: -- arriving as notifications.  Opting in is one section in the file and
+    #: one switch in the interface.
+    opt_in: bool = False
+
     def __init__(
         self: "Marketplace",
         name: str,
@@ -474,6 +528,44 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
         self.translator = Translator()
         self.logger = logger
         self.page: Page | None = None
+
+    def junk_price(
+        self: "Marketplace", item: Listing, item_config: TItemConfig
+    ) -> bool:
+        """Whether this listing's price is one the user told us to ignore.
+
+        The first thing every ``check_listing`` asks, and deliberately so: the
+        excluded patterns describe prices that are not asking prices at all, and
+        letting one through into the minimum/maximum/target comparisons is how a
+        placeholder 999999 becomes a group's "highest price" and a 0 becomes its
+        "cheapest".
+
+        Read from the item's platform section first and the platform's own
+        defaults second, which is the precedence every other option here uses.
+        A pattern list that somehow failed to compile excludes nothing rather
+        than everything: the loader has already refused the bad ones, so
+        reaching here at all means something unexpected, and the safe reading of
+        an unusable filter is that it filters nothing.
+        """
+        patterns = getattr(item_config, "excluded_price_patterns", None) or getattr(
+            self.config, "excluded_price_patterns", None
+        )
+        if not patterns:
+            return False
+        try:
+            compiled = compile_patterns(patterns)
+        except ValueError:
+            return False
+        hit = price_pattern_match(item.price, compiled)
+        if hit is None:
+            return False
+        if self.logger:
+            self.logger.info(
+                f"""{hilight("[Skip]", "fail")} Exclude {hilight(item.title)}: price """
+                f"""{hilight(item.price or "", "fail")} matches the excluded pattern """
+                f"""{hilight(hit.source)}."""
+            )
+        return True
 
     @classmethod
     def get_config(cls: Type["Marketplace"], **kwargs: Any) -> TMarketplaceConfig:

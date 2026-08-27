@@ -99,6 +99,7 @@ class TelegramNotificationConfig(PushNotificationConfig):
         title: str,
         items: List[Tuple["Listing", ListingCard]],
         logger: Logger | None = None,
+        template: str | None = None,
     ) -> bool:
         """One message per listing, with the listing's photo when it has one.
 
@@ -118,13 +119,16 @@ class TelegramNotificationConfig(PushNotificationConfig):
         * a card longer than a caption is allowed to be is sent as text, rather
           than cut in the middle to fit under a photo.
         """
-        return self._run_async(self._send_items_async(title, items, logger), logger)
+        return self._run_async(
+            self._send_items_async(title, items, logger, template), logger
+        )
 
     async def _send_items_async(
         self: "TelegramNotificationConfig",
         title: str,
         items: List[Tuple["Listing", ListingCard]],
         logger: Logger | None = None,
+        template: str | None = None,
     ) -> bool:
         try:
             import telegram
@@ -156,7 +160,11 @@ class TelegramNotificationConfig(PushNotificationConfig):
             # escaping afterwards would backslash the asterisks that make the
             # title bold along with the dots in the price, and Telegram would
             # show the markup instead of applying it.
-            body = card.render(MARKDOWN_V2, link=False)
+            # `link=False` matters more with a template than without one:
+            # the button below already carries the address, and `{link}` in a
+            # user's template falls back to the bare URL rather than adding a
+            # second copy of it under the photo.
+            body = card.render(MARKDOWN_V2, link=False, template=template)
             # The link is a button rather than a line of text: it is the one
             # thing the reader is going to press, and a caption is small.
             markup = telegram.InlineKeyboardMarkup(
@@ -179,7 +187,7 @@ class TelegramNotificationConfig(PushNotificationConfig):
                 sent = await self._send_single_message_with_retry(
                     bot,
                     self.telegram_chat_id,
-                    card.render_within(MESSAGE_LIMIT, MARKDOWN_V2),
+                    card.render_within(MESSAGE_LIMIT, MARKDOWN_V2, template=template),
                     logger,
                 )
             ok = ok and sent

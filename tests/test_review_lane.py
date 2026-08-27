@@ -33,9 +33,14 @@ from diskcache import Cache
 from ai_marketplace_monitor import control
 from ai_marketplace_monitor.listing import Listing
 from ai_marketplace_monitor.marketplace import ListingStatus
-from ai_marketplace_monitor.observations import record_observation, reset_index_cache
+from ai_marketplace_monitor.observations import (
+    delete_observations,
+    is_known,
+    record_observation,
+    reset_index_cache,
+)
 from ai_marketplace_monitor.refresh import (
-    SEARCH_RECHECK_COOLDOWN,
+    DEFAULT_RECHECK_INTERVAL,
     ListingRefresher,
     stale_records,
     was_checked_recently,
@@ -139,15 +144,41 @@ def test_a_listing_just_fetched_by_a_search_is_not_in_the_review_queue(store):
     assert [record["id"] for record in due] == ["old"]
 
 
-def test_freshness_is_the_same_question_for_both_flows(store):
+def test_the_two_flows_ask_different_questions(store):
+    # They used to share one: "was this read in the last fifteen minutes?".
+    # That made them race -- a search sixteen minutes after a review re-opened
+    # every page it had just read, and one fourteen minutes after skipped
+    # listings that had genuinely changed.  Now the search asks whether it has
+    # ever seen the listing, and only the review asks about time.
     record_observation(listing("1"), local_cache=store)
-    # The search flow asks this before it opens a listing page, and the review
-    # builds its queue from the same timestamp: one fact, not two.
-    assert was_checked_recently("facebook", "1", within=SEARCH_RECHECK_COOLDOWN, local_cache=store)
+
+    # The search: known from the first sighting, and it stays known.
+    assert is_known("facebook", "1", local_cache=store)
     _age(store, "facebook", "1", hours=48)
-    assert not was_checked_recently(
-        "facebook", "1", within=SEARCH_RECHECK_COOLDOWN, local_cache=store
+    assert is_known("facebook", "1", local_cache=store)
+
+    # The review: fresh at first, overdue two days later.
+    record_observation(listing("2"), local_cache=store)
+    assert was_checked_recently(
+        "facebook", "2", within=DEFAULT_RECHECK_INTERVAL, local_cache=store
     )
+    _age(store, "facebook", "2", hours=48)
+    assert not was_checked_recently(
+        "facebook", "2", within=DEFAULT_RECHECK_INTERVAL, local_cache=store
+    )
+
+
+def test_a_listing_nobody_has_seen_is_the_searchs_business(store):
+    assert not is_known("facebook", "never-seen", local_cache=store)
+
+
+def test_a_deleted_listing_stays_known_to_the_search(store):
+    # The marketplace has no idea we threw it away, so it keeps turning up in
+    # results.  Re-fetching its page on every cycle forever was the most
+    # wasteful thing the search did.
+    record_observation(listing("1"), local_cache=store)
+    delete_observations([("facebook", "1")], local_cache=store)
+    assert is_known("facebook", "1", local_cache=store)
 
 
 def test_a_review_claims_what_it_reads_so_a_search_will_not_repeat_it(store):

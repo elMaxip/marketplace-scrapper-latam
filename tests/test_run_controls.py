@@ -432,3 +432,88 @@ def test_a_stopped_job_is_not_recorded_as_a_failure_either() -> None:
             raise control.SearchStopped(item="ps5", marketplace="facebook")
 
     assert control.state()["last"]["outcome"] == "stopped"
+
+
+# --------------------------------------------------------------------------- #
+# "Ejecutar ahora"
+# --------------------------------------------------------------------------- #
+#
+# The promotion above plus the stop above, sent together, because that pair is
+# exactly what "ahora" means: one says what runs next, the other makes "next"
+# arrive in seconds instead of at the end of whatever is under way.
+
+
+def test_running_one_now_ends_what_is_under_way() -> None:
+    with control.running(item="ps5", marketplace="facebook"):
+        asked = control.request_search_now("bici")
+
+    assert control.next_search()["item"] == "bici"
+    assert control.next_search_now() == "bici"
+    # Ended as if it had finished -- a stop, not a cancellation: no browser is
+    # closed and the scraper stays in the state it was in.
+    assert control.stop_requested("ps5") is not None
+    assert not control.cancel_requested()
+    assert [entry["item"] for entry in asked["stopped"]] == ["ps5"]
+
+
+def test_running_one_now_leaves_the_review_alone() -> None:
+    # Re-checking stored listings is not "la búsqueda en curso", and it is the
+    # flow that reports what this button's own search finds later on.
+    with control.running(item=None, marketplace="updates"):
+        asked = control.request_search_now("bici")
+
+    assert asked["stopped"] == []
+    assert control.search_stops() == []
+
+
+def test_running_one_now_does_not_stop_itself() -> None:
+    with control.running(item="bici", marketplace="facebook"):
+        control.request_search_now("bici")
+
+    assert control.stop_requested("bici") is None
+
+
+def test_a_narrowed_pass_honours_a_search_asked_for_now(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A narrowed pass declines an ordinary promotion and honours this one.
+
+    Half of a parallel pass is a narrowed pass, and parallel searching is on by
+    default -- so a button that meant "at the end of the pass" there would mean
+    it most of the time.
+    """
+    monitor = build(tmp_path)
+    recorder = Recorder()
+    stub(monitor, monkeypatch, recorder)
+    monitor.schedule_jobs()
+    both = {("ps5", "facebook"), ("bici", "facebook")}
+
+    control.set_next_search("bici")
+    assert monitor._run_jobs(only=both) is True
+    # Untouched: the promoted product may not even be in a narrowed queue, so
+    # the promise is kept for the pass that can keep it.
+    assert recorder.items[0] == "ps5"
+    assert control.next_search() is not None
+
+    recorder.calls.clear()
+    control.set_next_search("bici", now=True)
+    assert monitor._run_jobs(only=both) is True
+    assert recorder.items[0] == "bici"
+    # Claimed as it was honoured: a promotion that is read and not claimed
+    # promotes the same product on every turn round every queue, for ever.
+    assert control.next_search() is None
+
+
+def test_a_search_asked_for_now_that_this_queue_does_not_hold_waits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monitor = build(tmp_path)
+    recorder = Recorder()
+    stub(monitor, monkeypatch, recorder)
+    monitor.schedule_jobs()
+
+    control.set_next_search("bici", now=True)
+    assert monitor._run_jobs(only={("ps5", "facebook")}) is True
+    assert recorder.items == ["ps5"]
+    # Still standing, for the pass that can actually run it.
+    assert control.next_search_now() == "bici"

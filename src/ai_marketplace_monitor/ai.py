@@ -245,6 +245,27 @@ class AIBackend(Generic[TAIConfig]):
             self.logger.debug(f"""{hilight("[AI-Prompt]", "info")} {prompt}""")
         return prompt
 
+    #: What the model is told it is, for a question that is not about listings.
+    #:
+    #: The evaluate path has its own system prompt about matching search
+    #: criteria, which is exactly the wrong instruction for reading a product
+    #: page: a model told it is judging a match will judge one.
+    READER_SYSTEM_PROMPT = (
+        "You extract product facts from web pages. You answer with JSON only, "
+        "no explanation and no markdown fence."
+    )
+
+    def ask(self: "AIBackend", prompt: str) -> str:
+        """One free-form question, answered as text.
+
+        Separate from :meth:`evaluate` because it is a different job with a
+        different system prompt, no listing, no caching and no rating to parse.
+        The default refuses: a backend that has not been taught this simply does
+        not offer AI extraction, and the extractor treats that the same as an AI
+        that failed -- which is to say, it falls back to what it already read.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot answer a free-form question.")
+
     def evaluate(
         self: "AIBackend",
         listing: Listing,
@@ -276,6 +297,26 @@ class OpenAIBackend(AIBackend):
             )
             if self.logger:
                 self.logger.info(f"""{hilight("[AI]", "name")} {self.config.name} connected.""")
+
+    def ask(self: "OpenAIBackend", prompt: str) -> str:
+        """One question through the chat API.
+
+        No retry loop, unlike :meth:`evaluate`: this is called while somebody
+        waits for a preview to come back, and three failures with five seconds
+        between them is a spinner that looks broken.  One attempt, and the
+        caller falls back to what the page itself said.
+        """
+        self.connect()
+        assert self.client is not None
+        response = self.client.chat.completions.create(
+            model=self.config.model or self.default_model,
+            messages=[
+                {"role": "system", "content": self.READER_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            stream=False,
+        )
+        return response.choices[0].message.content or ""
 
     def evaluate(
         self: "OpenAIBackend",
@@ -410,6 +451,18 @@ class AnthropicBackend(AIBackend):
             )
             if self.logger:
                 self.logger.info(f"""{hilight("[AI]", "name")} {self.config.name} connected.""")
+
+    def ask(self: "AnthropicBackend", prompt: str) -> str:
+        """The same question, in this API's shape.  See :meth:`OpenAIBackend.ask`."""
+        self.connect()
+        assert self.client is not None
+        response = self.client.messages.create(
+            model=self.config.model or self.default_model,
+            max_tokens=1024,
+            system=self.READER_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text if response.content else ""
 
     def evaluate(
         self: "AnthropicBackend",

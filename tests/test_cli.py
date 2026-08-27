@@ -351,6 +351,7 @@ def test_config(config_file: Callable, config_content: str, acceptable: bool) ->
         "searched_count": int,
         "sort_by": (str, type(None)),
         "start_at": (list, type(None)),
+        "excluded_price_patterns": (list, type(None)),
         "target_price": (str, type(None)),
         "username": (str, type(None)),
     }
@@ -393,7 +394,7 @@ def test_support_multiple_marketplaces(config_file: Callable) -> None:
     config = Config([cfg])
 
     # The two built-in platforms, plus the extra section this file declares.
-    assert sorted(config.marketplace) == ["facebook", "houston", "mercadolibre"]
+    assert sorted(config.marketplace) == ["facebook", "houston", "lider", "mercadolibre", "sodimac"]
     assert len(config.item) == 2
     assert len(config.user) == 1
 
@@ -420,7 +421,7 @@ def test_multiplace_ai_agent(config_file: Callable) -> None:
     config = Config([cfg])
 
     # Every platform the monitor supports, whether or not the file names it.
-    assert sorted(config.marketplace) == ["facebook", "mercadolibre"]
+    assert sorted(config.marketplace) == ["facebook", "lider", "mercadolibre", "sodimac"]
     assert len(config.ai) == 2
 
     assert config.ai["openai"].api_key == "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"

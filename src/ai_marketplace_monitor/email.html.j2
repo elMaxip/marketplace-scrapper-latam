@@ -131,9 +131,24 @@
                           for the image, which was fetched and attached by
                           content id before the template ran.
                         #}
-                        {% for listing, rating, ns, card in listings %}
+                        {% for listing, rating, ns, card, body in listings %}
                         <tr>
                             <td style="padding: 20px;">
+                                {#
+                                  A channel with a template of its own says what
+                                  a listing looks like, and this template says
+                                  where it sits: the frame, the picture and the
+                                  button stay, because they are things an email
+                                  can do and a template string cannot.  Dropping
+                                  the picture along with the layout would be
+                                  reading "let me word this" as "let me lose the
+                                  attachment I already fetched".
+                                #}
+                                {% if body %}
+                                <div style="color: #444444; line-height: 1.6; font-size: 15px;">
+                                    {{ body }}
+                                </div>
+                                {% else %}
                                 <div style="margin-bottom: 12px;">
                                     <h3 style="color: #2C5364; font-size: 18px; font-weight: bold; margin: 0; display: inline;">
                                         {{ card.title }}
@@ -166,6 +181,7 @@
                                 <div style="color: #666666; margin-bottom: 14px;">
                                     {% for fact in card.facts() %}<div>{{ fact }}</div>{% endfor %}
                                 </div>
+                                {% endif %}
 
                                 {% if listing.image and (listing.image|hash in valid_image_hashes) %}
                                     <img src="cid:image_{{ listing.image|hash }}"
@@ -180,13 +196,13 @@
                                   no AI configured, which is a paragraph saying
                                   nothing, once per listing, forever.
                                 #}
-                                {% if card.comment %}
+                                {% if card.comment and not body %}
                                 <div style="background-color: #F8F9FA; padding: 12px; border-radius: 4px; margin: 15px 0; color: #666666;">
                                     <em>{{ card.comment }}</em>
                                 </div>
                                 {% endif %}
 
-                                {% if listing.description %}
+                                {% if listing.description and not body %}
                                 <div style="color: #444444; margin: 12px 0; line-height: 1.6; font-size: 14px; white-space: pre-line;">
                                     {{ listing.description | bold_headers }}
                                 </div>

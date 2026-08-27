@@ -11,6 +11,7 @@ from .listing import Listing
 from .marketplace import TItemConfig
 from .messages import build_card
 from .notification import NotificationConfig, NotificationStatus
+from .notify_reasons import NotifyReasons
 from .observations import record_notification
 from .ntfy import NtfyNotificationConfig
 from .pushbullet import PushbulletNotificationConfig
@@ -226,6 +227,8 @@ class User:
         language: str | None = None,
         marketplace_label: str | None = None,
         description_words: int | None = None,
+        reasons: NotifyReasons | None = None,
+        forced_status: NotificationStatus | None = None,
     ) -> None:
         """Tell this user about these listings, once, through every channel.
 
@@ -234,6 +237,19 @@ class User:
         worth reading: what the user was last told this listing cost, which
         lives in this user's own cache entry, and which language to say it in.
         A channel asked to build its own card would have neither.
+
+        ``reasons`` is which of "new", "cheaper" and "top 1" the user asked to
+        hear about.  Applied here, on the resolved statuses, rather than at
+        either end of the path: the monitor upstream does not know what a
+        listing's status is for *this* user (two users with different ``remind``
+        intervals get different answers for the same listing), and a channel
+        downstream has already been handed a batch it can only send or drop
+        whole.
+
+        ``forced_status`` forces the reason instead of reading it from the cache, and
+        exists for the one notification that cannot be worked out from a
+        listing's own history: see
+        :attr:`~ai_marketplace_monitor.notification.NotificationStatus.TOP_LISTING`.
         """
         if self.config.enabled is False:
             if self.logger:
@@ -241,7 +257,24 @@ class User:
                     f"""{hilight("[Notify]", "skip")} User {hilight(self.name)} is disabled."""
                 )
             return
-        statuses = [self.notification_status(listing, local_cache) for listing in listings]
+        statuses = (
+            [forced_status] * len(listings)
+            if forced_status is not None
+            else [self.notification_status(listing, local_cache) for listing in listings]
+        )
+        allowed = reasons or NotifyReasons()
+        if not all(allowed.allows(entry) for entry in statuses):
+            keep = [index for index, entry in enumerate(statuses) if allowed.allows(entry)]
+            if not keep:
+                if self.logger:
+                    self.logger.debug(
+                        f"""{hilight("[Notify]", "skip")} Nothing to tell {hilight(self.name)}: """
+                        """every listing's reason is switched off."""
+                    )
+                return
+            listings = [listings[index] for index in keep]
+            ratings = [ratings[index] for index in keep]
+            statuses = [statuses[index] for index in keep]
         cards = []
         for listing, rating, status in zip(listings, ratings, statuses):
             when, price = self.last_notification(listing, local_cache)

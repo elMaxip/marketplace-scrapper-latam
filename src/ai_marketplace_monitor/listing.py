@@ -1,5 +1,5 @@
 from dataclasses import asdict, dataclass
-from typing import Optional, Tuple, Type
+from typing import ClassVar, Optional, Tuple, Type
 
 from diskcache import Cache  # type: ignore
 
@@ -20,6 +20,33 @@ class Listing:
     seller: str
     condition: str
     description: str
+    #: How many the shop says it can sell right now, as text, or "".
+    #:
+    #: Only a retailer has this.  A Facebook or Mercado Libre listing is one
+    #: object with one seller, and the question does not arise; Lider and
+    #: Sodimac publish a number, and it is the number a "stock mínimo" alert is
+    #: measured against.  Text and not an int because what the two sites publish
+    #: is not the same quantity -- Sodimac's is what it will let you put in a
+    #: cart, Lider's is a per-order ceiling -- and rounding both into one
+    #: integer would invent a precision neither of them offers.
+    stock: str = ""
+    #: ``"in_stock"``, ``"out_of_stock"`` or "" when the site does not say.
+    #:
+    #: Kept apart from ``stock`` because they answer different questions and a
+    #: site can answer one without the other: "no stock number, but you can buy
+    #: it" is the ordinary state of a marketplace listing.
+    availability: str = ""
+
+    #: Fields that are not part of "has this listing changed?".
+    #:
+    #: ``image`` because Facebook's URLs carry an expiring signature, so every
+    #: scrape would report a change.  ``stock`` and ``availability`` because a
+    #: shop's counter ticking from 45 to 44 is not news, and telling the user
+    #: their listing "changed" every time somebody else buys one is how a
+    #: notification channel gets muted.  Availability going to zero is not lost:
+    #: it comes back as :attr:`~ai_marketplace_monitor.marketplace.ListingStatus.SOLD`
+    #: from the re-check, which removes the listing outright.
+    NOT_IN_HASH: ClassVar[Tuple[str, ...]] = ("image", "stock", "availability")
 
     @property
     def content(self: "Listing") -> Tuple[str, str, str]:
@@ -33,7 +60,7 @@ class Listing:
             {
                 x: (y.split("?")[0] if x == "post_url" else y)
                 for x, y in asdict(self).items()
-                if x != "image"
+                if x not in self.NOT_IN_HASH
             }
         )
 

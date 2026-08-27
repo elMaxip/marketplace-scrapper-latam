@@ -51,8 +51,9 @@ import html as html_module
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from . import templates as user_template
 from .listing import Listing
 from .utils import price_value
 
@@ -233,12 +234,20 @@ PHRASES: Dict[str, Dict[str, str]] = {
         "updated": "updated",
         "cheaper": "cheaper",
         "reminder": "reminder",
+        "top": "cheapest",
+        "low_stock": "running out",
         "new_plural": "new",
         "updated_plural": "updated",
         "cheaper_plural": "cheaper",
         "reminder_plural": "reminder",
+        "top_plural": "cheapest",
+        "low_stock_plural": "running out",
         "found_one": "{count} {kind} listing on {marketplace}",
         "found_many": "{count} {kind} listings on {marketplace}",
+        # The top-1 message names the search rather than counting listings:
+        # there is exactly one of them and which product it is for is the
+        # whole point.
+        "new_top": "New cheapest for {item}",
     },
     "es": {
         "dropped": "Bajó",
@@ -250,6 +259,8 @@ PHRASES: Dict[str, Dict[str, str]] = {
         "updated": "actualizada",
         "cheaper": "más barata",
         "reminder": "ya vista",
+        "top": "la más barata",
+        "low_stock": "por agotarse",
         # Spanish agrees adjectives with the noun, so the plural is a second
         # entry rather than an "s" glued on: "más barata" does not pluralise by
         # suffix, and neither will anything else worth adding here later.
@@ -257,8 +268,11 @@ PHRASES: Dict[str, Dict[str, str]] = {
         "updated_plural": "actualizadas",
         "cheaper_plural": "más baratas",
         "reminder_plural": "ya vistas",
+        "top_plural": "las más baratas",
+        "low_stock_plural": "por agotarse",
         "found_one": "{count} publicación {kind} en {marketplace}",
         "found_many": "{count} publicaciones {kind} en {marketplace}",
+        "new_top": "Nuevo top 1 en {item}",
     },
 }
 
@@ -421,8 +435,66 @@ class ListingCard:
     language: str | None = None
     #: Kept for the channels that were built around it, and shown last.
     description: str = ""
+    #: The search this listing turned up under, for ``{item}`` in a template.
+    item: str | None = None
+    #: What the shop says is left, and whether it can be bought at all.
+    #:
+    #: Never on the built-in card: a marketplace listing has neither, so a line
+    #: for them would be blank on almost every notification the monitor sends.
+    #: They exist for the one message that is *about* them -- a tracker running
+    #: out of stock -- and for a template that asks.
+    stock: str | None = None
+    availability: str | None = None
+    #: Who is selling, for ``{seller}``.  Not on the built-in card -- it is one
+    #: line of a phone notification that almost never helps -- but a template
+    #: the user wrote is allowed to want it.
+    seller: str | None = None
     #: Whatever else the caller wants to carry through, unrendered.
     extra: Dict[str, Any] = field(default_factory=dict)
+
+    def template_values(self: "ListingCard") -> Dict[str, Any]:
+        """This card as the flat mapping a user template is filled in from.
+
+        Flat and stringly-typed on purpose: a template is a string the user
+        wrote, and every hole in it is filled with text.  The two computed
+        entries -- the difference and the percentage -- are why this is a method
+        rather than an ``asdict``: they exist only when both prices parsed, and
+        a template saying "Bajó {discount}" has to drop that line rather than
+        say "Bajó " when they did not.
+        """
+        change = self.change
+        symbol = symbol_of(self.price)
+        return {
+            "notification_type": self.status or "",
+            "title": self.title,
+            "price": self.price or "",
+            # An alias, so a price-drop template reads the way its subject does:
+            # "de {old_price} a {new_price}".
+            "new_price": self.price or "",
+            "old_price": self.previous_price or "",
+            "discount": (
+                f"{symbol}{_group(change.amount, self.language)}" if change is not None else ""
+            ),
+            "discount_percent": (
+                f"{'-' if change.direction == 'down' else '+'}{change.percent:.0f}%"
+                if change is not None and change.percent is not None
+                else ""
+            ),
+            "location": self.location or "",
+            "condition": self.condition or "",
+            "stock": self.stock or "",
+            "availability": self.availability or "",
+            "marketplace": self.marketplace,
+            "item": self.item or "",
+            "seller": self.seller or "",
+            "rating": "" if self.rating is None else str(self.rating),
+            "verdict": self.verdict or "",
+            "comment": self.comment or "",
+            "description": self.description or "",
+            "url": self.url,
+            "link": self.url,
+            "image": self.image or "",
+        }
 
     # -- the individual lines, so a channel can pick and choose --------------
 
@@ -460,48 +532,84 @@ class ListingCard:
         """The words on the link, for a channel that makes it a button."""
         return phrases_for(self.language)["view"]
 
-    def render(self: "ListingCard", message_format: str = PLAIN, link: bool = True) -> str:
+    def _writers(
+        self: "ListingCard", message_format: str, link: bool
+    ) -> Tuple[Any, Any, Any, str]:
+        """``(escape, bold, anchor, newline)`` for one format.
+
+        The whole of the difference between the four formats, in one place, so
+        that a template and the built-in card are escaped by exactly the same
+        rules.  Assembling them separately is how the three original branches
+        drifted into saying three slightly different things.
+        """
+        if message_format == HTML:
+            return (
+                lambda text: html_module.escape(text, quote=True),
+                lambda text: f"<b>{text}</b>",
+                (lambda label, url: f'<a href="{url}">{label}</a>') if link else None,
+                "<br>",
+            )
+        if message_format == MARKDOWN_V2:
+            return (
+                escape_markdown_v2,
+                lambda text: f"*{text}*",
+                (lambda label, url: f"[{label}]({url})") if link else None,
+                "\n",
+            )
+        if message_format == MARKDOWN:
+            return (
+                lambda text: text,
+                lambda text: f"**{text}**",
+                (lambda label, url: f"[{label}]({url})") if link else None,
+                "\n",
+            )
+        return (
+            lambda text: text,
+            lambda text: text,
+            (lambda label, url: f"{label}: {url}") if link else None,
+            "\n",
+        )
+
+    def render(
+        self: "ListingCard",
+        message_format: str = PLAIN,
+        link: bool = True,
+        template: str | None = None,
+    ) -> str:
         """The card as text in one of the four formats.
 
         ``link`` is False for a channel that puts the URL somewhere of its own
         -- a Telegram photo caption with a button under it, say -- so the same
         card does not carry the address twice.
 
-        All four go through :meth:`_blocks` with an escaper and a way of writing
-        a link, which is the whole of the difference between them.  Assembling
-        them separately is how the three original branches drifted into saying
-        three slightly different things.
+        ``template`` replaces the built-in shape with one the user wrote; see
+        :mod:`ai_marketplace_monitor.templates`.  It goes through the very same
+        escaper as the built-in card, so a template cannot produce a message the
+        channel refuses outright -- which is what this indirection is for, not a
+        nicety: an unescaped "." in a MarkdownV2 message is not a cosmetic
+        problem, it is a message that never arrives.
         """
-        if message_format == HTML:
-            return self._blocks(
-                lambda text: html_module.escape(text, quote=True),
-                bold=lambda text: f"<b>{text}</b>",
-                anchor=(lambda label, url: f'<a href="{url}">{label}</a>') if link else None,
-                newline="<br>",
+        esc, bold, anchor, newline = self._writers(message_format, link)
+        if template and template.strip():
+            return user_template.render(
+                template,
+                self.template_values(),
+                esc=esc,
+                write_link=(
+                    (lambda url: anchor(esc(self.link_label()), url))
+                    if anchor is not None
+                    else None
+                ),
+                newline=newline,
             )
-        if message_format == MARKDOWN_V2:
-            return self._blocks(
-                escape_markdown_v2,
-                bold=lambda text: f"*{text}*",
-                anchor=(lambda label, url: f"[{label}]({url})") if link else None,
-            )
-        if message_format == MARKDOWN:
-            return self._blocks(
-                lambda text: text,
-                bold=lambda text: f"**{text}**",
-                anchor=(lambda label, url: f"[{label}]({url})") if link else None,
-            )
-        return self._blocks(
-            lambda text: text,
-            bold=lambda text: text,
-            anchor=(lambda label, url: f"{label}: {url}") if link else None,
-        )
+        return self._blocks(esc, bold=bold, anchor=anchor, newline=newline)
 
     def render_within(
         self: "ListingCard",
         limit: int | None,
         message_format: str = PLAIN,
         link: bool = True,
+        template: str | None = None,
     ) -> str:
         """The card, rendered so that it fits in ``limit`` characters.
 
@@ -519,7 +627,7 @@ class ListingCard:
         no longer says what it is about.  The price, the platform and the link
         are never touched: they are the message.
         """
-        text = self.render(message_format, link)
+        text = self.render(message_format, link, template)
         if limit is None or len(text) <= limit:
             return text
 
@@ -533,7 +641,7 @@ class ListingCard:
             over = len(text) - limit
             room = max(0, len(card.description) - over - len(ELLIPSIS))
             card = replace(card, description=shorten(card.description, room))
-            text = card.render(message_format, link)
+            text = card.render(message_format, link, template)
             if len(text) <= limit:
                 return text
 
@@ -541,7 +649,7 @@ class ListingCard:
             replace(card, description=""),
             replace(card, description="", comment=None),
         ):
-            text = shorter.render(message_format, link)
+            text = shorter.render(message_format, link, template)
             if len(text) <= limit:
                 return text
             card = shorter
@@ -549,7 +657,7 @@ class ListingCard:
         # Nothing discretionary is left: the title itself is what does not fit.
         over = len(text) - limit
         text = replace(card, title=shorten(card.title, max(1, len(card.title) - over))).render(
-            message_format, link
+            message_format, link, template
         )
         # Even the irreducible card can be too long for an absurdly small
         # limit, and this method's promise is the one thing that must not
@@ -611,6 +719,8 @@ STATUS_WORDS = {
     "LISTING_DISCOUNTED": "cheaper",
     "LISTING_CHANGED": "updated",
     "EXPIRED": "reminder",
+    "TOP_LISTING": "top",
+    "LOW_STOCK": "low_stock",
 }
 
 
@@ -671,6 +781,13 @@ def build_card(
         image=_clean(listing.image),
         notified_at=notified_at,
         language=language,
+        # Neither is on the built-in card: the search's name is something the
+        # reader already knows and the seller is a line that almost never helps
+        # on a phone.  A template the user wrote is allowed to want both.
+        item=_clean(getattr(listing, "name", None)),
+        seller=_clean(listing.seller),
+        stock=_clean(getattr(listing, "stock", None)),
+        availability=_clean(getattr(listing, "availability", None)),
         # Only the notification's copy is shortened.  What the scraper stored
         # is the seller's text and stays the seller's text -- the dashboard,
         # the export and the AI all keep reading the whole of it.

@@ -86,6 +86,14 @@ class CacheType(Enum):
     #: two minutes before the monitor was stopped is not due again the instant
     #: it comes back, and "Iniciar" has to be able to say so.
     SEARCH_RUNS = "search-runs"
+    #: The cheapest valid listing each search has, and what it cost.  Kept so a
+    #: "new top 1" is only announced when the number actually goes down --
+    #: without it, every search would re-announce the same cheapest listing on
+    #: every cycle.
+    TOP_LISTING = "top-listing"
+    #: The stock level a tracker was last warned about, so "quedan 2" is said
+    #: once rather than on every round until somebody buys the last one.
+    STOCK_ALERT = "stock-alert"
 
 
 class CounterItem(Enum):
@@ -406,6 +414,24 @@ class MonitorConfig(BaseConfig):
     #: seller who writes one unbroken paragraph gets past a line limit with a
     #: description that still fills the screen.
     max_description_words: int | None = None
+    #: Whether a listing nobody has been told about yet produces a message.
+    #:
+    #: On, because it is what the monitor has always done and a configuration
+    #: file written before this switch existed must keep meaning what it meant.
+    #: Off is for somebody who only wants to hear about price movement on
+    #: listings they already know about.  See
+    #: :mod:`ai_marketplace_monitor.notify_reasons`.
+    notify_new: bool | None = None
+    #: Whether a listing that got cheaper since the last message produces one.
+    #: On, for the same reason.
+    notify_price_drop: bool | None = None
+    #: Whether a search announces its cheapest valid listing when that gets
+    #: cheaper.
+    #:
+    #: Off, unlike the other two: this is new behaviour that sends messages
+    #: nobody has asked for yet, and the honest default for that is silence.
+    #: See :mod:`ai_marketplace_monitor.toplist`.
+    notify_top_listing: bool | None = None
     #: Retired: this counted lines, which measured the screen rather than the
     #: text.  Accepted so a file written while it existed still loads, ignored
     #: so it cannot quietly mean something else, and dropped from the file by
@@ -467,6 +493,28 @@ class MonitorConfig(BaseConfig):
             return
         if not isinstance(self.notify_immediately, bool):
             raise ValueError(f"Monitor {hilight('notify_immediately')} must be true or false.")
+
+    def _handle_notify_switch(self: "MonitorConfig", key: str) -> None:
+        """Validate one of the three "tell me about" switches.
+
+        ``None`` is left alone rather than replaced with a default: absent means
+        "whatever the monitor does", and :func:`notify_reasons.reasons_from_config`
+        is the single place that decides what that is.  Filling it in here would
+        put the same default in two files, which is how the two drift apart.
+        """
+        value = getattr(self, key)
+        if value is None or isinstance(value, bool):
+            return
+        raise ValueError(f"Monitor {hilight(key)} must be true or false.")
+
+    def handle_notify_new(self: "MonitorConfig") -> None:
+        self._handle_notify_switch("notify_new")
+
+    def handle_notify_price_drop(self: "MonitorConfig") -> None:
+        self._handle_notify_switch("notify_price_drop")
+
+    def handle_notify_top_listing(self: "MonitorConfig") -> None:
+        self._handle_notify_switch("notify_top_listing")
 
     def handle_max_description_words(self: "MonitorConfig") -> None:
         if self.max_description_words is None:

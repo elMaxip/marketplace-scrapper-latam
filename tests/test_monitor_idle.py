@@ -141,9 +141,11 @@ def test_publishing_an_empty_config_is_not_a_failure(tmp_path: Path) -> None:
     assert loaded["items"] == []
     assert loaded["searches"] == []
     # The platforms are built in, so stored listings can still be re-checked
-    # on both of them even with nothing configured to search.
+    # on all of them even with nothing configured to search.  The shops are in
+    # this list too: a search has to opt in to *searching* one, but a listing
+    # already stored from one is re-checked like any other.
     assert control.updates()["enabled"] is True
-    assert control.updates()["marketplaces"] == ["facebook", "mercadolibre"]
+    assert control.updates()["marketplaces"] == ["facebook", "mercadolibre", "lider", "sodimac"]
 
 
 def test_a_reload_forgets_a_search_that_is_gone(tmp_path: Path) -> None:

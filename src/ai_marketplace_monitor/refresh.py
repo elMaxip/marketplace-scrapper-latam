@@ -8,11 +8,13 @@ one up to date.
 
 Three rules shape it:
 
-* **Do not re-check what was just checked.**  A listing the search flow looked
-  at two minutes ago has nothing new to say, so freshness is decided from the
+* **Do not re-check what was just checked.**  Freshness is decided from the
   observation's ``last_seen`` -- which is exactly "when we last looked at this"
   and already exists -- rather than from a second timestamp meaning the same
-  thing.
+  thing.  This is about not repeating *this* flow's own work within one recheck
+  interval; the search no longer opens stored listings at all, so there is
+  nothing of its to collide with (see
+  :func:`~ai_marketplace_monitor.observations.is_known`).
 * **Never let two flows work on the same listing.**  The search flow and the
   refresher can both reach the same listing; :mod:`ai_marketplace_monitor.control`
   hands out an exclusive claim and the loser skips rather than waits.
@@ -37,7 +39,7 @@ from .control import claim
 from .listing import Listing
 from .marketplace import ItemConfig, ListingStatus, Marketplace
 from .observations import delete_observations, get_observation, iter_observations, record_observation
-from .utils import CacheType, CounterItem, aimm_event, cache, counter, hilight
+from .utils import CacheType, CounterItem, aimm_event, cache, counter, hilight, price_value
 
 #: How stale a listing has to be before re-opening its page is worth the traffic.
 DEFAULT_RECHECK_INTERVAL = 6 * 60 * 60
@@ -46,12 +48,6 @@ DEFAULT_RECHECK_INTERVAL = 6 * 60 * 60
 #: with searching and abandoned promptly when the monitor is paused; a small
 #: number keeps any single burst of listing-page traffic modest.
 DEFAULT_SLICE_SIZE = 10
-
-#: How recently a listing has to have been read for the *search* flow to leave
-#: it alone.  Much shorter than the recheck interval on purpose: this exists to
-#: stop the two flows from opening the same page minutes apart, not to stop the
-#: search from noticing that a price moved.
-SEARCH_RECHECK_COOLDOWN = 15 * 60
 
 #: Shortest gap between two slices, and between two listing pages inside one.
 #:
@@ -201,6 +197,24 @@ def _placeholder_config(item_name: Optional[str]) -> ItemConfig:
 
 
 @dataclass
+class PriceDrop:
+    """One listing that is cheaper than the last time it was read.
+
+    Reported rather than acted on, because who to tell and whether they asked to
+    hear it are the monitor's questions, not this module's -- the refresher has
+    no users, no reasons and no notification cache.  What it does have, and
+    nothing else does, is *both prices*: the one on the page now and the one
+    that was stored a moment ago.
+    """
+
+    listing: Listing
+    #: The price the store held before this re-check.
+    previous: str
+    #: The search this listing belongs to, or None when it has been deleted.
+    item_name: Optional[str]
+
+
+@dataclass
 class RefreshReport:
     """What one slice did.  Summed by the caller for the log line."""
 
@@ -210,6 +224,12 @@ class RefreshReport:
     skipped: int = 0
     failed: int = 0
     removed_keys: List[Tuple[str, str]] = field(default_factory=list)
+    #: The listings that got cheaper in this slice.
+    #:
+    #: A re-check is the *only* place a price moves -- the search never opens a
+    #: listing it already knows -- so if this does not travel out of here, the
+    #: fact that something got cheaper is known to the log and to nobody else.
+    drops: List["PriceDrop"] = field(default_factory=list)
     #: Why listings were skipped, by reason.  A slice that does nothing has to
     #: be able to say why: a silent skip reads exactly like an empty queue, and
     #: the two call for opposite reactions.
@@ -225,6 +245,22 @@ class RefreshReport:
     def why_skipped(self: "RefreshReport") -> str:
         """The skip reasons in one phrase, for the log line."""
         return ", ".join(f"{count} {reason}" for reason, count in sorted(self.skips.items()))
+
+
+def is_cheaper(previous: Any, current: Any) -> bool:
+    """Whether ``current`` is a smaller amount than ``previous``.
+
+    Compared as numbers, never as text: prices are stored exactly as the site
+    printed them, so "$1.099.990" and "1099990" are the same amount written two
+    ways and a string comparison would call that a change.  Anything that does
+    not parse on either side is not a fall -- a price that cannot be read is not
+    a cheaper one, it is one we do not know.
+    """
+    before = price_value(None if previous is None else str(previous))
+    after = price_value(None if current is None else str(current))
+    if before is None or after is None:
+        return False
+    return after < before
 
 
 class ListingRefresher:
@@ -487,6 +523,15 @@ class ListingRefresher:
             details, matched=matched, item_name=item_name, local_cache=self.local_cache
         )
         report.updated += 1
+        if matched and is_cheaper(previous, details.price):
+            # Only a listing that still passes its filters: one the search would
+            # have thrown away is not a bargain, it is a rejection that happens
+            # to cost less.  `check_listing` above has already dropped junk
+            # prices, which is what keeps a page reporting 999999 while it loads
+            # from being read as a price and then as a spectacular fall.
+            report.drops.append(
+                PriceDrop(listing=details, previous=str(previous), item_name=item_name)
+            )
         if self.logger and previous and previous != details.price:
             self.logger.info(
                 f"""{hilight("[Update]", "succ")} {hilight(details.title)} changed price: """

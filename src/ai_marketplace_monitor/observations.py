@@ -458,6 +458,48 @@ def get_observation(
     return record if isinstance(record, dict) else None
 
 
+def is_known(
+    marketplace: str,
+    listing_id: str,
+    local_cache: Cache | None = None,
+) -> bool:
+    """Whether this listing has ever been recorded, tombstones included.
+
+    The one question the *search* flow asks of this store, and the division of
+    labour it enforces: searching answers "what is new?", and a listing already
+    in the store is by definition not new.  Everything that happens to it
+    afterwards -- the price moving, the stock running out, the post coming down
+    -- belongs to the review (:mod:`ai_marketplace_monitor.refresh`), which
+    opens the listing's own page and reads it properly.
+
+    This replaced a fifteen-minute cooldown that asked the wrong question.
+    "Was this read recently?" made the two flows race: a search that ran sixteen
+    minutes after a review re-opened every listing page the review had just
+    read, and one that ran fourteen minutes after it skipped listings that had
+    genuinely changed.  Whether the search should open a page does not depend on
+    the clock at all -- it depends on whether the listing is one we already
+    know.
+
+    A tombstone counts as known.  A deleted or sold listing that keeps turning
+    up in results is the normal case (the marketplace has no idea we threw it
+    away), and re-fetching its page on every single cycle forever was the most
+    wasteful thing the search did.
+    """
+    if not marketplace or not listing_id:
+        return False
+    try:
+        record = _resolve(local_cache).get(observation_key(marketplace, listing_id))
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        # An unreadable store must not turn into "everything is new", which
+        # would re-fetch the entire market.  Treating it as known costs one
+        # skipped listing; the opposite costs a scrape.
+        logger.debug("Could not tell whether %s/%s is known", marketplace, listing_id)
+        return True
+    return isinstance(record, dict)
+
+
 def iter_observations(local_cache: Cache | None = None) -> Iterator[Dict[str, Any]]:
     """Every observation record, in no particular order."""
     local = _resolve(local_cache)

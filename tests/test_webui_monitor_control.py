@@ -179,6 +179,33 @@ def test_the_choice_can_be_withdrawn(client: TestClient) -> None:
     assert control.next_search() is None
 
 
+def test_running_a_search_now_promotes_it_and_ends_what_is_running(
+    client: TestClient,
+) -> None:
+    with control.running(item="ps5", marketplace="facebook"):
+        body = client.post("/api/scraper/search/run", json={"item": "bici"}).json()
+
+    assert body["next_search"] == {**body["next_search"], "item": "bici", "now": True}
+    assert [entry["item"] for entry in body["stopped"]] == ["ps5"]
+    # A stop, not a cancellation: the scraper is left exactly as it was and the
+    # search it was running ends as if it had finished.
+    assert control.cancel_requested() is False
+    assert body["paused"] is False
+
+
+def test_running_a_search_now_does_not_release_the_pause(client: TestClient) -> None:
+    # Two contradictory instructions otherwise.  The answer says so, so the
+    # interface can say "cuando lo reanudes" instead of promising it now.
+    client.post("/api/monitor/pause", json={"paused": True})
+    body = client.post("/api/scraper/search/run", json={"item": "bici"}).json()
+    assert body["paused"] is True
+    assert control.next_search_now() == "bici"
+
+
+def test_running_a_search_now_needs_a_name(client: TestClient) -> None:
+    assert client.post("/api/scraper/search/run", json={"item": ""}).status_code == 400
+
+
 def test_resuming_withdraws_a_stop_that_never_landed(client: TestClient) -> None:
     client.post("/api/monitor/pause", json={"paused": True, "force": True})
     body = client.post("/api/monitor/pause", json={"paused": False}).json()

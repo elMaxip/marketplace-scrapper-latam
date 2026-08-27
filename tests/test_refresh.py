@@ -16,6 +16,7 @@ from ai_marketplace_monitor.marketplace import ItemConfig, ListingStatus
 from ai_marketplace_monitor.refresh import (
     ListingRefresher,
     _interleave,
+    is_cheaper,
     stale_records,
     was_checked_recently,
 )
@@ -380,6 +381,67 @@ def test_a_slice_stops_when_asked(temp_cache: Cache) -> None:
     marketplace = FakeMarketplace(ListingStatus.ACTIVE, details=_listing(price="$90 000"))
     refresher = _refresher(temp_cache, marketplace, stop_when=lambda: True)
     assert refresher.run_slice(("facebook",)).checked == 0
+
+
+# --------------------------------------------------------------------------- #
+# Saying that something got cheaper
+# --------------------------------------------------------------------------- #
+#
+# A re-check is the only place a price moves -- the search never opens a listing
+# it already knows -- so a fall that does not leave this module is a fall
+# nobody will ever hear about.  Reported rather than announced: who to tell and
+# whether they asked to hear it belong to the monitor.
+
+
+def test_a_fall_is_reported(temp_cache: Cache) -> None:
+    obs.record_observation(_listing(price="$100 000"), item_name="ps5", local_cache=temp_cache)
+    _age(("facebook", "1"), temp_cache, minutes=600)
+
+    marketplace = FakeMarketplace(ListingStatus.ACTIVE, details=_listing(price="$80 000"))
+    report = _refresher(temp_cache, marketplace).run_slice(("facebook",))
+
+    assert len(report.drops) == 1
+    assert (report.drops[0].previous, report.drops[0].listing.price) == ("$100 000", "$80 000")
+    assert report.drops[0].item_name == "ps5"
+
+
+def test_a_rise_is_not_a_fall(temp_cache: Cache) -> None:
+    obs.record_observation(_listing(price="$100 000"), item_name="ps5", local_cache=temp_cache)
+    _age(("facebook", "1"), temp_cache, minutes=600)
+
+    marketplace = FakeMarketplace(ListingStatus.ACTIVE, details=_listing(price="$120 000"))
+    assert _refresher(temp_cache, marketplace).run_slice(("facebook",)).drops == []
+
+
+def test_the_same_amount_written_differently_is_not_a_fall(temp_cache: Cache) -> None:
+    # Prices are stored exactly as the site printed them, so a site that changes
+    # its formatting would otherwise announce a bargain on every listing it has.
+    obs.record_observation(_listing(price="$100.000"), item_name="ps5", local_cache=temp_cache)
+    _age(("facebook", "1"), temp_cache, minutes=600)
+
+    marketplace = FakeMarketplace(ListingStatus.ACTIVE, details=_listing(price="100000"))
+    assert _refresher(temp_cache, marketplace).run_slice(("facebook",)).drops == []
+
+
+def test_a_rejected_listing_does_not_announce_a_bargain(temp_cache: Cache) -> None:
+    # A listing the filters throw away is not a bargain; it is a rejection that
+    # happens to cost less.
+    obs.record_observation(_listing(price="$100 000"), item_name="ps5", local_cache=temp_cache)
+    _age(("facebook", "1"), temp_cache, minutes=600)
+
+    marketplace = FakeMarketplace(
+        ListingStatus.ACTIVE, details=_listing(price="$80 000"), matched=False
+    )
+    assert _refresher(temp_cache, marketplace).run_slice(("facebook",)).drops == []
+
+
+def test_a_price_that_cannot_be_read_is_not_a_fall() -> None:
+    # Not cheaper, not dearer: unknown.  A page that stops printing a price is
+    # the normal way this happens, and it must not read as free.
+    assert is_cheaper("$100 000", "") is False
+    assert is_cheaper("", "$80 000") is False
+    assert is_cheaper("$100 000", "**unspecified**") is False
+    assert is_cheaper("$100 000", "$80 000") is True
 
 
 def test_the_filters_verdict_is_recorded(temp_cache: Cache) -> None:

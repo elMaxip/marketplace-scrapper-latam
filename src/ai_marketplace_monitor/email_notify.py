@@ -17,7 +17,7 @@ from markupsafe import Markup, escape
 
 from .ai import AIResponse  # type: ignore
 from .listing import Listing
-from .messages import PLAIN, ListingCard, build_card, summary_title
+from .messages import HTML, PLAIN, ListingCard, build_card, summary_title
 from .notification import NotificationConfig, NotificationStatus
 from .utils import fetch_with_retry, hilight, resize_image_data
 
@@ -171,11 +171,26 @@ class EmailNotificationConfig(NotificationConfig):
                 build_card(listing, rating, status)
                 for listing, rating, status in zip(listings, ratings, notification_status)
             ]
+        # One template for the batch, chosen from the first status that is
+        # actually being sent: an email covers one round of one search, so the
+        # batch is one kind of news the same way a push batch is.
+        template = self._batch_template(notification_status, force)
         return "\n\n".join(
-            card.render(PLAIN)
+            card.render(PLAIN, template=template)
             for card, status in zip(cards, notification_status)
             if force or status != NotificationStatus.NOTIFIED
         )
+
+    def _batch_template(
+        self: "EmailNotificationConfig",
+        notification_status: List[NotificationStatus],
+        force: bool = False,
+    ) -> str | None:
+        """The user's wording for this email, or None for the built-in layout."""
+        for status in notification_status:
+            if force or status != NotificationStatus.NOTIFIED:
+                return self.template_for(status)
+        return None
 
     def get_html_message(
         self: "EmailNotificationConfig",
@@ -237,11 +252,21 @@ class EmailNotificationConfig(NotificationConfig):
                 for listing, rating, status in zip(listings, ratings, notification_status)
             ]
 
+        # A body per listing when the channel has a template, None otherwise.
+        # Rendered here rather than in the Jinja template because the escaping
+        # is the card's business, not the layout's -- and HTML is the one format
+        # where getting that wrong is a security question and not a cosmetic one.
+        wording = self._batch_template(notification_status, force)
+        bodies = [
+            Markup(card.render(HTML, template=wording)) if wording else None
+            for card in cards
+        ]
+
         # Render template.  The card travels alongside the listing rather than
         # replacing it: the template still needs the raw listing for the image
         # it has already fetched and attached by content id.
         html = template.render(
-            listings=zip(listings, ratings, notification_status, cards),
+            listings=zip(listings, ratings, notification_status, cards, bodies),
             force=force,
             item_name=listings[0].name.capitalize(),
             NotificationStatus=NotificationStatus,  # Pass enum for comparison

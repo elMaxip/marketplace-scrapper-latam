@@ -143,7 +143,7 @@ def test_every_supported_platform_is_listed_without_being_declared(
         handler,
     )
     body = TestClient(app).get("/api/marketplace/sessions").json()
-    assert sorted(body["sessions"]) == ["facebook", "mercadolibre"]
+    assert sorted(body["sessions"]) == ["facebook", "lider", "mercadolibre", "sodimac"]
 
 
 def test_configured_credentials_are_reported_as_another_way_in(tmp_path: Path) -> None:
