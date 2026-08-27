@@ -16,6 +16,7 @@ from .messages import (
     summary_title,
     truncate_description,
 )
+from .templates import template_for, validate_all as validate_templates
 from .utils import BaseConfig, hilight
 
 
@@ -25,6 +26,23 @@ class NotificationStatus(Enum):
     NOTIFIED = 2
     LISTING_CHANGED = 3
     LISTING_DISCOUNTED = 4
+    #: The cheapest valid listing a search has, and it just became cheaper than
+    #: the cheapest it had.
+    #:
+    #: Unlike the others this is not a fact about *this* listing -- it is a fact
+    #: about the listing's position among all the others found for the same
+    #: search -- which is why it cannot be worked out from the notification
+    #: cache the way the rest are, and why it is decided in
+    #: :mod:`ai_marketplace_monitor.toplist` and handed in rather than read.
+    TOP_LISTING = 5
+    #: A tracked product's stock has fallen to or below the number the user
+    #: asked to be told about.
+    #:
+    #: Like ``TOP_LISTING`` and unlike the rest, this cannot be worked out from
+    #: the notification cache: it is a comparison between what the page says now
+    #: and a threshold in the config, so it is decided in
+    #: :mod:`ai_marketplace_monitor.tracking` and handed in.
+    LOW_STOCK = 6
 
 
 @dataclass
@@ -107,6 +125,40 @@ class NotificationConfig(BaseConfig):
             if hasattr(subclass_obj, "notify_all"):
                 succ.append(subclass.notify_all(config, *args, **kwargs))
         return any(succ)
+
+    @classmethod
+    def message_all(
+        cls: type["NotificationConfig"],
+        config: "NotificationConfig",
+        title: str,
+        message: str,
+        logger: Logger | None = None,
+    ) -> bool:
+        """Send one plain message through every channel this user has.
+
+        The same walk as :meth:`notify_all` and deliberately so, but for the
+        notification that is not about a listing.  There is exactly one of those
+        so far -- a shop has started refusing us -- and it needs no card, no
+        rating and no status: it is a sentence about the monitor itself.
+
+        Channels the user has not configured drop out on their own, inside
+        :meth:`_execute_with_retry`, which is where "has the required fields"
+        already lives.
+        """
+        sent = []
+        for subclass in cls.__subclasses__():
+            flds = {f.name for f in fields(subclass)}
+            subclass_obj = subclass(**{k: getattr(config, k) for k in flds})
+            if subclass.__name__ not in ("UserConfig", "PushNotificationConfig"):
+                try:
+                    sent.append(subclass_obj._execute_with_retry(title, message, logger))
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    sent.append(False)
+            if hasattr(subclass_obj, "message_all"):
+                sent.append(subclass.message_all(config, title, message, logger))
+        return any(sent)
 
     def _execute_with_retry(
         self: "NotificationConfig",
@@ -314,6 +366,45 @@ class PushNotificationConfig(NotificationConfig):
     #: switched off.
     max_description_words: int | None = None
 
+    #: The message this channel sends, written by the user, one per kind of
+    #: notification.  Empty (the default) means the built-in card -- so this
+    #: whole feature is inert until somebody asks for it.
+    #:
+    #: Per channel rather than system-wide because the channels are not alike:
+    #: an email has room for the description and a lock-screen notification has
+    #: room for a price.  See :mod:`ai_marketplace_monitor.templates` for the
+    #: placeholders and for why the user's own text is escaped along with the
+    #: values.
+    template: str | None = None
+    #: Used for a listing nobody has been told about yet.
+    template_new: str | None = None
+    #: Used when a known listing got cheaper.
+    template_price_drop: str | None = None
+    #: Used when a search's cheapest valid listing gets cheaper.
+    template_top: str | None = None
+    #: Used when the seller edited the post.
+    template_updated: str | None = None
+    #: Used when the ``remind`` interval came round again.
+    template_reminder: str | None = None
+    #: Used when a tracked product is running out.
+    template_low_stock: str | None = None
+
+    def handle_template(self: "PushNotificationConfig") -> None:
+        """Refuse a template with a placeholder that is not real.
+
+        At load time and not at send time, which is the whole point: a typo like
+        ``{titel}`` renders as nothing, so a template validated on the way out
+        would silently drop the title of every notification and look like a
+        channel that had simply stopped saying what things are.
+        """
+        problems = validate_templates(self)
+        if problems:
+            raise ValueError(" ".join(problems))
+
+    def template_for(self: "PushNotificationConfig", status: Any) -> str | None:
+        """The template to use for one kind of notification, or None."""
+        return template_for(self, getattr(status, "name", None))
+
     def handle_message_format(self: "PushNotificationConfig") -> None:
         if self.message_format is None:
             self.message_format = "plain_text"
@@ -408,7 +499,13 @@ class PushNotificationConfig(NotificationConfig):
                 batch[0][1].marketplace,
                 language=language,
             )
-            if not self.send_items(title, batch, logger=logger):
+            # Chosen per batch and not per card: a batch is one kind of news
+            # by construction (that is what the grouping above is for), and a
+            # message that mixed two templates would be a message about two
+            # different things.
+            if not self.send_items(
+                title, batch, logger=logger, template=self.template_for(status)
+            ):
                 return False
         return True
 
@@ -450,6 +547,7 @@ class PushNotificationConfig(NotificationConfig):
         title: str,
         items: List[Tuple[Listing, ListingCard]],
         logger: Logger | None = None,
+        template: str | None = None,
     ) -> bool:
         """Send one batch of cards.  Text, joined, which is all most channels do.
 
@@ -457,10 +555,14 @@ class PushNotificationConfig(NotificationConfig):
         as its listing's photo with the text as the caption -- and the reason
         this is a method rather than a branch: adding a channel that can carry
         pictures should not mean editing the one that cannot.
+
+        ``template`` is the user's own wording for this kind of notification,
+        already chosen by :meth:`notify` because it is the batch, not the card,
+        that has a kind.  None means the built-in card.
         """
         fmt = self.message_format or PLAIN
         if self.message_limit is None:
-            message = "\n\n".join(card.render(fmt) for _listing, card in items)
+            message = "\n\n".join(card.render(fmt, template=template) for _listing, card in items)
             return self.send_message_with_retry(title, message, logger=logger)
 
         # The title counts: most channels put it at the top of the same message
@@ -475,7 +577,7 @@ class PushNotificationConfig(NotificationConfig):
         messages: List[str] = []
         current = ""
         for _listing, card in items:
-            text = card.render_within(room, fmt)
+            text = card.render_within(room, fmt, template=template)
             joined = text if not current else f"{current}\n\n{text}"
             if len(joined) <= room:
                 current = joined

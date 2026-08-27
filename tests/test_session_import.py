@@ -15,9 +15,12 @@ from typing import Iterator
 
 import pytest
 
+import logging
+
 from ai_marketplace_monitor import session
 from ai_marketplace_monitor.facebook import FacebookMarketplace
 from ai_marketplace_monitor.mercadolibre import MercadoLibreMarketplace
+from ai_marketplace_monitor.monitor import MarketplaceMonitor
 
 
 @pytest.fixture(autouse=True)
@@ -273,3 +276,77 @@ def test_the_cookies_survive_the_bookkeeping() -> None:
     session.rearm_import("mercadolibre")
     stored = session.load_session("mercadolibre")
     assert [cookie["name"] for cookie in stored["cookies"]] == ["ssid"]
+
+
+# --------------------------------------------------------------------------- #
+# Reaching every browser, not just the first one
+# --------------------------------------------------------------------------- #
+#
+# A lane is a second browser on a profile of its own, and it is the browser that
+# actually searches whichever platform runs in parallel.  An import that reached
+# only the main context therefore did nothing at all to it -- which is what
+# "the Sodimac cookies do not work" turned out to be: Sodimac runs on
+# `browser-profile-sodimac`.
+
+
+class FakeLane:
+    """A lane that runs what it is given, the way a live one eventually does."""
+
+    def __init__(self, name: str, alive: bool = True) -> None:
+        self.name = name
+        self.alive = alive
+        self.context = FakeCookieJar()
+
+    def submit(self, call):
+        call(self.context)
+        return None
+
+
+class FakeCookieJar:
+    def __init__(self) -> None:
+        self.added = []
+
+    def add_cookies(self, cookies):
+        self.added.extend(cookies)
+
+
+def _monitor(lanes):
+    instance = MarketplaceMonitor.__new__(MarketplaceMonitor)
+    instance.logger = logging.getLogger("test-session-import")
+    instance.lanes = lanes
+    return instance
+
+
+COOKIES = [{"name": "cf_clearance", "value": "x", "domain": ".sodimac.cl"}]
+
+
+def test_an_import_reaches_the_lanes_too() -> None:
+    lane = FakeLane("sodimac")
+    _monitor({"sodimac": lane})._seed_lanes_with_session("sodimac", COOKIES)
+    assert lane.context.added == COOKIES
+
+
+def test_every_live_lane_gets_it() -> None:
+    # Not only the lane named after the platform: one profile visits every site,
+    # and a cookie the review lane is missing is a review that gets refused.
+    lanes = {"sodimac": FakeLane("sodimac"), "updates": FakeLane("updates")}
+    _monitor(lanes)._seed_lanes_with_session("sodimac", COOKIES)
+    assert all(lane.context.added == COOKIES for lane in lanes.values())
+
+
+def test_a_lane_that_has_not_started_is_left_alone() -> None:
+    # It seeds itself from the same stored file when its browser opens, so
+    # there is nothing to do and no thread to do it on.
+    lane = FakeLane("sodimac", alive=False)
+    _monitor({"sodimac": lane})._seed_lanes_with_session("sodimac", COOKIES)
+    assert lane.context.added == []
+
+
+def test_a_lane_that_refuses_the_work_does_not_stop_the_others() -> None:
+    class Broken(FakeLane):
+        def submit(self, call):
+            raise RuntimeError("lane is going away")
+
+    good = FakeLane("updates")
+    _monitor({"a": Broken("a"), "b": good})._seed_lanes_with_session("sodimac", COOKIES)
+    assert good.context.added == COOKIES

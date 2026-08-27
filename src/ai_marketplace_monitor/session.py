@@ -317,6 +317,40 @@ def save_device_state(marketplace_name: str, context: Any) -> bool:
         return False
 
 
+def save_site_session(
+    marketplace_name: str, context: Any, domains: Iterable[str]
+) -> bool:
+    """Persist only the cookies belonging to this site.
+
+    :func:`save_session` writes the whole jar, which is right for a browser that
+    only ever visits one site and wrong for the monitor's, where one profile
+    holds Facebook, Mercado Libre and both shops at once.  Writing all of it
+    into ``sessions/lider.json`` would put the Facebook session in a file the
+    interface labels "Lider", and seed it back into every new profile from
+    there.
+
+    What this is *for* is the cookie a shop hands out once it has decided we are
+    a person -- the clearance token, not a login.  It lives in the browser
+    profile and nowhere else, so a profile thrown away takes it with it and the
+    next one starts by being challenged again.
+    """
+    try:
+        state = context.storage_state()
+        kept = [
+            cookie
+            for cookie in state.get("cookies", [])
+            if domain_allowed(cookie.get("domain"), domains)
+        ]
+        if not kept:
+            return False
+        return _write(marketplace_name, {"cookies": kept, "origins": []})
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        logger.debug("Could not save the %r session", marketplace_name, exc_info=True)
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # Importing a session from the user's own browser
 # --------------------------------------------------------------------------- #

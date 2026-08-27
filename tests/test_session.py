@@ -48,6 +48,38 @@ def test_save_then_load_round_trip(session_dir: Path) -> None:
     assert session_mod.load_session("facebook") == STATE
 
 
+MIXED: Dict[str, Any] = {
+    "cookies": [
+        {"name": "c_user", "value": "42", "domain": ".facebook.com"},
+        {"name": "_px3", "value": "clearance", "domain": ".lider.cl"},
+        {"name": "cartId", "value": "7", "domain": "www.lider.cl"},
+        {"name": "cf_clearance", "value": "x", "domain": ".sodimac.cl"},
+    ],
+    "origins": [],
+}
+
+
+def test_a_site_session_keeps_only_that_site(session_dir: Path) -> None:
+    # One profile holds every platform at once, so writing the whole jar into
+    # sessions/lider.json would put the Facebook session in a file the
+    # interface labels "Lider" -- and seed it back from there.
+    assert session_mod.save_site_session("lider", FakeContext(MIXED), ["lider.cl"]) is True
+    stored = session_mod.load_session("lider")
+    assert stored is not None
+    assert sorted(cookie["name"] for cookie in stored["cookies"]) == ["_px3", "cartId"]
+
+
+def test_a_site_session_with_nothing_to_keep_writes_nothing(session_dir: Path) -> None:
+    assert session_mod.save_site_session("lider", FakeContext(STATE), ["lider.cl"]) is False
+    assert session_mod.load_session("lider") is None
+
+
+def test_a_site_session_survives_a_dead_browser(session_dir: Path) -> None:
+    assert (
+        session_mod.save_site_session("lider", FakeContext(fail=True), ["lider.cl"]) is False
+    )
+
+
 def test_corrupt_session_is_ignored(session_dir: Path) -> None:
     """A half-written file must degrade to "log in again", not raise."""
     session_mod.save_session("facebook", FakeContext())
