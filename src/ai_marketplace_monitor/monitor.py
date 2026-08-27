@@ -20,7 +20,7 @@ from rich.prompt import Prompt
 
 from . import control
 from .ai import AIBackend, AIResponse
-from .config import Config, supported_ai_backends, supported_marketplaces
+from .config import Config, all_marketplaces, supported_ai_backends, supported_marketplaces
 from .control import CancelledScrape, ScrapeInterrupted, SearchStopped, SearchSuperseded
 from .dispatch import NotificationDispatcher
 from .lanes import BrowserLane, context_is_alive
@@ -37,10 +37,24 @@ from .live_config import (
 )
 from .marketplace import Marketplace, TItemConfig, TMarketplaceConfig
 from .messages import DEFAULT_DESCRIPTION_WORDS
-from .notification import NotificationStatus
-from .observations import record_observation, record_rating
+from .notification import NotificationConfig, NotificationStatus
+from .notify_reasons import NotifyReasons, reasons_from_config
+from .toplist import new_top, new_tops, remember_top
+from .tracking import (
+    LABEL as TRACKED_LABEL,
+    PLATFORM as TRACKED_PLATFORM,
+    reader_for as tracking_reader_for,
+    stock_alert,
+    tracked_id,
+)
+from .observations import get_observation, is_known, record_observation, record_rating
 from .pause import is_force_paused, is_paused
-from .refresh import DEFAULT_RECHECK_INTERVAL, ListingRefresher, stale_records
+from .refresh import (
+    DEFAULT_RECHECK_INTERVAL,
+    ListingRefresher,
+    RefreshReport,
+    stale_records,
+)
 from .review import ReviewSchedule, schedule_from_config
 from .session import (
     import_is_pending,
@@ -74,7 +88,25 @@ from .utils import (
 MARKETPLACE_LABELS: Dict[str, str] = {
     "facebook": "Facebook Marketplace",
     "mercadolibre": "Mercado Libre",
+    "lider": "Lider",
+    "sodimac": "Sodimac",
 }
+
+
+def _marketplace_label(marketplace: str) -> str:
+    """What a notification calls the place a listing came from.
+
+    `tracked` is deliberately not in the table above -- it is not a marketplace,
+    and listing it as one is how it ends up offered as somewhere to search -- so
+    it is named here instead.  Without this, the top-1 of a followed page was
+    the one notification in the whole program that said "tracked" at the reader
+    in English while every other tracker message said "Seguimiento".
+    """
+    name = marketplace.lower()
+    if name == TRACKED_PLATFORM:
+        return TRACKED_LABEL
+    return MARKETPLACE_LABELS.get(name, marketplace)
+
 
 #: How long a gap before the next search has to be before the browsers are
 #: worth closing.  A search every two minutes should not pay a Chromium start
@@ -131,6 +163,27 @@ class ConfigProbe:
         return self.config is not None and self.change is not None
 
 
+def _stored_rating(rating: Dict[str, Any] | None) -> AIResponse:
+    """The AI verdict an observation holds, as the object a card expects.
+
+    A listing announced as the cheapest one has almost always been evaluated
+    already -- just not by this flow, which reads the store rather than the
+    scraper.  Rebuilding the verdict from the record is what keeps the top-1
+    message from being the one notification with no stars on it.
+
+    Anything missing or unreadable comes back as "not evaluated", which
+    :func:`~ai_marketplace_monitor.messages.build_card` renders by dropping the
+    rating line -- the honest result of not knowing.
+    """
+    if not isinstance(rating, dict):
+        return AIResponse(score=3, comment=AIResponse.NOT_EVALUATED)
+    score = rating.get("score")
+    comment = rating.get("comment")
+    if not isinstance(score, int) or score not in range(1, 6) or not isinstance(comment, str):
+        return AIResponse(score=3, comment=AIResponse.NOT_EVALUATED)
+    return AIResponse(score=score, comment=comment, name=str(rating.get("name") or ""))
+
+
 class MarketplaceMonitor:
     active_marketplaces: ClassVar = {}
 
@@ -180,6 +233,15 @@ class MarketplaceMonitor:
     #: not about cost -- it is about not hashing and re-parsing a file that a
     #: text editor is writing a few bytes at a time.
     CONFIG_PROBE_INTERVAL = 2.0
+
+    #: True while a tracker's first read has a browser open on its own thread.
+    #: A class attribute so that asking is safe before anything has started one.
+    _ingesting = False
+    #: Guards the check-and-set above.  A configuration can be adopted by a
+    #: lane's checkpoint as well as by the monitor thread, and two of them
+    #: reading "no ingest is running" at the same instant would open two
+    #: browsers on the same tracker.
+    _ingest_lock = threading.Lock()
 
     def __init__(
         self: "MarketplaceMonitor",
@@ -584,6 +646,10 @@ class MarketplaceMonitor:
                     **change.to_dict(),
                 ),
             )
+        # A tracker added in this change has no schedule entry to wait for and
+        # no search that will ever pick it up: its first read is this, and it
+        # happens now rather than at the end of whatever is running.
+        self._ingest_trackers()
 
     def _apply_changes_while_running(self: "MarketplaceMonitor") -> bool:
         """Whether an edit to the running search is taken into it, or ends it."""
@@ -1171,7 +1237,7 @@ class MarketplaceMonitor:
         """
         marketplace = lane.marketplaces.get(marketplace_config.name)
         if marketplace is None:
-            marketplace_class = supported_marketplaces[
+            marketplace_class = all_marketplaces[
                 (marketplace_config.market_type or "facebook").lower()
             ]
             marketplace = marketplace_class(
@@ -1184,6 +1250,7 @@ class MarketplaceMonitor:
             # would open a fresh tab for every single search and leave the old
             # one behind.
             marketplace.set_context(context)
+        self._prepare_tracked(marketplace)
         marketplace.configure(
             marketplace_config,
             translator=self._select_translator(marketplace_config.language),
@@ -1287,8 +1354,42 @@ class MarketplaceMonitor:
                     self.logger.debug("Could not close the browser context", exc_info=True)
             self.context = None
 
+    def _seed_lanes_with_session(
+        self: "MarketplaceMonitor", name: str, cookies: List[Dict[str, Any]]
+    ) -> None:
+        """Put the same cookies into every browser that is not the main one.
+
+        A lane is a second browser on a profile of its own -- that is what makes
+        parallel searching possible at all -- and an import that reached only
+        the main context therefore missed the browser that does the searching
+        for every platform running in parallel.  Sodimac is the case that showed
+        it: it runs on ``browser-profile-sodimac``, so importing a Sodimac
+        session did nothing at all to the browser that visits Sodimac.
+
+        Handed to the lane rather than applied here, because a Playwright object
+        belongs to the thread that made it.  Queued and not waited on: this runs
+        between jobs on the monitor thread, and a lane in the middle of a search
+        should take the cookies when it comes up for air, not hold the monitor.
+        """
+        for lane in list(self.lanes.values()):
+            if not lane.alive:
+                # A lane that has not started yet seeds itself from the same
+                # stored file when its browser opens, so there is nothing to do
+                # and nowhere to do it.
+                continue
+            try:
+                lane.submit(lambda context: context.add_cookies(cookies))
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                if self.logger:
+                    self.logger.debug(
+                        f"Could not hand the {name} session to lane {lane.name!r}",
+                        exc_info=True,
+                    )
+
     def _load_session_into_browser(self: "MarketplaceMonitor", name: str) -> bool:
-        """Put an imported session into the live browser.  False if it did not.
+        """Put an imported session into every live browser.  False if it did not.
 
         The cookies are added to the persistent context, which is the same thing
         a sign-in would have produced, and the marketplace's cooldown is lifted:
@@ -1303,6 +1404,7 @@ class MarketplaceMonitor:
             return False
         try:
             self.context.add_cookies(cookies)
+            self._seed_lanes_with_session(name, cookies)
         except KeyboardInterrupt:
             raise
         except Exception as error:
@@ -1334,7 +1436,16 @@ class MarketplaceMonitor:
         find out.  Marketplaces that cannot answer the question keep quiet.
         """
         marketplace = self.active_marketplaces.get(name)
-        check = getattr(marketplace, "is_signed_in", None) if marketplace else None
+        if marketplace is None:
+            return
+        # A shop answers a different question, and it is the one that matters
+        # for a shop: a catalogue is public, so "am I signed in" is not the
+        # thing an import can fail.  See `RetailerMarketplace.session_health`.
+        health = getattr(marketplace, "session_health", None)
+        if health is not None:
+            self._report_shop_session(name, health)
+            return
+        check = getattr(marketplace, "is_signed_in", None)
         if check is None:
             return
         try:
@@ -1357,6 +1468,30 @@ class MarketplaceMonitor:
                 """imported session. The cookies were probably copied from a different """
                 """country's site, or they have expired — export them again from the site """
                 """the monitor searches, while signed in there.""",
+                extra=aimm_event("session_checked", marketplace=name, signed_in=False),
+            )
+
+    def _report_shop_session(self: "MarketplaceMonitor", name: str, health: Any) -> None:
+        """Say what the shop did with the cookies that were just loaded."""
+        try:
+            answer = health()
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            return
+        if answer is None or not self.logger:
+            # None is "could not ask", which is not an answer and must not be
+            # reported as a bad one.
+            return
+        served, sentence = answer
+        if served:
+            self.logger.info(
+                f"""{hilight("[Login]", "succ")} {sentence}""",
+                extra=aimm_event("session_checked", marketplace=name, signed_in=True),
+            )
+        else:
+            self.logger.error(
+                f"""{hilight("[Login]", "fail")} {sentence}""",
                 extra=aimm_event("session_checked", marketplace=name, signed_in=False),
             )
 
@@ -1432,10 +1567,62 @@ class MarketplaceMonitor:
             else "The running search was stopped; the browsers are still open.",
         )
 
+    def _announce_marketplace_blocks(self: "MarketplaceMonitor") -> None:
+        """Tell the user when a site has started refusing us.
+
+        Worth a message rather than only a log line, because it is the one
+        failure that looks like nothing at all: the monitor is healthy, the
+        searches run, and one platform quietly finds nothing for hours.  On a
+        server nobody is watching the interface, which is exactly where this
+        happens.
+
+        Said once per refusal, claimed from `control` so a cooldown that is read
+        on every poll does not become a message on every poll.  No link: the
+        browser view is served relative to whatever address the interface was
+        opened on -- localhost, a Tailscale name -- and this process does not
+        know which, so a URL invented here would be a URL that does not work.
+        """
+        pending = control.take_new_blocks()
+        if not pending or self.config is None:
+            return
+        users = list(self.config.user.keys())
+        if not users:
+            return
+        for block in pending:
+            name = str(block.get("marketplace") or "")
+            label = _marketplace_label(name)
+            minutes = int(float(block.get("seconds") or 0) // 60)
+            reason = str(block.get("reason") or "refused us")
+            body = (
+                f"{label} {reason} instead of serving the page, so it is being left "
+                f"alone for {minutes} minutes.\n\n"
+                "If it keeps happening, open the monitor's browser view and solve the "
+                "check once by hand -- the clearance is saved and reused afterwards."
+            )
+            for user in users:
+                if self.config.user[user].enabled is False:
+                    continue
+                try:
+                    NotificationConfig.message_all(
+                        self.config.user[user],
+                        f"{label} is being left alone",
+                        body,
+                        self.logger,
+                    )
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    if self.logger:
+                        self.logger.debug(
+                            f"Could not tell {user!r} about the {name} cooldown",
+                            exc_info=True,
+                        )
+
     def _run_job(self: "MarketplaceMonitor", job: schedule.Job) -> JobOutcome:
         """Run one scheduled search and say how it ended."""
         self._ensure_browser()
         self._apply_pending_sessions()
+        self._announce_marketplace_blocks()
         tags = sorted(str(tag) for tag in (job.tags or []))
         pair: Pair = getattr(job, "amm_pair", ("", ""))
         control.set_phase("searching", tags[0] if tags else "")
@@ -1646,7 +1833,25 @@ class MarketplaceMonitor:
             lane = self.lanes.get(lane_name)
             if lane is None:
                 return True
-            for marketplace_config, item_config in searches:
+            # A queue rather than a `for`, because "ejecutar ahora" can arrive
+            # while this lane is halfway down it and the answer to it is a
+            # different order, not a different pass.
+            queue = list(searches)
+            while queue:
+                # Asked for *now*, and this lane still has it to run: it goes to
+                # the front instead of waiting for its turn.  Claimed in the
+                # same breath, on whichever lane gets here first -- a promotion
+                # that is read and not claimed promotes the same product on
+                # every turn round every queue, for ever.
+                urgent = control.next_search_now()
+                if (
+                    urgent is not None
+                    and any(pair[1].name == urgent for pair in queue)
+                    and control.take_next_search_if(urgent)
+                ):
+                    # Stable, so everything else keeps the order it had.
+                    queue.sort(key=lambda pair: pair[1].name != urgent)
+                marketplace_config, item_config = queue.pop(0)
                 if is_paused() or control.cancel_requested():
                     return False
                 # A platform that has just refused us is not one to open a
@@ -2056,18 +2261,29 @@ class MarketplaceMonitor:
                 # search that is running, and the promise is the *next* search,
                 # not the next pass.
                 first = control.take_next_search()
-            pending = self._interleave(
-                [
-                    job
-                    for job in schedule.get_jobs()
-                    if self._job_key(job) not in done
-                    and (wanted is None or getattr(job, "amm_pair", ("", "")) in wanted)
-                    and (marketplaces is None or self._marketplace_of(job) in marketplaces)
-                    and (not due_only or job.should_run)
-                ],
-                served,
-                first,
-            )
+            candidates = [
+                job
+                for job in schedule.get_jobs()
+                if self._job_key(job) not in done
+                and (wanted is None or getattr(job, "amm_pair", ("", "")) in wanted)
+                and (marketplaces is None or self._marketplace_of(job) in marketplaces)
+                and (not due_only or job.should_run)
+            ]
+            if first is None and not whole_pass:
+                # A narrowed pass does not honour an ordinary promotion -- the
+                # promoted product may not be in its queue at all -- but
+                # "ejecutar ahora" is a different promise, and refusing it here
+                # would make the button mean "at the end of the pass" for the
+                # half of a parallel pass that runs on this thread.  Only when
+                # this queue really holds it, and claimed as it is honoured.
+                urgent = control.next_search_now()
+                if (
+                    urgent is not None
+                    and any(getattr(job, "amm_pair", ("", ""))[0] == urgent for job in candidates)
+                    and control.take_next_search_if(urgent)
+                ):
+                    first = urgent
+            pending = self._interleave(candidates, served, first)
             if not pending:
                 # The pass is over, so the stops that belonged to it are spent.
                 # Keeping them would silently skip the same searches next time
@@ -2436,6 +2652,12 @@ class MarketplaceMonitor:
 
         self._plan_next_review()
         self._log_review(report)
+        # A re-check is where a price actually moves, so this is the other
+        # moment a search's cheapest listing can change -- and the only one that
+        # catches a seller dropping their price between two searches.
+        self._announce_price_drops(report)
+        self._announce_top_listings_after_review()
+        self._announce_low_stock()
         return True
 
     # ------------------------------------------------------------------ #
@@ -2508,6 +2730,9 @@ class MarketplaceMonitor:
                     self.logger.debug(f"A review round failed: {error}", exc_info=True)
             self._plan_next_review()
             self._log_review(report, lane=control.UPDATES_LANE)
+            self._announce_price_drops(report)
+            self._announce_top_listings_after_review()
+            self._announce_low_stock()
         return True
 
     def _review_lane_marketplace(
@@ -2664,6 +2889,7 @@ class MarketplaceMonitor:
         # Always a translator, never None: `configure` leaves the existing one
         # in place when handed None, which would carry the previous search's
         # language into this one.
+        self._prepare_tracked(marketplace)
         marketplace.configure(
             marketplace_config, translator=self._select_translator(language) or Translator()
         )
@@ -2872,12 +3098,526 @@ class MarketplaceMonitor:
                     label=label,
                     immediate=False,
                 )
+        # After the batch, and after a stopped search too: the cheapest listing
+        # of a search is a fact about everything stored for it, not only about
+        # what this pass turned up, so a search that ended early can still have
+        # produced a new floor -- and a listing found before the stop that
+        # happens to be the cheapest one is exactly the message worth having.
+        self._announce_top_listing(users_to_notify, item_config, language=language)
         if interrupted is not None:
             # Now that what was found has been handed over.  The caller decides
             # what a stop means -- next search, closed browser, paused monitor --
             # and none of that changes here.
             raise interrupted
         time.sleep(5)
+
+    def _top_scopes(self: "MarketplaceMonitor") -> Dict[str, str]:
+        """Which names share a cheapest-of, for the trackers a user grouped.
+
+        A search competes with itself and nothing else -- its own listings are
+        the whole market it knows about -- so it is absent here and
+        :mod:`~ai_marketplace_monitor.toplist` treats an absent name as its own
+        scope.  A tracker is the case that needed a second answer: one watched
+        page has no cheapest, it just has a price, and "the cheapest of the five
+        shops I am watching" is the fact the group was created to produce.
+        """
+        scopes: Dict[str, str] = {}
+        if self.config is None:
+            return scopes
+        for (marketplace_name, item_name), item_config in self.config.items.items():
+            if marketplace_name != TRACKED_PLATFORM:
+                continue
+            group = getattr(item_config, "group", None)
+            if group:
+                scopes[item_name] = str(group)
+        return scopes
+
+    def _announce_top_listing(
+        self: "MarketplaceMonitor",
+        users: List[str],
+        item_config: TItemConfig,
+        language: str | None = None,
+    ) -> None:
+        """Say so when one search's cheapest valid listing gets cheaper.
+
+        The search flow's entry point: it already knows who to tell and in what
+        language, having just worked both out for the batch notification.
+        """
+        if not self._notify_reasons().top_listing:
+            return
+        scope = self._top_scopes().get(item_config.name, item_config.name)
+        top = self._new_top_for(item_config.name, scope)
+        if top is not None:
+            self._send_top(top, item_config, users, language, scope=scope)
+
+    def _announce_top_listings_after_review(self: "MarketplaceMonitor") -> None:
+        """The same question, asked for every search, after a round of re-checks.
+
+        This is the half of the feature the search flow cannot cover.  A
+        re-check is where a price actually *moves*: the search only ever adds
+        listings, and a seller who drops their price by 40.000 changes the
+        cheapest offer of a search that may not run again for hours.
+
+        One pass over the store for every search rather than one pass each --
+        see :func:`~ai_marketplace_monitor.toplist.current_tops`.  Who to tell
+        is resolved per search here, because unlike the search flow there is no
+        marketplace in hand: a top-1 can belong to any platform the search runs
+        on.
+        """
+        if self.config is None or not self._notify_reasons().top_listing:
+            return
+        names = list(self.config.item.keys())
+        if not names:
+            return
+        scopes = self._top_scopes()
+        try:
+            tops = new_tops(names, scope_of=scopes)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            if self.logger:
+                self.logger.debug("Could not work out the cheapest listings", exc_info=True)
+            return
+        for scope, top in tops.items():
+            item_config = self.config.item.get(scope)
+            if item_config is None:
+                # A group of trackers: the scope is the group's name and no
+                # section is called that.  The winning listing names the tracker
+                # it belongs to, and that tracker's settings -- who to notify, in
+                # what language -- are the ones that apply, because the message
+                # is about its page.
+                owner = str((top.snapshot or {}).get("name") or "")
+                item_config = self.config.item.get(owner)
+            if item_config is None:
+                continue
+            self._send_top(top, item_config, users=None, language=None, scope=scope)
+
+    def _prepare_tracked(self: "MarketplaceMonitor", marketplace: Any) -> None:
+        """Give the tracked platform an AI to fall back on, when one exists.
+
+        Not passed through the config like a filter, because it is not a
+        setting: it is the same AI service the searches already use, borrowed
+        for the one job the parsers cannot always do.  A monitor with no AI
+        configured simply gets ``None`` and the five other strategies.
+        """
+        if self.config is None or getattr(marketplace, "name", "") != TRACKED_PLATFORM:
+            return
+        try:
+            marketplace.ai_reader = tracking_reader_for(self.config)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            marketplace.ai_reader = None
+
+    # ------------------------------------------------------------------ #
+    # Reading a tracker for the first time
+    # ------------------------------------------------------------------ #
+    #
+    # The one moment a tracker needs a browser of its own.  Everything after it
+    # is the review's work, on the review's browser, exactly as for a listing a
+    # search found -- which is the whole idea of a tracker: a stored listing
+    # with no search behind it.
+
+    def _trackers_to_ingest(self: "MarketplaceMonitor") -> List[Tuple[Any, Any]]:
+        """The trackers whose page has never been read.
+
+        Asked before a browser is opened rather than after, because "already in
+        the store" is the answer for every tracker but the one just added, and
+        opening a window to find that out is the cost this avoids.
+        """
+        if self.config is None:
+            return []
+        marketplace_config = self.config.marketplace.get(TRACKED_PLATFORM)
+        if marketplace_config is None or marketplace_config.enabled is False:
+            return []
+        pending: List[Tuple[Any, Any]] = []
+        for (marketplace_name, _item_name), item_config in self.config.items.items():
+            if marketplace_name != TRACKED_PLATFORM or item_config.enabled is False:
+                continue
+            url = str(getattr(item_config, "url", "") or "")
+            if not url or is_known(TRACKED_PLATFORM, tracked_id(url)):
+                continue
+            pending.append((marketplace_config, item_config))
+        return pending
+
+    def _ingest_trackers(self: "MarketplaceMonitor") -> None:
+        """Read every tracker nobody has read yet, now, on a browser of its own.
+
+        On a thread of its own as well, and that is the requirement rather than
+        an implementation detail: a tracker is added by a person who has just
+        pasted an address and is watching the screen, and the monitor may be
+        forty minutes into a Facebook pass.  Neither may wait for the other, so
+        this borrows the machinery a parallel platform already uses -- a lane:
+        a thread, a Playwright and a browser on its own profile.
+
+        The browser is opened for this and closed after it.  The lane is
+        deliberately *not* kept in :attr:`lanes`, because everything in there is
+        something the monitor may hand more work to later, and this one has
+        exactly one thing to do in its life.
+        """
+        if is_paused():
+            return
+        pending = self._trackers_to_ingest()
+        if not pending:
+            return
+        with self._ingest_lock:
+            if self._ingesting:
+                return
+            self._ingesting = True
+        threading.Thread(
+            target=self._ingest_pass,
+            args=(pending,),
+            name="amm-track-ingest",
+            daemon=True,
+        ).start()
+
+    def _ingest_pass(self: "MarketplaceMonitor", pending: List[Tuple[Any, Any]]) -> None:
+        """Open a browser, read the new trackers, close it again."""
+        lane = BrowserLane(
+            control.TRACKED_LANE, launch=self._launch_context, logger=self.logger
+        )
+        try:
+            if self.logger:
+                names = ", ".join(item_config.name for _marketplace, item_config in pending)
+                self.logger.info(
+                    f"""{hilight("[Track]", "info")} Reading {hilight(names)} for the """
+                    """first time.""",
+                    extra=aimm_event(
+                        "tracker_ingest",
+                        items=[item_config.name for _marketplace, item_config in pending],
+                    ),
+                )
+            lane.run(lambda context: self._read_trackers(lane, context, pending))
+        except KeyboardInterrupt:
+            raise
+        except Exception as error:
+            # A browser that will not open is the usual one.  Nothing is lost:
+            # the tracker is still unknown to the store, so the next time this
+            # is asked -- the next configuration change, or the next turn round
+            # the loop -- it is offered again.
+            if self.logger:
+                self.logger.warning(
+                    f"""{hilight("[Track]", "fail")} Could not read the new trackers """
+                    f"""({error}). They will be read on the next attempt.""",
+                    extra=aimm_event("tracker_ingest_failed", error=str(error)),
+                )
+        finally:
+            try:
+                lane.close()
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                if self.logger:
+                    self.logger.debug("Could not close the tracker lane", exc_info=True)
+            self._ingesting = False
+
+    def _read_trackers(
+        self: "MarketplaceMonitor",
+        lane: BrowserLane,
+        context: BrowserContext,
+        pending: List[Tuple[Any, Any]],
+    ) -> bool:
+        """Read each new tracker once, on the lane's thread and browser."""
+        for marketplace_config, item_config in pending:
+            if is_paused() or control.cancel_requested():
+                return False
+            url = str(getattr(item_config, "url", "") or "")
+            if not url or is_known(TRACKED_PLATFORM, tracked_id(url)):
+                # Read while this was waiting for its browser to open, by an
+                # attempt that was slower than it looked.
+                continue
+            try:
+                marketplace = self._lane_marketplace(lane, context, marketplace_config)
+                with control.running(
+                    item=item_config.name,
+                    marketplace=marketplace_config.name,
+                    lane=control.TRACKED_LANE,
+                ):
+                    self.search_item(marketplace_config, marketplace, item_config)
+            except CancelledScrape:
+                return False
+            except (SearchStopped, SearchSuperseded):
+                continue
+            except KeyboardInterrupt:
+                raise
+            except Exception as error:
+                if self.logger:
+                    self.logger.error(
+                        f"""{hilight("[Track]", "fail")} Could not read """
+                        f"""{hilight(item_config.name)}: {error}""",
+                        extra=aimm_event(
+                            "tracker_ingest_failed",
+                            item=item_config.name,
+                            error=str(error),
+                        ),
+                    )
+                continue
+        return True
+
+    def _announce_price_drops(
+        self: "MarketplaceMonitor", report: RefreshReport | None
+    ) -> None:
+        """Tell the user when a stored listing is cheaper than what they were told.
+
+        The third thing a round of re-checks can turn up, beside a new cheapest
+        listing and a tracker running out -- and the one that had nowhere to go.
+        The code that writes a "bajó de precio" message has always existed
+        (:attr:`~ai_marketplace_monitor.notification.NotificationStatus.LISTING_DISCOUNTED`),
+        but its only door was the search, and a search never hands over a
+        listing it already knows
+        (:func:`~ai_marketplace_monitor.observations.is_known`).  So the price
+        moved, the store recorded it, the log said so, and the user was told
+        nothing -- with ``notify_price_drop`` switched on the whole time.
+
+        Whether it is cheaper is asked **per user**, and that is the point
+        rather than a detail: the fall the refresher saw is against the stored
+        snapshot, and what makes a message worth sending is the fall against
+        *the price this user was last told*.  Two users with different
+        ``remind`` intervals honestly have different answers, and a user who was
+        never told about the listing at all gets nothing -- announcing it now as
+        a bargain would mean a message about a listing they have never heard of,
+        and, on the first round after this existed, one about every such listing
+        in the store.
+        """
+        if self.config is None or report is None or not report.drops:
+            return
+        if not self._notify_reasons().price_drop:
+            return
+        for drop in report.drops:
+            listing = drop.listing
+            item_config = self._item_config_for(listing.marketplace, drop.item_name)
+            if item_config is None or item_config.enabled is False:
+                # Deleted, renamed, or switched off.  The listing is still
+                # re-checked -- it is still in the dashboard -- but a message
+                # about a product the user removed or paused is noise, and a
+                # deleted search has no `notify` list to read anyway.
+                continue
+            marketplace_config = self.config.marketplace.get(listing.marketplace)
+            users = (
+                item_config.notify
+                or (getattr(marketplace_config, "notify", None) if marketplace_config else None)
+                or list(self.config.user.keys())
+            )
+            told = [
+                user
+                for user in users
+                if user in self.config.user
+                and User(self.config.user[user], self.logger).notification_status(listing)
+                is NotificationStatus.LISTING_DISCOUNTED
+            ]
+            if not told:
+                continue
+            record = get_observation(listing.marketplace, listing.id)
+            rating = _stored_rating(
+                record.get("rating") if isinstance(record, dict) else None
+            )
+            if self.logger:
+                self.logger.info(
+                    f"""{hilight("[Notify]", "succ")} {hilight(listing.title)} is cheaper: """
+                    f"""{drop.previous} to {hilight(listing.price)}.""",
+                    extra=aimm_event(
+                        "price_drop",
+                        item=item_config.name,
+                        listing_id=listing.id,
+                        marketplace=listing.marketplace,
+                        title=listing.title,
+                        price_from=drop.previous,
+                        price_to=listing.price,
+                        url=listing.post_url,
+                    ),
+                )
+            # No `forced_status`: the reason is worked out from this user's own
+            # cache entry, exactly as it is for a listing a search found, and
+            # the filter above has already established what that answer is.
+            self._notify(
+                told,
+                [listing],
+                [rating],
+                item_config,
+                language=getattr(item_config, "language", None)
+                or getattr(marketplace_config, "language", None),
+                label=(
+                    TRACKED_LABEL
+                    if listing.marketplace == TRACKED_PLATFORM
+                    else MARKETPLACE_LABELS.get(
+                        listing.marketplace.lower(), listing.marketplace
+                    )
+                ),
+                # A round of re-checks has no "end of the search" to save it up
+                # for: this *is* the end of the only thing it was doing.
+                immediate=True,
+            )
+
+    def _announce_low_stock(self: "MarketplaceMonitor") -> None:
+        """Tell the user when a tracked product is running out.
+
+        Asked after a round of re-checks, which is the only place a stock number
+        moves: a tracker is read once when it is created and by the review from
+        then on.
+
+        Silent for everything that is not a tracker, and for every tracker whose
+        page publishes no stock -- which is most pages.  A number that is not
+        there is not zero, and firing on it would mean an alert about every
+        product on every site that does not count.
+        """
+        if self.config is None:
+            return
+        for (marketplace_name, item_name), item_config in self.config.items.items():
+            if marketplace_name != TRACKED_PLATFORM:
+                continue
+            minimum = getattr(item_config, "min_stock", None)
+            if minimum is None or getattr(item_config, "enabled", None) is False:
+                continue
+            record = get_observation(TRACKED_PLATFORM, tracked_id(str(item_config.url or "")))
+            if not isinstance(record, dict) or record.get("deleted"):
+                continue
+            snapshot = record.get("listing")
+            if not isinstance(snapshot, dict):
+                continue
+            try:
+                listing = Listing(**snapshot)
+            except (TypeError, ValueError):
+                continue
+            if not stock_alert(item_name, listing, minimum):
+                continue
+
+            users = item_config.notify or list(self.config.user.keys())
+            if not users:
+                continue
+            if self.logger:
+                self.logger.info(
+                    f"""{hilight("[Track]", "info")} {hilight(listing.title)} is down to """
+                    f"""{hilight(listing.stock)} in stock.""",
+                    extra=aimm_event(
+                        "low_stock",
+                        item=item_name,
+                        listing_id=listing.id,
+                        title=listing.title,
+                        stock=listing.stock,
+                        min_stock=minimum,
+                        url=listing.post_url,
+                    ),
+                )
+            self._notify(
+                users,
+                [listing],
+                [_stored_rating(record.get("rating"))],
+                item_config,
+                language=getattr(item_config, "language", None),
+                label=TRACKED_LABEL,
+                immediate=True,
+                forced_status=NotificationStatus.LOW_STOCK,
+            )
+
+    def _new_top_for(
+        self: "MarketplaceMonitor", item_name: str, scope: str | None = None
+    ) -> Any:
+        """The cheapest listing of one search when it is worth announcing.
+
+        Wrapped rather than called directly so that a store that cannot be read
+        -- a cache mid-eviction, a record written by a version that stored
+        something else -- costs one silent round rather than the search it was
+        called from.
+
+        ``scope`` is the name it competes under, which differs from its own only
+        for a tracker in a group.  The whole group is asked, not just this one
+        name: the cheapest of five watched pages does not change because the
+        sixth was read, and asking about one of them would announce it as the
+        cheapest whatever the other four cost.
+        """
+        scope = scope or item_name
+        try:
+            if scope == item_name:
+                return new_top(item_name)
+            members = [
+                name for name, owner in self._top_scopes().items() if owner == scope
+            ]
+            return new_tops(members, scope_of=self._top_scopes()).get(scope)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            if self.logger:
+                self.logger.debug(
+                    f"Could not work out the cheapest listing for {item_name!r}", exc_info=True
+                )
+            return None
+
+    def _send_top(
+        self: "MarketplaceMonitor",
+        top: Any,
+        item_config: TItemConfig,
+        users: List[str] | None,
+        language: str | None,
+        scope: str | None = None,
+    ) -> None:
+        """Hand one top-1 to the notification path, then remember it.
+
+        The record is written only after the send has been queued.  A top-1 that
+        could not be handed over is one that gets announced next round rather
+        than one that is silently marked as told.
+
+        ``scope`` is what the record is filed under and what the message names:
+        the search, or the group of trackers this one belongs to.  The listing
+        handed over is still the individual page that won -- a group decides who
+        competes, never what is sent -- so the card, the link and the ``{item}``
+        of a user's own template all still name the tracker.
+        """
+        listing = top.as_listing()
+        if listing is None or self.config is None:
+            return
+        scope = scope or item_config.name
+
+        if users is None:
+            # The review flow has no marketplace in hand -- a top-1 can come
+            # from any platform the search runs on -- so the platform's own
+            # `notify` list is taken from whichever platform this listing is on.
+            marketplace_config = self.config.marketplace.get(listing.marketplace)
+            users = (
+                item_config.notify
+                or (getattr(marketplace_config, "notify", None) if marketplace_config else None)
+                or list(self.config.user.keys())
+            )
+            language = getattr(item_config, "language", None) or getattr(
+                marketplace_config, "language", None
+            )
+        if not users:
+            return
+
+        if self.logger:
+            self.logger.info(
+                f"""{hilight("[Notify]", "succ")} New cheapest listing for """
+                f"""{hilight(scope)}: {hilight(top.price)}.""",
+                extra=aimm_event(
+                    "top_listing",
+                    item=scope,
+                    tracker=item_config.name if scope != item_config.name else None,
+                    listing_id=listing.id,
+                    marketplace=listing.marketplace,
+                    title=listing.title,
+                    price=top.price,
+                    url=listing.post_url,
+                ),
+            )
+        self._notify(
+            users,
+            [listing],
+            [_stored_rating(top.rating)],
+            item_config,
+            language=language,
+            label=_marketplace_label(listing.marketplace),
+            immediate=True,
+            forced_status=NotificationStatus.TOP_LISTING,
+        )
+        remember_top(scope, top)
+
+    def _notify_reasons(self: "MarketplaceMonitor") -> NotifyReasons:
+        """Which of "new", "cheaper" and "top 1" the user asked to hear about.
+
+        Read on every send rather than cached on the monitor: the settings are
+        editable while the scraper runs, and a value read once at startup would
+        mean a checkbox that only takes effect after a restart.
+        """
+        return reasons_from_config(None if self.config is None else self.config.monitor)
 
     def _notifies_immediately(self: "MarketplaceMonitor") -> bool:
         """Whether a listing is told about the moment it passes."""
@@ -2901,6 +3641,7 @@ class MarketplaceMonitor:
         language: str | None,
         label: str | None,
         immediate: bool,
+        forced_status: NotificationStatus | None = None,
     ) -> None:
         """Hand a notification to the sender, and do not wait for it.
 
@@ -2918,6 +3659,7 @@ class MarketplaceMonitor:
         """
         assert self.config is not None
         words = self._description_words()
+        reasons = self._notify_reasons()
         configs = [self.config.user[user] for user in users if user in self.config.user]
         if not configs:
             return
@@ -2931,6 +3673,8 @@ class MarketplaceMonitor:
                     language=language,
                     marketplace_label=label,
                     description_words=words,
+                    reasons=reasons,
+                    forced_status=forced_status,
                 )
 
         if not self.notifier.submit(send):
@@ -3103,7 +3847,7 @@ class MarketplaceMonitor:
         for marketplace_config in self.config.marketplace.values():
             if marketplace_config.enabled is False:
                 continue
-            marketplace_class = supported_marketplaces[
+            marketplace_class = all_marketplaces[
                 (marketplace_config.market_type or "facebook").lower()
             ]
             if marketplace_config.name in self.active_marketplaces:
@@ -3115,10 +3859,22 @@ class MarketplaceMonitor:
                 self.active_marketplaces[marketplace_config.name] = marketplace
 
             # Configure might have been changed
+            self._prepare_tracked(marketplace)
             marketplace.configure(
                 marketplace_config,
                 translator=self._select_translator(marketplace_config.language),
             )
+
+            # A tracker is not a search and gets no schedule entry.  It is
+            # one address, read once when it is added and by the review from
+            # then on -- so a repeating job for it could only ever open a
+            # browser, find the listing already known and close it again.  That
+            # is exactly what it did: an empty window every half hour, and a
+            # "búsqueda" in the interface that could not, by design, ever find
+            # anything.  The marketplace object above is still built and
+            # configured, because the review drives it.
+            if marketplace_config.name == TRACKED_PLATFORM:
+                continue
 
             # One item can run on several marketplaces; each pair has its own
             # configuration, because the platforms take different options.
@@ -3414,19 +4170,51 @@ class MarketplaceMonitor:
                 # searches at all: wait for the file to change, quietly.
                 control.set_phase(
                     "waiting_for_config",
-                    "Searches are configured but none of them can run.",
+                    "Nothing to search; stored listings are still reviewed.",
                 )
                 if self.logger:
                     self.logger.warning(
                         f"""{hilight("[Schedule]", "fail")} No search is scheduled: every """
-                        """configured search, or its platform, is switched off."""
+                        """configured search is switched off, or everything configured is """
+                        """a tracker, which is not a search."""
                     )
-                self.handle_pause()
-                if (
-                    doze(3600, self.config_files, self.keyboard_monitor, stop_when=is_paused)
-                    == SleepStatus.BY_KEYBOARD
-                ):
-                    self.keyboard_monitor.set_paused(True)
+                # Nothing to *search* is not nothing to do, and since trackers
+                # stopped being scheduled as searches this is the normal state
+                # of a monitor that only follows pages rather than an odd one:
+                # a tracker's first read and every re-read after it both happen
+                # here.  Sleeping an hour through it -- which is what this did,
+                # when the only way to be here was to switch every search off --
+                # would be a monitor that never looks at the one thing it was
+                # asked to watch.
+                #
+                # A loop of its own rather than going back round the outer one,
+                # because the outer one begins by reloading the configuration
+                # and rebuilding the schedule, and doing that once a minute to
+                # discover the same emptiness again is exactly the wake-up-a-
+                # minute this branch was written to avoid.
+                while not schedule.get_jobs():
+                    self.handle_pause()
+                    self._ingest_trackers()
+                    self._apply_pending_sessions()
+                    # Re-asked every round: the lane is not started until there
+                    # is something to re-check, and with a tracker just added
+                    # the thing to re-check appears *here*, seconds after the
+                    # ingest above stores it.
+                    self._start_review_lane()
+                    if not self._refresh_slice():
+                        break
+                    status = doze(
+                        60,
+                        self.config_files,
+                        self.keyboard_monitor,
+                        stop_when=lambda: is_paused() or control.run_pending(),
+                    )
+                    if status == SleepStatus.BY_KEYBOARD:
+                        self.keyboard_monitor.set_paused(True)
+                    if status in (SleepStatus.BY_KEYBOARD, SleepStatus.BY_FILE_CHANGE):
+                        break
+                    if is_paused() or control.run_pending():
+                        break
                 continue
             # Run what is actually ready, then let each search keep to its own
             # schedule.  Deliberately not "everything, now": starting the
@@ -3499,6 +4287,11 @@ class MarketplaceMonitor:
                 # short slice, then back to sleep -- so a pause or a forced run
                 # is still noticed within seconds.
                 self._apply_pending_sessions()
+                # A tracker whose first read never happened -- its browser
+                # would not open, or the monitor was paused when it was added.
+                # A no-op once every tracker is in the store, which is after
+                # one read each, for ever.
+                self._ingest_trackers()
                 # Asked again here, not only at the top of the outer loop: the
                 # review lane is not started until there is something to
                 # re-check, and what makes something worth re-checking is a
@@ -3523,8 +4316,13 @@ class MarketplaceMonitor:
                     # Cut the sleep short when the switch is thrown, so the
                     # "paused" line reaches the web UI's log while the user is
                     # still looking at the button they just pressed -- and when
-                    # a search is asked for, so the button acts at once.
-                    stop_when=lambda: is_paused() or control.run_pending(),
+                    # a search is asked for, so the button acts at once.  A
+                    # search asked for *now* counts: without it "ejecutar ahora"
+                    # on an idle monitor would be honoured at the end of a sleep
+                    # that can be an hour long, which is not what it says.
+                    stop_when=lambda: is_paused()
+                    or control.run_pending()
+                    or control.next_search_now() is not None,
                 )
                 # An explicit "search now" from the web UI.  Older versions had
                 # to touch the config file to wake the monitor; this is the same
@@ -3547,7 +4345,14 @@ class MarketplaceMonitor:
                 # a targeted one and targeted passes deliberately do not claim.
                 # Peeking would leave the choice standing and promote the same
                 # product on every turn round this loop, forever.
-                chosen = control.take_next_search()
+                #
+                # Not while paused, though: the sleep above also ends on the
+                # switch, and claiming here would spend the promise on a pass
+                # that is about to be turned back at the top of the loop -- the
+                # user's chosen search silently dropped by a pause, which is not
+                # something a pause is supposed to do.  It waits, and is claimed
+                # on the way out of the pause.
+                chosen = None if is_paused() else control.take_next_search()
                 if chosen is not None:
                     pairs = {pair for pair in self._scheduled_pairs() if pair[0] == chosen}
                     if pairs:
@@ -3626,10 +4431,11 @@ class MarketplaceMonitor:
             if marketplace_config.enabled is False:
                 continue
             attempted += 1
-            marketplace_class = supported_marketplaces[
+            marketplace_class = all_marketplaces[
                 (marketplace_config.market_type or "facebook").lower()
             ]
             marketplace = marketplace_class(marketplace_config.name, self.context, None, self.logger)
+            self._prepare_tracked(marketplace)
             marketplace.configure(
                 marketplace_config,
                 translator=self._select_translator(marketplace_config.language),
@@ -3744,7 +4550,7 @@ class MarketplaceMonitor:
             for marketplace_config in self.config.marketplace.values():
                 if marketplace_config.enabled is False:
                     continue
-                marketplace_class = supported_marketplaces[
+                marketplace_class = all_marketplaces[
                 (marketplace_config.market_type or "facebook").lower()
             ]
                 if marketplace_config.name in self.active_marketplaces:
@@ -3760,6 +4566,7 @@ class MarketplaceMonitor:
                     continue
 
                 # Configure might have been changed
+                self._prepare_tracked(marketplace)
                 marketplace.configure(
                     marketplace_config,
                     translator=self._select_translator(marketplace_config.language),
