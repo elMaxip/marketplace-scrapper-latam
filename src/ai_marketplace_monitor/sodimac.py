@@ -39,12 +39,26 @@ browser, and the id is enough.
   further down in ``variants[0]``.  Unchanged, and shared by both routes -- the
   redirect lands on the same ``/articulo/...`` page either way.
 
-**Pagination exists on one route only.**  ``?currentpage=2`` really does serve
-the next 28 entries on ``/search``; on ``/lista`` it is accepted and ignored,
-and the payload comes back ``currentPage: 1`` every time.  Both were verified.
-So the parameter is sent and the duplicate-URL guard in
-:mod:`ai_marketplace_monitor.retailer` absorbs the route that ignores it.
-``pagination.count`` is the honest total and is logged.
+**Both routes page, and they do not page the same way.**  This file read that
+as "pagination exists on one route only" for a while, and it cost the category
+route eleven pages out of twelve -- 558 taladros seen as 48, quietly, because
+the duplicate-URL guard in :mod:`ai_marketplace_monitor.retailer` called the
+repeated page "the catalogue ended".  All of the below was verified live:
+
+* ``/search`` takes ``?currentpage=2`` and serves the next 28 entries.
+* ``/lista`` ignores ``currentpage`` and takes ``?page=2``, which serves 48
+  fresh entries and echoes ``currentPage``.
+
+And the trap under both: **the redirect keeps none of the query string.**
+``/search?Ntt=taladro&page=2`` lands on ``/lista/cat14080023/Taladros`` with no
+parameters at all, so nothing appended to a ``?Ntt=`` address can ever reach
+the category route -- whichever name it is given.  Page two has to be built
+from the address the results actually came back from, which the payload
+publishes as ``pageProps.canonicalUrl``.  See :func:`category_url` and
+:meth:`SodimacMarketplace.next_page_url`.
+
+``pagination.count`` is the honest total and ``pagination.perPage`` is what
+turns it into a page count -- see :meth:`SodimacMarketplace.total_pages`.
 
 The prices are a list of labelled entries rather than two fields.  The one that
 counts is the entry with ``crossed: false``; the crossed one is the "before"
@@ -59,6 +73,7 @@ is how many the shop will actually let into a cart.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil
 from typing import Any, Dict, List, Tuple, Type
 from urllib.parse import quote, urlparse
 
@@ -232,6 +247,66 @@ def _product_url(entry: Dict[str, Any]) -> str:
     return f"{HOST}/{SITE}/product/{product_id}/p/{sku_id}/"
 
 
+def _pagination(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The pagination block, from whichever of the two routes served the page.
+
+    The same "ask both, a page has one or the other" as :func:`_results_of`,
+    kept in one place so the next thing that needs a number out of it does not
+    become a third copy of the route dance.
+    """
+    found = dig(payload, "props", "pageProps", "pagination")
+    if isinstance(found, dict):
+        return found
+    found = dig(
+        payload, "props", "pageProps", "searchProps", "searchData", "pagination"
+    )
+    return found if isinstance(found, dict) else {}
+
+
+def _positive_int(value: Any) -> int | None:
+    """``value`` when it is a usable count, else None.  ``bool`` is not one."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def category_url(payload: Dict[str, Any]) -> str:
+    """The ``/lista`` address a category page came back from, or ``""``.
+
+    Read from the payload rather than from the browser so that everything
+    deciding a URL here stays a pure function of what the shop sent, testable
+    against a captured page.
+
+    Empty for the ``/search`` route, which publishes no ``canonicalUrl`` and
+    does not need one: that route keeps the parameters it was asked with.  The
+    ``/lista/`` check is what tells the two apart, and it is deliberately a test
+    of the address rather than of which results key was populated -- a payload
+    that starts publishing a canonical ``/search`` address must not have it
+    appended with ``?page``, which that route ignores.
+    """
+    text = text_of(dig(payload, "props", "pageProps", "canonicalUrl")).split("?")[0]
+    if not text or "/lista/" not in text:
+        return ""
+    if text.startswith("http"):
+        return text
+    return f"{HOST}/{text.lstrip('/')}"
+
+
+def page_count(payload: Dict[str, Any]) -> int | None:
+    """How many results pages there are, when the shop published both numbers.
+
+    None when either is missing, which keeps the honest stops in charge rather
+    than guessing a divisor -- the mistake this used to avoid by never
+    answering at all.
+    """
+    pagination = _pagination(payload)
+    count = _positive_int(pagination.get("count"))
+    per_page = _positive_int(pagination.get("perPage"))
+    if count is None or per_page is None:
+        return None
+    return ceil(count / per_page)
+
+
 def _results_of(payload: Dict[str, Any]) -> List[Any]:
     """The catalogue entries, from whichever of the two routes served the page.
 
@@ -289,12 +364,8 @@ def total_found(payload: Dict[str, Any]) -> int:
     visible: a phrase matching 546 products looks, from the results alone, like
     a phrase matching 56.
     """
-    count = dig(payload, "props", "pageProps", "pagination", "count")
-    if not isinstance(count, int):
-        count = dig(
-            payload, "props", "pageProps", "searchProps", "searchData", "pagination", "count"
-        )
-    return count if isinstance(count, int) else 0
+    count = _pagination(payload).get("count")
+    return count if isinstance(count, int) and not isinstance(count, bool) else 0
 
 
 def _variant(product: Dict[str, Any]) -> Dict[str, Any]:
@@ -422,6 +493,14 @@ class SodimacMarketplace(RetailerMarketplace):
     #: Cloudflare clearance rather than a login -- so "signed out" would be an
     #: alarm about a state that is entirely normal.
     session_cookies = ()
+    #: Cloudflare's, in its own spelling.  ``__cf_bm`` is the bot-management
+    #: cookie this jar actually carries; ``cf_clearance`` is the one a solved
+    #: challenge leaves and is listed for the same reason.
+    #:
+    #: Sodimac is not refusing us today -- these are here so the shop that has
+    #: no problem is cleaned by the same rule as the shop that does, rather than
+    #: growing its own special case the first time it is.
+    challenge_cookies = ("__cf_bm", "cf_clearance")
 
     @classmethod
     def get_config(cls: Type["SodimacMarketplace"], **kwargs: Any) -> SodimacMarketplaceConfig:
@@ -447,17 +526,35 @@ class SodimacMarketplace(RetailerMarketplace):
     def search_url(
         self: "SodimacMarketplace", phrase: str, item_config: ItemConfig, page: int = 1
     ) -> str:
-        """Where the results for one phrase are.
+        """Where a phrase's results start, and where its later pages are on
+        the route that stays put.
 
-        ``currentpage`` is sent because on the ``/search`` route it works -- 28
-        more entries a page -- and left harmless on the ``/lista`` route, which
-        accepts it and answers ``currentPage: 1`` anyway.  The duplicate-URL
-        guard in :class:`~ai_marketplace_monitor.retailer.RetailerMarketplace`
-        absorbs that, so the cost of the route that ignores it is one page load
-        and no wrong results.  See the module docstring.
+        ``currentpage`` is the ``/search`` route's parameter and works there.
+        On the category route this address is never used past page one: the
+        redirect drops the query string, so :meth:`next_page_url` builds those
+        from where page one landed instead.  See the module docstring.
         """
         url = f"{HOST}/{SITE}/search?Ntt={quote(phrase)}"
         return url if page <= 1 else f"{url}&currentpage={page}"
+
+    def next_page_url(
+        self: "SodimacMarketplace",
+        payload: Dict[str, Any],
+        phrase: str,
+        item_config: ItemConfig,
+        page: int,
+    ) -> str:
+        """Page two onwards, built from where the page before it came back.
+
+        The category route is the whole reason this exists: it answers to
+        ``?page`` and never sees anything appended to the ``?Ntt=`` address,
+        because the redirect that took us there dropped the query string.  The
+        search route keeps its own parameters, so it falls through.
+        """
+        landed = category_url(payload)
+        if landed:
+            return f"{landed}?page={page}"
+        return self.search_url(phrase, item_config, page=page)
 
     def parse_search(
         self: "SodimacMarketplace", payload: Dict[str, Any], item_name: str
@@ -485,6 +582,24 @@ class SodimacMarketplace(RetailerMarketplace):
         self: "SodimacMarketplace", payload: Dict[str, Any], url: str, item_name: str
     ) -> Listing | None:
         return parse_product(payload, url, item_name)
+
+    def total_pages(self: "SodimacMarketplace", payload: Dict[str, Any]) -> int | None:
+        """How many pages, from the two numbers the shop publishes.
+
+        This returned ``None`` on the grounds that the page size was nowhere
+        stated.  It is stated: ``pagination.perPage``, 48 on the category route
+        and 28 on the search one, and the arithmetic closes exactly -- a
+        category of 558 taladros at 48 gives 12 pages, and page 12 came back
+        with 30 entries while page 13 came back empty.  Eleven full pages plus
+        30 is 558.  Verified live.
+
+        Its neighbour ``totalPerPage`` (56) is **not** the divisor, and that is
+        the trap worth naming: it counts the sponsored cards padding each page,
+        which repeat across pages and are collapsed by the duplicate guard
+        anyway.  Dividing 558 by 56 gives 10, and a search that believed it
+        would stop with two pages unread.
+        """
+        return page_count(payload)
 
     def product_status(
         self: "SodimacMarketplace", payload: Dict[str, Any]

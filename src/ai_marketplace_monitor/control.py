@@ -538,6 +538,24 @@ def clear_marketplace_block(marketplace: str) -> None:
             entry["until"] = 0.0
 
 
+def clear_marketplace_blocks() -> List[str]:
+    """Drop every cooldown.  Returns the marketplaces that had one.
+
+    For an explicit human "run this now": a cooldown is the monitor's own guess
+    that asking again soon is pointless, and a person at the keyboard asking for
+    a search outranks a guess.  Without this the button reported
+    "Skipping Lider for another 11 minutes" and did nothing -- the one moment a
+    scheduled back-off is exactly the wrong answer.
+
+    Strikes go with the cooldown, so an override does not leave a shop one
+    refusal away from the four-hour ceiling.
+    """
+    with _lock:
+        cleared = sorted(_blocks)
+        _blocks.clear()
+        return cleared
+
+
 def is_running() -> bool:
     """Whether any lane has a scrape job in progress."""
     with _lock:
@@ -1174,6 +1192,9 @@ def request_search_now(item: str, reason: str = "web UI") -> Dict[str, Any]:
     return {
         "next_search": set_next_search(item, reason=reason, now=True),
         "stopped": stopped,
+        # A person asked for this search by name; a back-off the monitor set
+        # itself must not be what answers them.
+        "unblocked": clear_marketplace_blocks(),
     }
 
 

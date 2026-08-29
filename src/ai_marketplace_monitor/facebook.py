@@ -327,6 +327,20 @@ class FacebookItemConfig(ItemConfig, FacebookMarketItemCommonConfig):
 
 
 class FacebookMarketplace(Marketplace):
+    #: Deliberately empty, and here the reason runs the other way.
+    #:
+    #: Facebook's device cookies -- ``datr`` above all -- are exactly the ones
+    #: :func:`~ai_marketplace_monitor.session.save_device_state` goes out of its
+    #: way to *keep* when a login fails, so the site sees one device retrying
+    #: rather than a stream of new ones.  Dropping them would recreate the
+    #: challenge loop that whole function exists to break.
+    #:
+    #: Same mechanism as Lider's, opposite sign, and the difference is the only
+    #: thing worth remembering: a device the site merely *knows* is an asset, and
+    #: one the site has ruled *against* is a liability.  See
+    #: :attr:`Marketplace.challenge_cookies`.
+    challenge_cookies: Tuple[str, ...] = ()
+
     #: Where a sign-in starts.
     #:
     #: Marketplace itself, not ``/login/device-based/regular/login/``.  That

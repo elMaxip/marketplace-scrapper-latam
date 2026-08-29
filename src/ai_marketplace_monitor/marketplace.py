@@ -9,13 +9,14 @@ from playwright.sync_api import BrowserContext, ElementHandle, Locator, Page  # 
 from .control import raise_if_cancelled
 from .listing import Listing
 from .price_patterns import compile_patterns, matches as price_pattern_match, validate_patterns
-from .session import load_session, save_session
+from .session import drop_cookies, load_session, save_session
 from .utils import (
     BaseConfig,
     Currency,
     KeyboardMonitor,
     MonitorConfig,
     Translator,
+    aimm_event,
     hilight,
     interval_in_seconds,
     validated_start_at,
@@ -515,6 +516,99 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
     #: one switch in the interface.
     opt_in: bool = False
 
+    #: Cookie names that are the site's *bot check* talking about this browser.
+    #:
+    #: A third class of cookie, and telling it from the other two is the whole
+    #: point of declaring it:
+    #:
+    #: * a **login** cookie is the site's relationship with the user.  It is what
+    #:   an import is for, it cannot be re-earned by the monitor, and it is never
+    #:   thrown away.
+    #: * a **device** cookie is the site saying "I have seen this browser
+    #:   before".  Usually worth keeping -- see
+    #:   :func:`~ai_marketplace_monitor.session.save_device_state`, which hangs on
+    #:   to Facebook's ``datr`` precisely so a failed login looks like one device
+    #:   retrying rather than a stream of new ones.
+    #: * a **bot-check** cookie is the same idea after the site has ruled
+    #:   *against* that identity.  Then keeping it is the opposite of helpful,
+    #:   and that is the case this list exists for.
+    #:
+    #: Two moments act on it, and neither needs the platform to do anything
+    #: beyond naming the cookies:
+    #:
+    #: * a refusal drops them (:meth:`discard_challenge_state`), so the next
+    #:   browser profile starts with the account and an identity the wall has no
+    #:   history for.  Not on a good page: while they work they are a clearance
+    #:   worth more than any timer.
+    #: * an import drops them, because the ones in an export belong to the
+    #:   browser it came from.
+    #:
+    #: **Empty is an answer, not an omission**, and a platform that has none
+    #: should say so with a comment rather than leaving the default: Mercado
+    #: Libre's wall is its own and hands out no clearance token, so there is
+    #: nothing here to throw away.  A platform behind PerimeterX, Cloudflare,
+    #: DataDome or Kasada almost certainly has one, and it is found by looking at
+    #: the jar rather than by guessing -- see `lider.py` and `sodimac.py`.
+    challenge_cookies: Tuple[str, ...] = ()
+
+    def discard_challenge_state(self: "Marketplace") -> None:
+        """Throw away the device identity the site has just decided against.
+
+        Called from a platform's own "we were refused" path, and a no-op for the
+        platforms that declare no such cookies.
+
+        Both halves matter and they are different stores.  The **file** is what
+        seeds the next profile, so a burned identity left there comes back on
+        every fresh start for ever -- which is exactly what happened: a user who
+        deleted every profile to start clean was walled one second after the
+        browser opened, wearing the id we had just handed it. The **live
+        browser** is what would keep sending it for the rest of this run, so the
+        cooldown would expire and the very next request would arrive flagged.
+        """
+        if not self.challenge_cookies:
+            return
+        label = getattr(self, "label", self.name)
+        try:
+            removed = drop_cookies(self.name, self.challenge_cookies)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            removed = 0
+            if self.logger:
+                self.logger.debug(
+                    f"Could not clear the stored {self.name} challenge cookies", exc_info=True
+                )
+        # Resolved defensively, unlike the places that ask on a served page: this
+        # runs on the refusal path, where the browser may well be the thing that
+        # went wrong.  A page whose process has died raises on `.context`, and a
+        # refusal must not become a crash on the way to reporting itself.
+        context = self.context
+        if context is None and self.page is not None:
+            try:
+                context = self.page.context
+            except Exception:
+                context = None
+        if context is not None:
+            for cookie_name in self.challenge_cookies:
+                try:
+                    context.clear_cookies(name=cookie_name)
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    # An older Playwright without the filter, or a context that
+                    # is going away.  The stored file is the half that decides
+                    # what the next profile starts from.
+                    continue
+        if removed and self.logger:
+            self.logger.info(
+                f"""{hilight("[Login]", "info")} Dropped {removed} {label} bot-check """
+                """cookie(s); the next browser profile starts with the account and a """
+                """clean device id.""",
+                extra=aimm_event(
+                    "challenge_state_dropped", marketplace=self.name, cookies=removed
+                ),
+            )
+
     def __init__(
         self: "Marketplace",
         name: str,
@@ -528,6 +622,46 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
         self.translator = Translator()
         self.logger = logger
         self.page: Page | None = None
+        #: Throw this browser away and come back with a new one on a new profile.
+        #:
+        #: Filled in by whoever built this object, because opening a browser
+        #: needs things a marketplace does not have: the launch options, the
+        #: proxy, and -- for a lane -- that lane's own ``Playwright``.  ``None``
+        #: for a marketplace nobody offered one to, and the callers treat that
+        #: as "recovery is not available here" rather than as an error.
+        #:
+        #: Safe to call inline from a search, and only from there: a Playwright
+        #: object belongs to the thread that made it, and during a search that
+        #: thread is this one.
+        self.renew_browser: Callable[[], BrowserContext] | None = None
+
+    def renew_browser_now(self: "Marketplace") -> bool:
+        """Ask for a fresh browser on a fresh profile.  False if there is none.
+
+        Drops the page and context this object was holding before asking, so a
+        failure cannot leave it driving a browser that has been closed -- the
+        next :meth:`create_page` then builds against whatever comes back.
+        """
+        renew = self.renew_browser
+        if renew is None:
+            return False
+        self.page = None
+        try:
+            context = renew()
+        except KeyboardInterrupt:
+            raise
+        except Exception as error:
+            if self.logger:
+                self.logger.error(
+                    f"""{hilight("[Browser]", "fail")} Could not open a fresh browser for """
+                    f"""{hilight(self.name)}: {error}""",
+                    extra=aimm_event("browser_renew", marketplace=self.name, ok=False),
+                )
+            return False
+        if context is None:
+            return False
+        self.context = context
+        return True
 
     def junk_price(
         self: "Marketplace", item: Listing, item_config: TItemConfig

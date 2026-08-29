@@ -75,10 +75,20 @@ def clean(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[C
 
 
 class FakeLane:
-    """A lane without a browser: it only has to hold marketplace objects."""
+    """A lane without a browser: it only has to hold marketplace objects.
+
+    ``renew_context`` is here because every real lane has one and the
+    marketplaces built on a lane are handed it -- a shop that is refused asks
+    for a fresh browser through exactly this.  A tracker read never gets that
+    far, but leaving it off made building the marketplace raise, and the read
+    was reported as a tracker that could not be read.
+    """
 
     def __init__(self) -> None:
         self.marketplaces: dict = {}
+
+    def renew_context(self) -> None:
+        raise AssertionError("a tracker read should never need a new browser")
 
 
 def build(

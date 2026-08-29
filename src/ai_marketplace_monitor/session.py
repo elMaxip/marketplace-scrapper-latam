@@ -25,7 +25,9 @@ import logging
 import os
 import shutil
 import socket
+import time
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -183,6 +185,38 @@ def profile_lanes() -> List[str]:
         return []
 
 
+def reset_profile(lane: str | None = None, attempts: int = 5) -> bool:
+    """Delete one browser profile, so the next launch is a brand-new install.
+
+    For the recovery after a shop refuses us.  Dropping the challenge cookies
+    (:func:`drop_cookies`) deals with the identity the site handed out; this
+    deals with everything else a profile accumulates -- local storage, the
+    site's own databases, whatever else a bot check writes where cookies are
+    not.  The account survives regardless: the next launch reseeds from
+    ``sessions/``, which is a separate file this never touches.
+
+    Retried rather than attempted once, because on Windows Chromium does not
+    release the directory the instant ``close()`` returns and an immediate
+    ``rmtree`` fails with a sharing violation.  The caller has just closed the
+    browser and is about to open another one, so a second or two of patience
+    here is the difference between a clean profile and a stale one.
+
+    Returns whether the directory is gone.  False is survivable: the launch
+    that follows simply reuses the profile, which is what happened before this
+    existed.
+    """
+    path = profile_path(lane)
+    for attempt in range(attempts):
+        if not path.exists():
+            return True
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            return True
+        # Chromium still has a handle on it.  Back off a little each time.
+        time.sleep(0.2 * (attempt + 1))
+    return not path.exists()
+
+
 def clear_profile() -> bool:
     """Delete every browser profile, so the next run starts from a clean install.
 
@@ -255,8 +289,37 @@ def save_session(marketplace_name: str, context: Any) -> bool:
         return False
 
 
+#: Serialises the read-modify-write of a session file.
+#:
+#: The bookkeeping below is read, changed and written back, and two threads now
+#: do it: the monitor's, applying an import to its own browser, and a lane's,
+#: applying the same import to the lane's.  Without this the two interleave and
+#: one of them writes back a record that never saw the other's note -- which
+#: shows up as a profile that is asked to take the same import for ever.
+_write_lock = threading.RLock()
+
+
 def _write(marketplace_name: str, state: Dict[str, Any]) -> bool:
-    """Atomically write a storage state to this marketplace's session file."""
+    """Atomically write a storage state to this marketplace's session file.
+
+    A state with no ``aimm`` block of its own **inherits the stored one**.  That
+    is not tidiness: :func:`save_site_session` is called by the shops on the
+    first page they are served, and it writes exactly this shape.  Dropping the
+    block there erased the record of what the user had imported and which
+    profiles had taken it, so "importada" turned back into "guardada por el
+    navegador" and no profile could ever be told to take it again.
+    """
+    path = session_path(marketplace_name)
+    with _write_lock:
+        if "aimm" not in state:
+            previous = load_session(marketplace_name) or {}
+            if isinstance(previous.get("aimm"), dict):
+                state = {**state, "aimm": previous["aimm"]}
+        return _write_now(marketplace_name, state)
+
+
+def _write_now(marketplace_name: str, state: Dict[str, Any]) -> bool:
+    """The write itself, with the bookkeeping already decided."""
     path = session_path(marketplace_name)
     try:
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -334,6 +397,16 @@ def save_site_session(
     profile and nowhere else, so a profile thrown away takes it with it and the
     next one starts by being challenged again.
     """
+    if import_is_unapplied(marketplace_name):
+        # The stored file is a paste no browser has loaded yet, and this browser
+        # is one of the ones that has not.  Writing its jar over the paste is how
+        # a signed-in session the user established by hand became a handful of
+        # anonymous shop cookies, with no copy left anywhere.
+        logger.debug(
+            "Not overwriting the pending %r import with this browser's cookies",
+            marketplace_name,
+        )
+        return False
     try:
         state = context.storage_state()
         kept = [
@@ -496,15 +569,30 @@ def parse_cookies(text: str, default_domain: str = "") -> List[Dict[str, Any]]:
 
 
 def import_session(
-    marketplace_name: str, cookies: List[Dict[str, Any]], allowed_domains: Iterable[str]
+    marketplace_name: str,
+    cookies: List[Dict[str, Any]],
+    allowed_domains: Iterable[str],
+    drop_names: Iterable[str] = (),
 ) -> Dict[str, Any]:
     """Store a set of cookies as this marketplace's session.
 
     Cookies for anywhere else are dropped rather than stored: they would be no
     use to this marketplace and every one of them is credential-equivalent for
     whatever site it did come from.
+
+    ``drop_names`` is the shop's bot-check cookies, and they are dropped for a
+    different reason: they do belong to this site, they are simply not *ours*.
+    An export from the user's ordinary Chrome carries that browser's device id,
+    and replaying it in the monitor's browser makes the id and the fingerprint
+    disagree -- a card with somebody else's photograph on it.  The monitor earns
+    its own on the first page it is served.
+
+    Dropped here rather than asked of the user, because the alternative is a
+    person editing a JSON export by hand to remove four names they have no way
+    of recognising, every time they set up a new machine.
     """
     allowed = list(allowed_domains)
+    unwanted = {str(name) for name in drop_names}
     kept = [cookie for cookie in cookies if not allowed or domain_allowed(cookie["domain"], allowed)]
     ignored = len(cookies) - len(kept)
     if not kept:
@@ -512,6 +600,20 @@ def import_session(
             "Ninguna cookie pertenece a este marketplace"
             + (f" (se esperaban dominios como {allowed[0]})." if allowed else ".")
         )
+    if unwanted:
+        wanted = [cookie for cookie in kept if cookie["name"] not in unwanted]
+        dropped = len(kept) - len(wanted)
+        if not wanted:
+            # Distinguished from the message above on purpose: these cookies did
+            # come from the right site, so "no pertenecen a este marketplace"
+            # would send the reader looking for a mistake they did not make.
+            raise ValueError(
+                "Las cookies que pegaste son solo del control antibots del sitio, "
+                "no de tu sesión. Copia el paquete completo con la sesión iniciada."
+            )
+        kept = wanted
+    else:
+        dropped = 0
     written = _write(
         marketplace_name,
         {
@@ -532,59 +634,161 @@ def import_session(
         "ok": written,
         "imported": len(kept),
         "ignored": ignored,
+        "dropped": dropped,
         "domains": sorted({_strip_dot(cookie["domain"]) for cookie in kept}),
     }
 
 
-def import_is_pending(marketplace_name: str) -> bool:
-    """Whether a stored session is waiting to be loaded into a browser.
+#: How a profile is named in the bookkeeping.  ``""`` is the monitor's own
+#: profile, which is what ``lane=None`` means everywhere else in this module.
+def _profile_key(lane: str | None) -> str:
+    return lane or ""
 
-    True only for a session the user imported and that no browser has taken yet.
-    A session written by the monitor itself is already in the profile it came
-    from, and replaying it over a live one would be a way to overwrite a good
-    session with an older copy of itself.
+
+def _applied_profiles(meta: Dict[str, Any]) -> List[str]:
+    """The profiles that have already taken this import.
+
+    Reads the old bookkeeping too.  A file written before this existed carries a
+    single ``applied: True``, which meant "some browser took it" and in practice
+    only ever meant the monitor's own -- so that is what it is read as, and
+    every lane profile is correctly still owed the session.
+    """
+    recorded = meta.get("applied_to")
+    if isinstance(recorded, list):
+        return [str(name) for name in recorded]
+    return [""] if meta.get("applied") else []
+
+
+def drop_cookies(marketplace_name: str, names: Iterable[str]) -> int:
+    """Remove named cookies from a stored session.  Returns how many went.
+
+    For the cookies that are the *bot check's opinion of this browser* rather
+    than the site's relationship with the user -- PerimeterX's ``_pxvid``,
+    Cloudflare's ``cf_clearance``.  Kept while they work, because that is what
+    lets a new profile start already cleared; thrown away the moment the shop
+    refuses us, because from then on they are a device identity the shop has
+    decided against.
+
+    The bug this exists for: :func:`save_site_session` filters by *domain*, so
+    ``sessions/lider.json`` held ``_pxvid`` along with the login.  A user who
+    deleted every profile to start clean got the flagged device id seeded
+    straight back into the fresh one, and was walled one second after the
+    browser opened.  ``lider.py``'s own docstring says a reseeded profile
+    "arrives with the account cookies and a clean device id" -- this is what
+    makes that true.
+
+    Filters the stored file rather than rewriting it from a browser: the login
+    cookies in there were pasted by hand and a rebuild would lose them.
+    """
+    wanted = {str(name) for name in names}
+    if not wanted:
+        return 0
+    with _write_lock:
+        state = load_session(marketplace_name)
+        if state is None:
+            return 0
+        cookies = state.get("cookies") or []
+        kept = [
+            cookie
+            for cookie in cookies
+            if not (isinstance(cookie, dict) and str(cookie.get("name") or "") in wanted)
+        ]
+        removed = len(cookies) - len(kept)
+        if not removed:
+            return 0
+        state["cookies"] = kept
+        return removed if _write_now(marketplace_name, state) else 0
+
+
+def import_is_pending(marketplace_name: str, lane: str | None = None) -> bool:
+    """Whether a stored session is waiting to be loaded into *this* profile.
+
+    True only for a session the user imported and that this browser profile has
+    not taken yet.  A session written by the monitor itself is already in the
+    profile it came from, and replaying it over a live one would be a way to
+    overwrite a good session with an older copy of itself.
+
+    **Per profile, not per import.**  A lane is a second browser on a profile of
+    its own and it is the browser that actually searches whichever platform runs
+    in parallel, so "applied" was never one fact: an import that reached the
+    monitor's browser was marked applied for good, and the lane -- whose profile
+    already existed, so nothing re-seeded it from disk -- went on searching
+    signed out for ever.  That is the whole of why importing a Lider or Sodimac
+    session appeared to do nothing.
     """
     state = load_session(marketplace_name) or {}
     meta = state.get("aimm")
     if not isinstance(meta, dict):
         return False
-    return meta.get("source") == "imported" and not meta.get("applied")
+    if meta.get("source") != "imported":
+        return False
+    return _profile_key(lane) not in _applied_profiles(meta)
+
+
+def import_is_unapplied(marketplace_name: str) -> bool:
+    """Whether no profile at all has taken the import yet.
+
+    The question :func:`save_site_session` asks before it overwrites a file: an
+    import nobody has loaded is the user's paste and nothing else, and replacing
+    it with the cookies of a browser that was never given it destroys the one
+    copy there is.
+    """
+    state = load_session(marketplace_name) or {}
+    meta = state.get("aimm")
+    if not isinstance(meta, dict) or meta.get("source") != "imported":
+        return False
+    return not _applied_profiles(meta)
 
 
 def rearm_import(marketplace_name: str) -> bool:
-    """Mark a stored session as waiting to be loaded again.
+    """Mark a stored session as waiting to be loaded again, by every profile.
 
     For the two cases where a stored session needs to reach the browser a second
     time: the site logged us out and the cookies are still good, and a file
     imported before this bookkeeping existed, which carries no note saying it
     was ever meant to be applied.  Returns whether there was anything to re-arm.
     """
-    state = load_session(marketplace_name)
-    if state is None or not state.get("cookies"):
-        return False
-    meta = state.get("aimm") if isinstance(state.get("aimm"), dict) else {}
-    state["aimm"] = {
-        **meta,
-        "source": "imported",
-        "imported_at": meta.get("imported_at")
-        or datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "applied": False,
-    }
-    return _write(marketplace_name, state)
+    with _write_lock:
+        state = load_session(marketplace_name)
+        if state is None or not state.get("cookies"):
+            return False
+        meta = state.get("aimm") if isinstance(state.get("aimm"), dict) else {}
+        state["aimm"] = {
+            **meta,
+            "source": "imported",
+            "imported_at": meta.get("imported_at")
+            or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "applied": False,
+            "applied_to": [],
+        }
+        return _write_now(marketplace_name, state)
 
 
-def mark_import_applied(marketplace_name: str) -> None:
-    """Note that a browser has taken the imported session, so it is not re-applied."""
-    state = load_session(marketplace_name)
-    if state is None:
-        return
-    meta = state.get("aimm")
-    if not isinstance(meta, dict):
-        return
-    meta["applied"] = True
-    meta["applied_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    state["aimm"] = meta
-    _write(marketplace_name, state)
+def mark_import_applied(marketplace_name: str, lane: str | None = None) -> None:
+    """Note that one browser profile has taken the import.
+
+    Called by whichever thread owns that profile -- the monitor's for its own
+    browser, a lane's for the lane's -- so the whole read-modify-write is under
+    :data:`_write_lock`.
+    """
+    with _write_lock:
+        state = load_session(marketplace_name)
+        if state is None:
+            return
+        meta = state.get("aimm")
+        if not isinstance(meta, dict):
+            return
+        profiles = _applied_profiles(meta)
+        key = _profile_key(lane)
+        if key not in profiles:
+            profiles.append(key)
+        meta["applied_to"] = profiles
+        # Kept in step for anything still reading the old field, and because a
+        # file this version writes may be read by an older one.
+        meta["applied"] = "" in profiles
+        meta["applied_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        state["aimm"] = meta
+        _write_now(marketplace_name, state)
 
 
 def session_info(marketplace_name: str) -> Dict[str, Any]:
@@ -620,7 +824,16 @@ def session_info(marketplace_name: str) -> Dict[str, Any]:
         # that is still pending is the difference between "nothing happened"
         # and "it will happen when the browser next starts".
         "source": str(meta.get("source") or "browser"),
-        "pending": bool(meta.get("source") == "imported" and not meta.get("applied")),
+        # "Stored but not yet in any browser", which is the sentence the
+        # interface makes of it.  Deliberately *not* "every profile has it":
+        # the monitor keeps a profile per platform searched in parallel, plus
+        # one for the review and one for trackers, and a profile left on disk by
+        # a platform nobody searches any more would keep the panel saying
+        # "pendiente" for ever.  Which profiles still owe it is `applied_to`,
+        # and it is `import_is_pending(name, lane)` -- asked per profile at
+        # launch -- that decides who is handed it.
+        "pending": import_is_unapplied(marketplace_name),
+        "applied_to": _applied_profiles(meta) if meta.get("source") == "imported" else [],
         "domains": sorted({_strip_dot(str(cookie.get("domain") or "")) for cookie in cookies} - {""}),
         "saved_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(
             timespec="seconds"

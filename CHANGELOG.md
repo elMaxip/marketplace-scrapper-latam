@@ -8,6 +8,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **A shop's refusal is answered with a new browser, not with a wait.** Being
+  walled used to cost fifteen minutes of doing nothing and abandon the search
+  half way through a catalogue. Now the search drops the identity the shop just
+  refused, throws the browser and its profile away, opens a new one — reseeded
+  from the stored session, so it arrives with the account and nothing the wall
+  recognises — and asks for the same page again, all inside the search that hit
+  the wall. Once per search: a shop that refuses everything must not become a
+  loop of opening and closing browsers. The cooldown still exists and is now
+  what it should always have been, the last resort.
+- **A search walks a shop's catalogue to its end.** `max_pages` used to default
+  to one page, so nine tenths of a shop did not exist for the monitor. Left
+  unset it now pages until the shop runs out; set, it still means exactly that
+  many. It stops on an empty page, on a page holding nothing the earlier ones
+  did not, on the shop's own page count where it publishes one (Lider's
+  `paginationV2.maxPage`), and at a ceiling of 25 pages for the next site to
+  invent a way of never saying "no more".
+- **Results pages are spaced like pages somebody reads**, four seconds apart and
+  unevenly, where before the next one was requested the instant the last was
+  parsed. With a search that now walks to the end of a catalogue, that would
+  have been a burst.
+
+### Fixed
+- **Sodimac searches read one page of the catalogue and called it the end.**
+  Any phrase the shop can map to a category — "taladro", most single words —
+  redirects from `?Ntt=` to `/lista/...`, and the redirect keeps none of the
+  query string, so the `?currentpage` the monitor appended never arrived. That
+  route ignores `currentpage` anyway: its parameter is `?page`. Both halves
+  were verified live, and together they meant the duplicate-page stop fired on
+  page two every time — 558 taladros seen as 48. Page two onwards is now asked
+  for at the address page one actually came back from
+  (`pageProps.canonicalUrl`) with the parameter that route understands, through
+  a new `next_page_url` hook whose default leaves every other shop alone.
+- **Sodimac now says how many pages it has.** `total_pages` returned `None` on
+  the grounds that the page size was not published. It is: `pagination.perPage`,
+  48 on the category route and 28 on the search one, and the arithmetic closes
+  exactly — 558 products at 48 is 12 pages, the twelfth came back with 30
+  entries and the thirteenth empty. Not `totalPerPage` (56), which counts the
+  sponsored cards padding each page and would end the search two pages early.
+- **A shop's bot check no longer gets to keep its verdict for ever.** Sessions
+  are filtered by domain, so PerimeterX's device id was stored in
+  `sessions/lider.json` beside the login and seeded back into every new browser
+  profile: deleting every profile to start clean produced a fresh browser that
+  was refused one second after it opened, wearing the identity it had just been
+  handed. Each platform now names those cookies (`challenge_cookies`); a refusal
+  drops them, so the next profile starts with the account and an identity the
+  wall has no history for, and an import drops them too, since the ones in an
+  export belong to the browser they were copied from. Login cookies are never
+  touched, and platforms whose device cookies are an asset rather than a
+  liability — Facebook's `datr` — declare none.
+- **Being refused a product page no longer stops a shop being searched.** Both
+  shops serve their results grid far more willingly than their product pages,
+  and a page opened only for a description was putting the whole platform on a
+  fifteen-minute cooldown — skipping the next search, which was the part that
+  still worked. Only a refusal on the page the search actually came for does
+  that now; a walled product page keeps the listings already found, reads the
+  rest from the search cards, and stops opening pages until one comes back.
+- **A results page carrying a payload with no products in it is recognised as
+  the wall.** Both shops' block pages are Next.js applications too, so a refusal
+  could arrive with a perfectly good `__NEXT_DATA__` and be reported as "0
+  results" — indistinguishable from a shop that sells none of it, and with the
+  cooldown left switched off.
+- **An imported session reaches every browser, not just the first one.** The
+  monitor runs a browser profile per platform searched in parallel, plus one for
+  the review; "applied" was one fact about the import, so the first profile to
+  take it settled the question for all of them and the browser that actually
+  searched the shop never got it.
+- **"Ejecutar ahora" ignores a cooldown.** A back-off the monitor set itself is
+  a guess, and a person asking for a search by name outranks it.
+
+### Changed
+- **The spacing between page loads varies instead of being exact.** Two seconds,
+  precisely, forty-eight times in a row is a metronome rather than a slow
+  visitor. `utils.human_delay` keeps the average — the bounds are the two-sigma
+  points and symmetric, so a pass costs the same wall clock — and loses the
+  regularity. `AIMM_HUMAN_PACING=0` turns it off.
+- **A product page is opened only when its description decides something** — a
+  keyword filter, an AI rating, or `in_stock_only`, which needs a stock level no
+  grid publishes. Otherwise the card already carries the title, price, image,
+  seller and condition, and the review reads the page later anyway.
+- **Real Google Chrome is used where the machine has it**, and Playwright's
+  bundled Chromium where it does not. Where `patchright` is installed it drives
+  the browsers instead of Playwright; both are optional and absence changes
+  nothing.
 - **Searching the platforms in parallel, and reviewing stored listings in
   parallel, are both on by default.** Off, the monitor works through one queue
   and one browser: every Facebook search finishes before the first Mercado

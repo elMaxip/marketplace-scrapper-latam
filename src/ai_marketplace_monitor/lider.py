@@ -277,6 +277,21 @@ def parse_product(payload: Dict[str, Any], url: str, item_name: str) -> Listing 
     )
 
 
+def total_pages(payload: Dict[str, Any]) -> int | None:
+    """The number of results pages, or None when the payload does not say.
+
+    ``None`` rather than 1 for a missing key: "the shop did not tell us" and
+    "there is one page" lead to different behaviour, and guessing the second
+    would stop every search after its first page -- which is the bug this whole
+    change exists to remove.
+    """
+    value = dig(payload, "props", "pageProps", "initialData", "searchResult", "paginationV2", "maxPage")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    pages = int(value)
+    return pages if pages > 0 else None
+
+
 def product_status(payload: Dict[str, Any]) -> ListingStatus:
     """Whether Lider still sells this.
 
@@ -310,6 +325,17 @@ class LiderMarketplace(RetailerMarketplace):
     #: session rather than guessed: these are the names in the stored session
     #: file, and `customer` is the one that survives longest.
     session_cookies = ("customer", "auth", "CID")
+    #: PerimeterX's own cookies, read off a live jar rather than guessed:
+    #: ``_px3`` is the short-lived clearance, ``_pxvid``/``__pxvid`` are the
+    #: device id that accumulates a reputation, ``pxcts`` is its telemetry.
+    #: ``_pxde`` and ``_pxhd`` are the other two the vendor sets and are listed
+    #: so a jar that has them is cleaned too.
+    #:
+    #: Dropping these on a refusal is what makes the recovery this module's
+    #: docstring describes actually happen: a reseeded profile arrives with the
+    #: account and a device id the wall has no history for.  Before, the id it
+    #: had just decided against came back with the login attached.
+    challenge_cookies = ("_px3", "_pxvid", "__pxvid", "pxcts", "_pxde", "_pxhd")
 
     @classmethod
     def get_config(cls: Type["LiderMarketplace"], **kwargs: Any) -> LiderMarketplaceConfig:
@@ -392,3 +418,14 @@ class LiderMarketplace(RetailerMarketplace):
         self: "LiderMarketplace", payload: Dict[str, Any]
     ) -> ListingStatus:
         return product_status(payload)
+
+    def total_pages(self: "LiderMarketplace", payload: Dict[str, Any]) -> int | None:
+        """How many results pages Lider says there are.
+
+        ``paginationV2.maxPage``, which the module docstring has recorded as
+        real since this file was written -- ``&page=2`` genuinely serves
+        different items, verified by comparing the first entry of two pages.
+        Reading it means a search stops where the catalogue does rather than by
+        asking for a page that turns out to be empty.
+        """
+        return total_pages(payload)

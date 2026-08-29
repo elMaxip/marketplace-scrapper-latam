@@ -57,6 +57,13 @@ aimm = "ai_marketplace_monitor.cli:app"
 
 [project.optional-dependencies]
 pynput = ["pynput>=1.7.0"]
+# An undetected fork of Playwright, API-compatible, used when it is present and
+# ignored when it is not (see `browser_engine.py`).  Optional on purpose: the
+# shops' bot checks are the only reason for it, the container does not need it,
+# and a dependency that can be uninstalled without touching code is one this
+# project's "no new runtime dependencies without a strong reason" rule can live
+# with.  Pinned to the Playwright minor it forks.
+stealth = ["patchright>=1.62,<1.63"]
 dev = [
   "pre-commit>=4.0.1",
   "invoke>=2.2.0",

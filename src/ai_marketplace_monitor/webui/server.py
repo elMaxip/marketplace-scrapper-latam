@@ -738,9 +738,13 @@ def create_app(
             raise HTTPException(status_code=400, detail="Missing 'cookies' text")
 
         domains = marketplace.session_domains()
+        # A shop's bot-check cookies belong to the browser they were exported
+        # from, not to the user, so they are not carried across.  Empty for the
+        # marketplaces, which have none.
+        challenge = getattr(marketplace, "challenge_cookies", ())
         try:
             cookies = parse_cookies(raw, default_domain=domains[0] if domains else "")
-            result = import_session(name, cookies, domains)
+            result = import_session(name, cookies, domains, drop_names=challenge)
         except ValueError as error:
             # The user's paste was the wrong thing, which is a thing to say
             # rather than a server fault.

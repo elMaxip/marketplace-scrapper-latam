@@ -19,6 +19,7 @@ import logging
 
 from ai_marketplace_monitor import session
 from ai_marketplace_monitor.facebook import FacebookMarketplace
+from ai_marketplace_monitor.lider import LiderMarketplace
 from ai_marketplace_monitor.mercadolibre import MercadoLibreMarketplace
 from ai_marketplace_monitor.monitor import MarketplaceMonitor
 
@@ -350,3 +351,224 @@ def test_a_lane_that_refuses_the_work_does_not_stop_the_others() -> None:
     good = FakeLane("updates")
     _monitor({"a": Broken("a"), "b": good})._seed_lanes_with_session("sodimac", COOKIES)
     assert good.context.added == COOKIES
+
+
+# --------------------------------------------------------------------------- #
+# One import, several browser profiles
+# --------------------------------------------------------------------------- #
+#
+# The bug these pin down is the whole of "importar la sesión de Lider/Sodimac no
+# hace nada".  A lane is a second browser on a profile of its own and it is the
+# browser that searches whichever platform runs in parallel.  "Applied" used to
+# be one fact about the import, so the monitor's own browser taking it settled
+# the question for every profile -- and the lane, whose profile already existed
+# and so was never re-seeded from disk, searched signed out for ever.
+
+
+def test_applied_is_recorded_per_profile() -> None:
+    _import()
+    session.mark_import_applied("mercadolibre", None)
+    assert session.import_is_pending("mercadolibre", None) is False
+    assert session.import_is_pending("mercadolibre", "sodimac") is True
+
+
+def test_each_profile_is_settled_on_its_own() -> None:
+    _import()
+    session.mark_import_applied("mercadolibre", "sodimac")
+    assert session.import_is_pending("mercadolibre", "sodimac") is False
+    assert session.import_is_pending("mercadolibre", None) is True
+
+
+def test_a_file_from_the_old_bookkeeping_still_owes_every_lane() -> None:
+    """`applied: True` meant "some browser took it", and in practice only ever
+    meant the monitor's own.  Read that way, so upgrading repairs the lanes."""
+    _import()
+    state = session.load_session("mercadolibre")
+    state["aimm"] = {"source": "imported", "applied": True}
+    session._write_now("mercadolibre", state)
+    assert session.import_is_pending("mercadolibre", None) is False
+    assert session.import_is_pending("mercadolibre", "sodimac") is True
+
+
+def test_re_arming_asks_every_profile_again() -> None:
+    _import()
+    session.mark_import_applied("mercadolibre", None)
+    session.mark_import_applied("mercadolibre", "sodimac")
+    session.rearm_import("mercadolibre")
+    assert session.import_is_pending("mercadolibre", None) is True
+    assert session.import_is_pending("mercadolibre", "sodimac") is True
+
+
+# --------------------------------------------------------------------------- #
+# A shop's own save must not eat the paste
+# --------------------------------------------------------------------------- #
+
+
+class FakeContext:
+    """Just enough of a Playwright context for `save_site_session`."""
+
+    def __init__(self, cookies) -> None:
+        self._cookies = cookies
+
+    def storage_state(self):
+        return {"cookies": self._cookies, "origins": []}
+
+
+ANONYMOUS = [{"name": "_px3", "value": "x", "domain": ".mercadolibre.cl"}]
+
+
+def test_a_shop_save_keeps_the_import_bookkeeping() -> None:
+    """`save_site_session` writes cookies and no `aimm` block.  Dropping the
+    stored one erased what the user had imported and which profiles had taken
+    it, so "importada" turned back into "guardada por el navegador"."""
+    _import()
+    session.mark_import_applied("mercadolibre", None)
+    session.save_site_session("mercadolibre", FakeContext(ANONYMOUS), ML_DOMAINS)
+    info = session.session_info("mercadolibre")
+    assert info["source"] == "imported"
+    assert session.import_is_pending("mercadolibre", "sodimac") is True
+
+
+def test_a_shop_save_will_not_overwrite_a_paste_nobody_has_loaded() -> None:
+    """The destructive case: the import never reached this browser, this browser
+    is signed out, and its jar would be the only copy left."""
+    _import()
+    assert session.save_site_session("mercadolibre", FakeContext(ANONYMOUS), ML_DOMAINS) is False
+    stored = session.load_session("mercadolibre")
+    assert [cookie["name"] for cookie in stored["cookies"]] == ["ssid"]
+
+
+# --------------------------------------------------------------------------- #
+# The bot check's opinion is not the user's login
+# --------------------------------------------------------------------------- #
+#
+# Both live on the shop's own domain, and `save_site_session` filters by domain,
+# so a device id PerimeterX had already decided against was stored beside the
+# pasted login and seeded back into every new profile.  Deleting every profile
+# to start clean produced a fresh browser that was walled one second after it
+# opened, wearing the flagged id we had just handed it.
+
+
+def _lider_session() -> None:
+    session._write(
+        "lider",
+        {
+            "cookies": [
+                {"name": "customer", "value": "u", "domain": ".lider.cl"},
+                {"name": "auth", "value": "t", "domain": ".lider.cl"},
+                {"name": "_pxvid", "value": "burned", "domain": ".lider.cl"},
+                {"name": "_px3", "value": "stale", "domain": ".lider.cl"},
+                {"name": "pxcts", "value": "x", "domain": ".lider.cl"},
+            ],
+            "origins": [],
+        },
+    )
+
+
+def test_dropping_the_device_id_keeps_the_login() -> None:
+    """The half that must survive: those cookies were pasted by hand and there
+    is no other copy of them."""
+    _lider_session()
+    removed = session.drop_cookies("lider", LiderMarketplace.challenge_cookies)
+    assert removed == 3
+    stored = session.load_session("lider")
+    assert sorted(cookie["name"] for cookie in stored["cookies"]) == ["auth", "customer"]
+
+
+def test_dropping_nothing_leaves_the_file_alone() -> None:
+    _lider_session()
+    assert session.drop_cookies("lider", ()) == 0
+    assert session.drop_cookies("lider", ("not-a-cookie",)) == 0
+    assert len(session.load_session("lider")["cookies"]) == 5
+
+
+def test_the_import_bookkeeping_survives_the_drop() -> None:
+    """Otherwise clearing a burned device id would quietly turn a session the
+    user imported back into one "saved by the browser", and no profile could be
+    told to take it again."""
+    session.import_session(
+        "lider",
+        session.parse_cookies("customer=u; _pxvid=burned", default_domain=".lider.cl"),
+        ("lider.cl",),
+    )
+    session.mark_import_applied("lider", None)
+    session.drop_cookies("lider", LiderMarketplace.challenge_cookies)
+    info = session.session_info("lider")
+    assert info["source"] == "imported"
+    assert info["applied_to"] == [""]
+
+
+def test_a_shop_with_nothing_to_drop_is_not_a_special_case() -> None:
+    assert session.drop_cookies("nothing-stored-here", ("_pxvid",)) == 0
+
+
+# --------------------------------------------------------------------------- #
+# What an export from the user's own Chrome carries that should not travel
+# --------------------------------------------------------------------------- #
+#
+# The bot-check cookies do belong to the shop, so the domain filter keeps them --
+# they are simply not *ours*.  An export from an ordinary browser carries that
+# browser's device id, and replaying it in the monitor's browser makes the id and
+# the fingerprint disagree.  Dropped here rather than asked of the user, who
+# would otherwise be editing a JSON export by hand to remove four names they have
+# no way of recognising, on every new machine.
+
+
+LIDER_DOMAINS = LiderMarketplace.session_domains()
+
+
+def test_the_login_travels_and_the_device_id_does_not() -> None:
+    result = session.import_session(
+        "lider",
+        session.parse_cookies(
+            "customer=u; auth=t; _pxvid=theirs; _px3=theirs", default_domain=".lider.cl"
+        ),
+        LIDER_DOMAINS,
+        drop_names=LiderMarketplace.challenge_cookies,
+    )
+    assert result["imported"] == 2
+    assert result["dropped"] == 2
+    stored = session.load_session("lider")
+    assert sorted(cookie["name"] for cookie in stored["cookies"]) == ["auth", "customer"]
+
+
+def test_other_sites_and_the_device_id_are_counted_apart() -> None:
+    """Two different reasons to drop a cookie, and the interface says which."""
+    result = session.import_session(
+        "lider",
+        session.parse_cookies(
+            '[{"name":"customer","value":"u","domain":".lider.cl"},'
+            '{"name":"_pxvid","value":"x","domain":".lider.cl"},'
+            '{"name":"SID","value":"g","domain":".google.com"}]'
+        ),
+        LIDER_DOMAINS,
+        drop_names=LiderMarketplace.challenge_cookies,
+    )
+    assert result["imported"] == 1
+    assert result["ignored"] == 1
+    assert result["dropped"] == 1
+
+
+def test_a_paste_of_nothing_but_bot_check_cookies_says_so() -> None:
+    """Kept apart from "no pertenecen a este marketplace": these did come from
+    the right site, so that message would send the reader looking for a mistake
+    they did not make."""
+    with pytest.raises(ValueError, match="control antibots"):
+        session.import_session(
+            "lider",
+            session.parse_cookies("_pxvid=x; _px3=y", default_domain=".lider.cl"),
+            LIDER_DOMAINS,
+            drop_names=LiderMarketplace.challenge_cookies,
+        )
+
+
+def test_a_marketplace_with_no_bot_check_cookies_is_unaffected() -> None:
+    """Facebook and Mercado Libre declare none, and the import must behave
+    exactly as it did before this existed."""
+    result = session.import_session(
+        "mercadolibre",
+        session.parse_cookies("ssid=abc", default_domain=".mercadolibre.cl"),
+        ML_DOMAINS,
+    )
+    assert result["imported"] == 1
+    assert result["dropped"] == 0

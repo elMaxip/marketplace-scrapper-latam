@@ -60,17 +60,28 @@ from .utils import (
     aimm_event,
     counter,
     hilight,
+    human_delay,
+    human_scroll,
     is_substring,
     price_value,
 )
 
-#: Result pages walked per search phrase unless the config says otherwise.
+#: Hard stop on how far a search will page, whatever the shop says.
 #:
-#: One, because a shop's first page is already fifty-odd catalogue entries --
-#: more than a Facebook search returns for the same phrase -- and because a
-#: monitor that walks twenty pages of a retailer every cycle is a monitor that
-#: gets rate limited.
-DEFAULT_MAX_PAGES = 1
+#: Not a page limit -- every honest stop is elsewhere: the page came back empty,
+#: it held nothing the previous pages had not, or the shop published how many
+#: pages there are.  This is the brake for when none of those fire, which is a
+#: real shape and not a hypothetical: Sodimac's ``/lista`` route accepts
+#: ``?currentpage`` and ignores it, answering with page one for ever.  The
+#: duplicate guard catches that one; this catches the next site to invent a way
+#: of never saying "no more".
+MAX_PAGES_CEILING = 25
+
+#: Seconds between two results pages.  Longer than between two product pages
+#: (:data:`SECONDS_BETWEEN_PRODUCTS`) because reading a page of fifty results
+#: takes a person longer than glancing at one product, and this is the pacing a
+#: shop sees most of now that a search walks to the end of the catalogue.
+SECONDS_BETWEEN_PAGES = 4
 
 #: Seconds between two product-page reads.  The same pacing the other scrapers
 #: use, for the same reason: a burst of page loads from one session is what
@@ -144,6 +155,7 @@ class RetailerMarketplace(Marketplace):
     ``parse_search(payload, item_name)``        payload -> listings
     ``parse_product(payload, url, item_name)``  payload -> one listing
     ``product_status(payload)``                 payload -> ACTIVE / GONE / UNKNOWN
+    ``total_pages(payload)``                    payload -> how many pages, or None
     """
 
     #: Set by each subclass.
@@ -180,6 +192,25 @@ class RetailerMarketplace(Marketplace):
         #: the first page that is served, and writing the file on every load
         #: would be a disk write per product.
         self._session_kept = False
+        #: Why the shop is refusing *product* pages right now, or None.
+        #:
+        #: A separate fact from the marketplace cooldown, and the difference is
+        #: the whole of why Lider stopped finding anything.  Both shops serve
+        #: their results grid far more willingly than their product pages, so
+        #: the ordinary shape of a bad afternoon is: the search works, forty-odd
+        #: cards come back, and the first product page opened for a description
+        #: is the wall.  Treating that as "the shop is refusing us" put the
+        #: whole platform on a fifteen-minute cooldown and skipped the *next*
+        #: search entirely -- the one thing that was still working.
+        #:
+        #: Set on a walled product page, cleared by any page that comes back.
+        #: So the next search's own results page clears it if the shop is
+        #: serving, and nothing has to remember to reset it.
+        self._products_walled: str | None = None
+        #: Why the last :meth:`open_payload` for a page we came for came back
+        #: empty, or None.  Read by the search loop, which owns the decision --
+        #: see the comment there.
+        self.last_wall_reason: str | None = None
 
     # ------------------------------------------------------------------ #
     # What a subclass must provide
@@ -189,6 +220,29 @@ class RetailerMarketplace(Marketplace):
         self: "RetailerMarketplace", phrase: str, item_config: ItemConfig, page: int = 1
     ) -> str:
         raise NotImplementedError
+
+    def next_page_url(
+        self: "RetailerMarketplace",
+        payload: Dict[str, Any],
+        phrase: str,
+        item_config: ItemConfig,
+        page: int,
+    ) -> str:
+        """Where page ``page`` is, given the payload of the page before it.
+
+        Overridable because a search URL is not always the address the results
+        came back from.  Sodimac redirects any phrase it can map to a category,
+        and **the redirect keeps none of the query string** -- so a page
+        parameter appended to the search URL never arrives, page two is page one
+        for ever, and every category search read its first 48 entries out of
+        558 and stopped.  The duplicate guard below dutifully called that "the
+        catalogue ended".
+
+        The default ignores the payload and asks :meth:`search_url`, which is
+        right for any shop whose results stay at the address they were asked
+        for.
+        """
+        return self.search_url(phrase, item_config, page=page)
 
     def parse_search(
         self: "RetailerMarketplace", payload: Dict[str, Any], item_name: str
@@ -204,6 +258,19 @@ class RetailerMarketplace(Marketplace):
         self: "RetailerMarketplace", payload: Dict[str, Any]
     ) -> ListingStatus:
         raise NotImplementedError
+
+    def total_pages(self: "RetailerMarketplace", payload: Dict[str, Any]) -> int | None:
+        """How many results pages there are, if the shop says.
+
+        The fifth pure function of a payload, and the only one with a default:
+        ``None`` means "this shop does not publish it", which is a perfectly
+        good answer -- the search then stops on an empty page or on a page that
+        repeats the last one, which are facts rather than claims.
+
+        Worth reading where it exists because it saves the request that would
+        otherwise be needed to discover the end by hitting it.
+        """
+        return None
 
     # ------------------------------------------------------------------ #
     # Config plumbing
@@ -281,7 +348,9 @@ class RetailerMarketplace(Marketplace):
             self.page = self.context.new_page()
             temporary = True
         try:
-            payload = self.open_payload(self.home_url)
+            # A probe, not a search: being refused here is worth reporting and
+            # is not a reason to stop the platform searching.
+            payload = self.open_payload(self.home_url, is_the_page_we_came_for=False)
             names = self._cookie_names()
             signed_in = bool(self.session_cookies) and any(
                 name in names for name in self.session_cookies
@@ -367,8 +436,17 @@ class RetailerMarketplace(Marketplace):
         """
         return None
 
-    def open_payload(self: "RetailerMarketplace", url: str) -> Dict[str, Any] | None:
+    def open_payload(
+        self: "RetailerMarketplace", url: str, *, is_the_page_we_came_for: bool = True
+    ) -> Dict[str, Any] | None:
         """Navigate and hand back the page's own data, or None.
+
+        ``is_the_page_we_came_for`` says what a refusal *means*.  True for a
+        results page, which is the thing a search exists to read: refused, there
+        is nothing to salvage and nothing to gain by asking again soon, so the
+        cooldown is right.  False for a product page and for the health probe,
+        where the search may be working perfectly and a cooldown would take it
+        down with them.  See :meth:`_note_product_wall`.
 
         None is still every way of not getting the page: a bot check, a sign-in
         wall, an error page, a redirect somewhere else, a layout with no payload
@@ -388,13 +466,100 @@ class RetailerMarketplace(Marketplace):
         payload = from_page(self.page)
         if payload is None:
             reason = self.blocked_reason()
-            if reason:
-                self._hit_wall(reason)
+            # Recorded rather than acted on, for the page a search came for:
+            # what to do about a refusal -- open a fresh browser and try again,
+            # or give up and wait -- depends on whether this search has already
+            # had its one retry, and only the search knows that.  A product page
+            # keeps deciding for itself: there is nothing to retry, the card is
+            # already the answer.
+            self.last_wall_reason = reason if is_the_page_we_came_for else None
+            if reason and not is_the_page_we_came_for:
+                self._note_product_wall(reason)
             return None
+        self.last_wall_reason = None
+        # Any page that comes back is the shop saying it has forgiven us, and
+        # it clears both readings of a refusal at once.
+        self._products_walled = None
         control.clear_marketplace_block(self.name)
         if not self._session_kept:
             self._session_kept = True
             self.save_session()
+        return payload
+
+    def _note_product_wall(self: "RetailerMarketplace", reason: str) -> None:
+        """Record that product pages are walled, without cooling down the shop.
+
+        Deliberately **not** :meth:`_hit_wall`.  A product page is not the page
+        the search came for: the results grid already handed over the title, the
+        price, the image and the seller, and the page was being opened for the
+        description alone.  Losing it costs a keyword filter some accuracy;
+        putting the platform on a cooldown for it costs every later search.
+
+        What this does buy is that the rest of the run stops asking.  Forty-odd
+        product pages opened one after another through a wall is exactly the
+        traffic that keeps a shop refusing, and every one of them was going to
+        return the card anyway.
+        """
+        if self._products_walled is not None:
+            # The same refusal, still in force.  Once per stretch, not once per
+            # page: the log is meant to be read.
+            return
+        self._products_walled = reason
+        if self.logger:
+            self.logger.warning(
+                f"""{hilight("[Search]", "fail")} {self.label} {reason} on a product page. """
+                """The results it already served are kept and the rest are read from """
+                """the search cards; the platform is not being put on a cooldown for it.""",
+                extra=aimm_event(
+                    "product_wall", marketplace=self.name, reason=reason
+                ),
+            )
+
+    def _retry_on_a_fresh_browser(
+        self: "RetailerMarketplace", url: str, phrase: str
+    ) -> Dict[str, Any] | None:
+        """Open a new browser on a new profile and ask for the page once more.
+
+        The recovery the evidence asks for.  A profile carrying an identity the
+        wall has ruled against is refused in about a second; a profile with no
+        history is served.  So the answer to a refusal is a new profile, not a
+        quarter of an hour of doing nothing -- and it happens inside the search
+        that hit the wall, because a search that gives up here has abandoned a
+        catalogue it was halfway through.
+
+        Once per search, enforced by the caller.  Without that limit a shop that
+        refuses everything becomes a loop of opening and closing browsers, which
+        is the surest way to keep being refused.
+
+        The challenge cookies go first: the new profile is reseeded from
+        ``sessions/`` on launch, and reseeding it with the identity that was just
+        refused would make the whole exercise pointless.
+        """
+        self.discard_challenge_state()
+        if not self.renew_browser_now():
+            if self.logger:
+                self.logger.debug(
+                    f"No fresh browser available for {self.name}; falling back to the cooldown"
+                )
+            return None
+        if self.logger:
+            self.logger.info(
+                f"""{hilight("[Browser]", "info")} {self.label} refused us, so its browser """
+                """was replaced with a new one on a clean profile. Trying the same page """
+                """again before giving up on this search.""",
+                extra=aimm_event("browser_renewed", marketplace=self.name, item=phrase),
+            )
+        # A brand-new browser asking for the same address in the same instant is
+        # the least human sequence there is.
+        human_delay(SECONDS_BETWEEN_PAGES)
+        self.page = self.create_page()
+        payload = self.open_payload(url)
+        if payload is None and self.logger:
+            self.logger.warning(
+                f"""{hilight("[Search]", "fail")} {self.label} refused the fresh browser """
+                f"""too for {hilight(phrase)}, so the problem is not this profile.""",
+                extra=aimm_event("browser_renewed", marketplace=self.name, ok=False),
+            )
         return payload
 
     def _hit_wall(self: "RetailerMarketplace", reason: str) -> None:
@@ -410,6 +575,8 @@ class RetailerMarketplace(Marketplace):
         """
         if control.marketplace_blocked(self.name):
             return
+        # Declared per shop; see `Marketplace.challenge_cookies`.
+        self.discard_challenge_state()
         block = control.block_marketplace(self.name, reason=reason, announce=True)
         if self.logger:
             minutes = int(block["seconds"] // 60)
@@ -424,6 +591,18 @@ class RetailerMarketplace(Marketplace):
                     strikes=block["strikes"],
                 ),
             )
+
+    def forget_product_wall(self: "RetailerMarketplace") -> None:
+        """Let product pages be tried again.
+
+        Called at the top of each review round.  Without it the flag would be
+        permanently stuck there: a marketplace object lives as long as its lane,
+        the review never loads a results page, and it is a served page that
+        clears the flag -- so one walled product page would end re-checking on
+        that shop for the life of the process.  Once per round is the right
+        rate: a shop that is still refusing costs one page load to find out.
+        """
+        self._products_walled = None
 
     def is_blocked(self: "RetailerMarketplace") -> bool:
         """Whether this shop is inside a cooldown and must be left alone."""
@@ -471,21 +650,98 @@ class RetailerMarketplace(Marketplace):
         if self.page is None:
             self.page = self.create_page()
 
-        max_pages = int(self._option(item_config, "max_pages") or DEFAULT_MAX_PAGES)
+        # None means "until the shop runs out", which is now the default: a page
+        # limit chosen in advance is a guess about a catalogue nobody has
+        # counted, and the old default of one page meant the other nine tenths
+        # of a shop simply did not exist for the monitor.  A number in the
+        # config still means exactly that many pages.
+        configured = self._option(item_config, "max_pages")
+        max_pages = int(configured) if configured else None
+        renewed = False
         seen: Dict[str, bool] = {}
         opened = 0
+        # Counted apart, because there are two reasons a listing can arrive
+        # without its description and only one of them is news.  Reported as one
+        # number they read as the alarming one: a log line saying "the product
+        # pages were walled" appeared on a pass where Lider had walled nothing
+        # at all and the monitor had simply, correctly, not opened any.
+        walled = 0
+        skipped = 0
+        opens_pages = self._description_decides(item_config)
+        if not opens_pages and self.logger:
+            self.logger.debug(
+                f"""{hilight("[Search]", "info")} Reading {hilight(item_config.name)} from """
+                f"""{self.label}'s results grid alone: nothing in this search reads the """
+                """description, and the review fills it in later."""
+            )
 
         for phrase in item_config.search_phrases:
-            for page_number in range(1, max_pages + 1):
-                url = self.search_url(phrase, item_config, page=page_number)
-                payload = self.open_payload(url)
-                if payload is None:
+            page_number = 0
+            #: The payload of the page before this one.  Kept because on a shop
+            #: that redirects its searches it is the only thing that knows where
+            #: the next page is -- see :meth:`next_page_url`.
+            last_payload: Dict[str, Any] | None = None
+            while True:
+                page_number += 1
+                if max_pages is not None and page_number > max_pages:
+                    break
+                if page_number > MAX_PAGES_CEILING:
+                    # A last-resort brake, not a page limit.  Every honest stop
+                    # is above; reaching this one means the site is answering in
+                    # a way none of them recognise, and walking it for ever is
+                    # how a scraper turns into a nuisance.
                     if self.logger:
+                        self.logger.warning(
+                            f"""{hilight("[Search]", "fail")} Stopping at """
+                            f"""{MAX_PAGES_CEILING} pages of {self.label} results for """
+                            f"""{hilight(phrase)}: the shop never said there were no """
+                            """more.""",
+                            extra=aimm_event(
+                                "pagination_ceiling",
+                                marketplace=self.name,
+                                item=item_config.name,
+                                pages=MAX_PAGES_CEILING,
+                            ),
+                        )
+                    break
+                if page_number > 1:
+                    # A results page is a page somebody reads, not one of a
+                    # burst.  Spaced more generously than a product page for
+                    # that reason, and unevenly for the usual one.
+                    human_delay(SECONDS_BETWEEN_PAGES)
+
+                if last_payload is None:
+                    url = self.search_url(phrase, item_config, page=page_number)
+                else:
+                    url = self.next_page_url(
+                        last_payload, phrase, item_config, page_number
+                    )
+                payload = self.open_payload(url)
+                if payload is None and self.last_wall_reason and not renewed:
+                    # The shop refused the page this search came for, and this
+                    # search has not yet had its one fresh browser.  Waiting a
+                    # quarter of an hour is the wrong first answer: the evidence
+                    # is that a profile carrying an identity the wall has
+                    # decided against is refused instantly, and a new one is
+                    # served.  So the recovery happens here, inside the search,
+                    # rather than being deferred to a run half an hour away.
+                    renewed = True
+                    payload = self._retry_on_a_fresh_browser(url, phrase)
+                if payload is None:
+                    reason = self.last_wall_reason
+                    if reason:
+                        # Out of retries, or none was available.  Now the
+                        # cooldown is the right answer, and it is the last
+                        # resort rather than the first reaction.
+                        self._hit_wall(reason)
+                    elif self.logger:
                         self.logger.warning(
                             f"""{hilight("[Search]", "fail")} {self.label} did not serve its """
                             f"""results for {hilight(phrase)}."""
                         )
                     break
+
+                last_payload = payload
 
                 try:
                     found = self.parse_search(payload, item_config.name)
@@ -503,6 +759,34 @@ class RetailerMarketplace(Marketplace):
                         )
                     break
 
+                if not found:
+                    # A results page with a payload and no results in it is not
+                    # always an empty catalogue.  Both shops are Next.js
+                    # applications and so is the wall each of them serves, so a
+                    # refusal can arrive *with* a `__NEXT_DATA__` -- which the
+                    # check in `open_payload` never sees, because that one only
+                    # runs when there was no payload at all.  Reported as "0
+                    # result(s)" it looked exactly like a shop that sells none
+                    # of it, and the cooldown that exists to stop us hammering a
+                    # site that is refusing us never came on.
+                    reason = self.blocked_reason()
+                    if reason:
+                        self._hit_wall(reason)
+                        if self.logger:
+                            self.logger.warning(
+                                f"""{hilight("[Search]", "fail")} {self.label} {reason} on """
+                                f"""the results page for {hilight(phrase)}; it carried a """
+                                """payload with no products in it."""
+                            )
+                        break
+
+                # A page opened, parsed and abandoned without the viewport
+                # ever moving is a visitor with no behaviour at all, and
+                # behaviour is half of what both shops' bot checks score.  It
+                # changes nothing about what is read: the payload was already
+                # in the DOM before this.
+                human_scroll(self.page, self.logger)
+
                 counter.increment(CounterItem.SEARCH_PERFORMED, item_config.name)
                 if self.logger:
                     self.logger.debug(
@@ -511,11 +795,17 @@ class RetailerMarketplace(Marketplace):
                         f"""for {phrase}."""
                     )
 
+                # Counted before anything can `continue` past it, and before
+                # the pause checkpoint below returns: it decides whether the
+                # *page* was new, which is a fact about the page and not about
+                # how far this pass got through it.
+                fresh_on_this_page = 0
                 for listing in found:
                     key = listing.post_url.split("?")[0]
                     if key in seen:
                         continue
                     seen[key] = True
+                    fresh_on_this_page += 1
                     if self.keyboard_monitor is not None and self.keyboard_monitor.is_paused():
                         return
                     counter.increment(CounterItem.LISTING_EXAMINED, item_config.name)
@@ -530,10 +820,17 @@ class RetailerMarketplace(Marketplace):
                         counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
                         continue
 
-                    details = self._with_description(
-                        listing, item_config, spaced=opened > 0
-                    )
-                    opened += 1
+                    if self._products_walled is not None:
+                        walled += 1
+                        details = listing
+                    elif not opens_pages:
+                        skipped += 1
+                        details = listing
+                    else:
+                        details = self._with_description(
+                            listing, item_config, spaced=opened > 0
+                        )
+                        opened += 1
 
                     matched = self.check_listing(details, item_config)
                     record_observation(
@@ -544,8 +841,93 @@ class RetailerMarketplace(Marketplace):
                     else:
                         counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
 
-                if len(found) == 0:
+                if not found:
+                    # The catalogue ran out.  The only stop that needs no
+                    # explaining.
                     break
+                if not fresh_on_this_page:
+                    # Every entry on this page was already on an earlier one, so
+                    # the shop is serving the same page under a different number.
+                    # Sodimac's `/lista` route does exactly this: it accepts
+                    # `?currentpage` and answers `currentPage: 1` every time.
+                    # Without this the loop would only ever end at the ceiling.
+                    if self.logger:
+                        self.logger.debug(
+                            f"""{hilight("[Search]", "info")} {self.label} page """
+                            f"""{page_number} for {phrase} repeated the previous one; """
+                            """stopping here."""
+                        )
+                    break
+                total = self.total_pages(payload)
+                if total is not None and page_number >= total:
+                    # The shop said how many there are.  Believing it saves a
+                    # request that would only come back empty.
+                    break
+
+        if walled and self.logger:
+            # The one worth a warning: the shop refused pages we wanted.
+            self.logger.warning(
+                f"""{hilight("[Search]", "fail")} {walled} {self.label} listing(s) came from """
+                """the search cards because the shop refused their product pages: everything """
+                """but the description is there, and the next search will try them again.""",
+                extra=aimm_event(
+                    "carded_listings",
+                    marketplace=self.name,
+                    item=item_config.name,
+                    listings=walled,
+                    reason="walled",
+                ),
+            )
+        if skipped and self.logger:
+            # Working as intended, and at debug: nothing in this search reads a
+            # description, so the pages were never worth opening.  Said at all
+            # because "88 listings and not one page opened" is surprising enough
+            # to want an explanation when somebody goes looking for one.
+            self.logger.debug(
+                f"""{hilight("[Search]", "info")} {skipped} {self.label} listing(s) read from """
+                """the results grid alone; nothing in this search needs their """
+                """descriptions.""",
+                extra=aimm_event(
+                    "carded_listings",
+                    marketplace=self.name,
+                    item=item_config.name,
+                    listings=skipped,
+                    reason="not_needed",
+                ),
+            )
+
+    def _description_decides(
+        self: "RetailerMarketplace", item_config: ItemConfig
+    ) -> bool:
+        """Whether opening the product page can change any outcome.
+
+        The page is opened for one thing -- the description -- and on a shop
+        that is a marketing blurb, not a seller writing about their own object.
+        Opening one per catalogue entry is nonetheless the bulk of a search's
+        traffic and, on Lider, the exact requests the bot check refuses: a
+        results grid asked for once is served, and forty-eight product pages
+        opened straight after it are not.
+
+        So it is asked for when it decides something:
+
+        * ``keywords`` / ``antikeywords`` read the description as well as the
+          title, so the entry's fate depends on it;
+        * an AI is scoring the listing, and the description is most of what it
+          has to score;
+        * ``in_stock_only`` needs ``availability``, which neither shop prints on
+          its grid.
+
+        When none of them holds, the description would have gone into the
+        notification and nowhere else -- and the review reads the page later
+        anyway, so the stored listing gains it without a burst of traffic in the
+        one minute a bot check is watching hardest.
+        """
+        if self._option(item_config, "in_stock_only"):
+            return True
+        for key in ("keywords", "antikeywords", "ai"):
+            if getattr(item_config, key, None) or getattr(self.config, key, None):
+                return True
+        return False
 
     def _with_description(
         self: "RetailerMarketplace",
@@ -559,10 +941,14 @@ class RetailerMarketplace(Marketplace):
         description costs a keyword filter some accuracy; throwing the entry
         away costs the user the listing.
         """
-        import time
-
+        if self._products_walled is not None:
+            # The shop is refusing product pages.  The card is what the page
+            # would have returned anyway (see `get_listing_details`'s fallback),
+            # so take it now rather than after a navigation that will be walled
+            # and a two-second pause spent waiting to be walled again.
+            return listing
         if spaced and SECONDS_BETWEEN_PRODUCTS > 0:
-            time.sleep(SECONDS_BETWEEN_PRODUCTS)
+            human_delay(SECONDS_BETWEEN_PRODUCTS)
         try:
             details, _cached = self.get_listing_details(
                 listing.post_url,
@@ -608,7 +994,7 @@ class RetailerMarketplace(Marketplace):
         ):
             return cached, True
 
-        payload = self.open_payload(post_url)
+        payload = self.open_payload(post_url, is_the_page_we_came_for=False)
         if payload is None:
             if fallback is not None:
                 return fallback, True
@@ -682,9 +1068,13 @@ class RetailerMarketplace(Marketplace):
         # evidence about us rather than about the product.
         if control.marketplace_blocked(self.name):
             return ListingStatus.UNKNOWN, None
+        if self._products_walled is not None:
+            # Product pages are walled right now, and every one of them would
+            # come back UNKNOWN after a page load.  Say so without the load.
+            return ListingStatus.UNKNOWN, None
         counter.increment(CounterItem.LISTING_RECHECKED, item_config.name)
         try:
-            payload = self.open_payload(post_url)
+            payload = self.open_payload(post_url, is_the_page_we_came_for=False)
         except KeyboardInterrupt:
             raise
         except Exception:

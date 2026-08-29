@@ -39,7 +39,16 @@ from .control import claim
 from .listing import Listing
 from .marketplace import ItemConfig, ListingStatus, Marketplace
 from .observations import delete_observations, get_observation, iter_observations, record_observation
-from .utils import CacheType, CounterItem, aimm_event, cache, counter, hilight, price_value
+from .utils import (
+    CacheType,
+    CounterItem,
+    aimm_event,
+    cache,
+    counter,
+    hilight,
+    human_delay,
+    price_value,
+)
 
 #: How stale a listing has to be before re-opening its page is worth the traffic.
 DEFAULT_RECHECK_INTERVAL = 6 * 60 * 60
@@ -370,6 +379,7 @@ class ListingRefresher:
         self._next_slice = now + self.slice_interval
 
         due = self.due(marketplaces, limit)
+        self._retry_walled_products(due)
         try:
             self._run_due(due, limit, report)
         finally:
@@ -385,6 +395,30 @@ class ListingRefresher:
                 }
             )
         return report
+
+    def _retry_walled_products(
+        self: "ListingRefresher", due: List[Dict[str, Any]]
+    ) -> None:
+        """Once a round, let the shops try their product pages again.
+
+        A shop that refused a product page stops being asked for the rest of
+        the round -- forty loads through a wall is the traffic that keeps a shop
+        refusing -- and it is a page that comes back that lifts that.  The
+        review never loads a results page, so nothing here would ever lift it:
+        one refusal would end re-checking on that shop for the life of the
+        process.  One page load per round is what it costs to find out.
+
+        Only the shops this round is actually going to visit, so a platform
+        with nothing due is not built a marketplace object for nothing.
+        """
+        for name in sorted({str(record.get("marketplace") or "") for record in due} - {""}):
+            try:
+                marketplace = self.marketplace_for(name)
+            except Exception:
+                continue
+            forget = getattr(marketplace, "forget_product_wall", None)
+            if forget is not None:
+                forget()
 
     def _run_due(
         self: "ListingRefresher",
@@ -424,7 +458,11 @@ class ListingRefresher:
                     report.skip("already re-read since the queue was built")
                     continue
                 if not first and self.listing_interval > 0:
-                    time.sleep(self.listing_interval)
+                    # The same spacing the searches use, and varied for the same
+                    # reason: a round of re-checks is the most regular traffic
+                    # this monitor produces -- one product page every N seconds,
+                    # for as long as the queue lasts.
+                    human_delay(self.listing_interval)
                 first = False
                 control.updates_current(marketplace_name, listing_id)
                 self._refresh_one(record, report)

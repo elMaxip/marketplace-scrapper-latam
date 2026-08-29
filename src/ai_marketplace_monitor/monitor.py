@@ -14,7 +14,14 @@ import humanize
 import inflect
 import rich
 import schedule  # type: ignore
-from playwright.sync_api import BrowserContext, Playwright, sync_playwright
+from playwright.sync_api import BrowserContext, Playwright  # type: ignore
+
+from .browser_engine import (
+    ENGINE_NAME,
+    PATCHES_CDP,
+    chrome_is_installed,
+    sync_playwright,
+)
 from rich.pretty import pretty_repr
 from rich.prompt import Prompt
 
@@ -63,6 +70,7 @@ from .session import (
     profile_dir,
     profile_is_new,
     release_stale_profile_lock,
+    reset_profile,
 )
 from .user import User
 from .utils import (
@@ -119,6 +127,38 @@ IDLE_BROWSER_RELEASE = 120.0
 #: while its neighbours have not: a longer wait would put back the barrier this
 #: exists to remove, and a shorter one would spin for nothing.
 LANE_REAP_INTERVAL = 0.5
+
+
+#: Playwright's default Chromium flags that a person's Chrome never carries.
+#:
+#: Playwright starts Chromium with thirty-five of them.  This is deliberately a
+#: *subset*: the ones left in are load bearing and dropping them trades a
+#: fingerprint for a browser that falls over.  ``--disable-dev-shm-usage`` in
+#: particular is the difference, in a container, between working and dying on
+#: the first page; the sandbox and the GPU flags are the same kind of thing.
+#:
+#: What is dropped is the housekeeping a real browser does and an automated one
+#: is told not to: updating components, syncing, loading extensions, checking
+#: whether it is the default browser.  A page cannot read the command line, but
+#: it can read what these flags *do* -- an extensions API with nothing in it, a
+#: component updater that never ran, feature flags that do not match the build.
+TELLTALE_DEFAULT_ARGS: Tuple[str, ...] = (
+    "--disable-back-forward-cache",
+    "--disable-client-side-phishing-detection",
+    "--disable-component-extensions-with-background-pages",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--disable-extensions",
+    "--disable-field-trial-config",
+    "--disable-hang-monitor",
+    "--disable-popup-blocking",
+    "--disable-prompt-on-repost",
+    "--disable-renderer-backgrounding",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--no-default-browser-check",
+    "--no-first-run",
+)
 
 
 class JobOutcome(Enum):
@@ -917,15 +957,22 @@ class MarketplaceMonitor:
 
     @staticmethod
     def _launch_options(browser_name: str) -> dict:
-        """Per-engine launch flags that keep a normal sign-in from being refused.
+        """Per-engine launch flags that keep this browser from announcing itself.
 
         Playwright's Chromium advertises itself as automated: it sets
         ``--enable-automation``, which makes ``navigator.webdriver`` true.  Sites
         that read that flag can bounce an ordinary interactive login into a
         challenge loop -- the CAPTCHA is answered correctly and the login page
         just comes back, because what was rejected is the browser, not the
-        answer.  Turning the flag off lets the user's own manual sign-in behave
-        the way it does in their normal browser.
+        answer.
+
+        ``--enable-automation`` was never the only tell, though.  Playwright
+        starts Chromium with thirty-five flags a person's Chrome never carries,
+        and several are readable from the page one way or another.
+        :data:`TELLTALE_DEFAULT_ARGS` is the subset dropped and, just as
+        importantly, it is a subset: the rest are load bearing.
+
+        ``channel`` is not decided here -- see :meth:`_browser_channel`.
 
         Chromium-only: Firefox and WebKit reject these arguments.
         """
@@ -933,8 +980,29 @@ class MarketplaceMonitor:
             return {}
         return {
             "args": ["--disable-blink-features=AutomationControlled"],
-            "ignore_default_args": ["--enable-automation"],
+            "ignore_default_args": ["--enable-automation", *TELLTALE_DEFAULT_ARGS],
+            # The window is a window, not a fixed viewport.  A browser whose
+            # inner size never matches the screen it claims to be on is one more
+            # thing that does not add up.
+            "no_viewport": True,
         }
+
+    def _browser_channel(self: "MarketplaceMonitor", browser_name: str) -> str | None:
+        """Real Chrome when this machine has it, otherwise Playwright's Chromium.
+
+        Not the same browser, and the differences are all visible from a page:
+        Chromium ships without the proprietary codecs, without Widevine, with
+        different ``navigator.userAgentData`` brands and a different build
+        string.  None of that matters to the scraping and all of it is free
+        surface for whoever is deciding whether we are a person.
+
+        ``None`` -- Playwright's own build -- is a fallback and not a failure:
+        the container has no Chrome in it, and this must not be the reason it
+        stops starting.
+        """
+        if browser_name != "chromium":
+            return None
+        return "chrome" if chrome_is_installed() else None
 
     def _proxy_for_launch(self: "MarketplaceMonitor") -> Any:
         """The proxy to bind to the persistent profile, if one is configured.
@@ -981,30 +1049,68 @@ class MarketplaceMonitor:
             if self.logger:
                 self.logger.debug("Could not adjust the headless user agent", exc_info=True)
 
-    def _seed_profile_from_saved_sessions(
-        self: "MarketplaceMonitor", context: BrowserContext
+    def _seed_profile_sessions(
+        self: "MarketplaceMonitor",
+        context: BrowserContext,
+        lane: str | None,
+        first_run: bool,
     ) -> None:
-        """Carry cookie-only sessions from an older version into a new profile.
+        """Put the stored sessions this profile still owes into it, at launch.
 
-        Runs once, on a profile the browser has never written.  Without it,
-        upgrading to profile-based persistence would silently throw away a
-        working session and demand a fresh login.
+        Two jobs that used to be one, and the second one was missing.
+
+        *On a profile the browser has never written*, every stored session is
+        seeded.  That is the upgrade path from the versions that kept cookies
+        instead of a profile: without it, upgrading silently threw away a
+        working session and demanded a fresh login.
+
+        *On every launch, new profile or not*, any session the user **imported**
+        and that **this** profile has not taken is seeded as well.  A lane is a
+        second browser on a profile of its own, and an established profile was
+        never re-seeded from disk -- so an import that arrived while the lane's
+        browser was closed (which is most of the time: the monitor releases idle
+        browsers) reached the monitor's browser, was marked applied, and never
+        went anywhere near the browser that actually searches that platform.
+        That is what "importar la sesión de Lider/Sodimac no hace nada" was.
         """
         if self.config is None:
             return
         for marketplace_config in self.config.marketplace.values():
-            state = load_session(marketplace_config.name)
+            name = marketplace_config.name
+            imported = import_is_pending(name, lane)
+            if not first_run and not imported:
+                continue
+            state = load_session(name)
             if not state or not state.get("cookies"):
                 continue
             try:
                 context.add_cookies(state["cookies"])
-                if self.logger:
-                    self.logger.debug(
-                        f"Seeded new profile with the saved {marketplace_config.name} session"
-                    )
             except Exception:
                 if self.logger:
-                    self.logger.debug("Could not seed saved session", exc_info=True)
+                    self.logger.debug(
+                        f"Could not seed the {name} session into "
+                        f"{'the ' + lane + ' lane' if lane else 'the main profile'}",
+                        exc_info=True,
+                    )
+                continue
+            if imported:
+                # Recorded per profile, so this browser is not asked again and
+                # the others still are.
+                mark_import_applied(name, lane)
+            if self.logger:
+                self.logger.info(
+                    f"""{hilight("[Login]", "succ")} Loaded the """
+                    f"""{"imported " if imported else "saved "}{hilight(name)} session into """
+                    f"""the {lane + " lane's" if lane else "main"} browser profile """
+                    f"""({len(state["cookies"])} cookies).""",
+                    extra=aimm_event(
+                        "session_seeded",
+                        marketplace=name,
+                        lane=lane,
+                        imported=imported,
+                        cookies=len(state["cookies"]),
+                    ),
+                )
 
     def _launch_context(
         self: "MarketplaceMonitor",
@@ -1061,34 +1167,49 @@ class MarketplaceMonitor:
             try:
                 if self.logger:
                     self.logger.debug(f"Attempting to launch {browser_name} browser...")
+                channel = self._browser_channel(browser_name)
                 context = browser_type.launch_persistent_context(
                     user_data_dir,
                     headless=self.headless,
                     proxy=proxy,
+                    **({"channel": channel} if channel else {}),
                     **self._launch_options(browser_name),
                 )
-                # Chromium leaves navigator.webdriver defined even with the
-                # automation flag off; clear it before any page script runs.
-                try:
-                    context.add_init_script(
-                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                    )
-                except Exception:
-                    # Not supported on every engine; the launch flag already
-                    # covers the common case.
-                    pass
-                if self.headless:
+                if not PATCHES_CDP:
+                    # Chromium leaves navigator.webdriver defined even with the
+                    # automation flag off; clear it before any page script runs.
+                    #
+                    # Skipped under a driver that already handles it: the
+                    # override is then redundant, and an injected init script is
+                    # itself something a page can notice -- which is the whole
+                    # reason for using such a driver.
+                    try:
+                        context.add_init_script(
+                            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                        )
+                    except Exception:
+                        # Not supported on every engine; the launch flag already
+                        # covers the common case.
+                        pass
+                if self.headless and not PATCHES_CDP:
+                    # patchright asks callers not to set a user agent or extra
+                    # headers, and this does both.  A forged UA that disagrees
+                    # with the rest of the browser is worse than the marker it
+                    # hides.
                     self._hide_headless_marker(context)
-                if first_run:
-                    self._seed_profile_from_saved_sessions(context)
+                self._seed_profile_sessions(context, lane, first_run)
                 if self.logger:
                     self.logger.info(
-                        f"""{hilight("[Browser]", "info")} Successfully launched {browser_name} browser"""
+                        f"""{hilight("[Browser]", "info")} Successfully launched """
+                        f"""{"Google Chrome" if channel == "chrome" else browser_name} """
+                        f"""via {ENGINE_NAME}"""
                         f"""{f" for the {lane} lane" if lane else ""}"""
                         f""" ({"new" if first_run else "existing"} profile).""",
                         extra=aimm_event(
                             "browser_ready",
                             engine=browser_name,
+                            channel=channel or "bundled",
+                            driver=ENGINE_NAME,
                             new_profile=first_run,
                             lane=lane,
                         ),
@@ -1243,6 +1364,9 @@ class MarketplaceMonitor:
             marketplace = marketplace_class(
                 marketplace_config.name, context, self.keyboard_monitor, self.logger
             )
+            # Recovery runs on this lane's thread, which is where its searches
+            # run, so the lane can both close and open its own browser inline.
+            marketplace.renew_browser = lane.renew_context
             lane.marketplaces[marketplace_config.name] = marketplace
         elif marketplace.context is not context:
             # Only when the browser behind it has actually been replaced.
@@ -1287,6 +1411,32 @@ class MarketplaceMonitor:
             # imported session would otherwise never reach a browser that was
             # started after the import.
             self._seed_imported_sessions()
+        self._browsers_idle = False
+        return self.context
+
+    def _renew_main_browser(self: "MarketplaceMonitor") -> BrowserContext:
+        """Throw the monitor's own browser away, profile and all, and reopen it.
+
+        The counterpart of :meth:`BrowserLane.renew_context` for the platform
+        that runs on this thread.  Called from inside a search, which is the one
+        place it is safe: this thread owns the browser it is about to close.
+
+        Every marketplace on this browser is pointed at the new context, not
+        only the one that asked.  They share it, and leaving the others holding
+        a closed browser would turn one shop's recovery into the next platform's
+        failure.
+        """
+        if self.context is not None:
+            try:
+                self.context.close()
+            except Exception:
+                if self.logger:
+                    self.logger.debug("Could not close the browser being renewed", exc_info=True)
+            self.context = None
+        reset_profile(None)
+        self.context = self._launch_context()
+        for marketplace in self.active_marketplaces.values():
+            marketplace.set_context(self.context)
         self._browsers_idle = False
         return self.context
 
@@ -1373,12 +1523,17 @@ class MarketplaceMonitor:
         """
         for lane in list(self.lanes.values()):
             if not lane.alive:
-                # A lane that has not started yet seeds itself from the same
-                # stored file when its browser opens, so there is nothing to do
-                # and nowhere to do it.
+                # Nothing to do and no thread to do it on.  The lane takes the
+                # same session from disk when its browser opens -- see
+                # `_seed_profile_sessions`, which asks per profile, so a lane
+                # whose profile already exists is still owed it.
                 continue
             try:
-                lane.submit(lambda context: context.add_cookies(cookies))
+                lane.submit(
+                    lambda context, lane_name=lane.name: self._take_session(
+                        context, name, cookies, lane_name
+                    )
+                )
             except KeyboardInterrupt:
                 raise
             except Exception:
@@ -1387,6 +1542,21 @@ class MarketplaceMonitor:
                         f"Could not hand the {name} session to lane {lane.name!r}",
                         exc_info=True,
                     )
+
+    @staticmethod
+    def _take_session(
+        context: BrowserContext, name: str, cookies: List[Dict[str, Any]], lane: str | None
+    ) -> None:
+        """Add the cookies and record that this profile now has them.
+
+        Runs on the lane's own thread, which is the only one allowed to touch
+        that browser.  The record is written here rather than by the caller
+        because the caller does not wait for the answer: marking it applied
+        before the lane had taken it would leave the lane owed a session that
+        nothing would ever offer it again.
+        """
+        context.add_cookies(cookies)
+        mark_import_applied(name, lane)
 
     def _load_session_into_browser(self: "MarketplaceMonitor", name: str) -> bool:
         """Put an imported session into every live browser.  False if it did not.
@@ -1416,7 +1586,8 @@ class MarketplaceMonitor:
                 )
             return False
 
-        mark_import_applied(name)
+        # The monitor's own profile, and only it: every lane records its own.
+        mark_import_applied(name, None)
         control.clear_marketplace_block(name)
         if self.logger:
             self.logger.info(
@@ -1434,7 +1605,17 @@ class MarketplaceMonitor:
         silently fails to log in is indistinguishable from one that worked until
         the next search quietly comes back empty, which is a terrible way to
         find out.  Marketplaces that cannot answer the question keep quiet.
+
+        **Asked of the browser that will do the searching**, which is not always
+        this one.  A platform bound to a lane is searched by the lane's browser
+        on the lane's profile, and checking the monitor's browser instead
+        answered a question nobody asked: the reassuring "Sodimac is serving its
+        pages" in the log was about a profile that never visits Sodimac.
         """
+        lane_name = self._browser_of.get(name)
+        if lane_name:
+            self._check_session_on_lane(name, lane_name)
+            return
         marketplace = self.active_marketplaces.get(name)
         if marketplace is None:
             return
@@ -1454,25 +1635,82 @@ class MarketplaceMonitor:
             raise
         except Exception:
             return
+        self._report_signed_in(name, signed_in, lane=None)
+
+    def _report_signed_in(
+        self: "MarketplaceMonitor", name: str, signed_in: bool, lane: str | None
+    ) -> None:
+        """Say what a marketplace made of the cookies, and in which browser."""
         if not self.logger:
             return
+        where = f""" (navegador de {lane})""" if lane else ""
         if signed_in:
             self.logger.info(
                 f"""{hilight("[Login]", "succ")} {hilight(name)} accepts the imported """
-                """session — signed in.""",
-                extra=aimm_event("session_checked", marketplace=name, signed_in=True),
+                f"""session — signed in{where}.""",
+                extra=aimm_event(
+                    "session_checked", marketplace=name, signed_in=True, lane=lane
+                ),
             )
         else:
             self.logger.error(
                 f"""{hilight("[Login]", "fail")} {hilight(name)} does not recognise the """
-                """imported session. The cookies were probably copied from a different """
-                """country's site, or they have expired — export them again from the site """
-                """the monitor searches, while signed in there.""",
-                extra=aimm_event("session_checked", marketplace=name, signed_in=False),
+                f"""imported session{where}. The cookies were probably copied from a """
+                """different country's site, or they have expired — export them again from """
+                """the site the monitor searches, while signed in there.""",
+                extra=aimm_event(
+                    "session_checked", marketplace=name, signed_in=False, lane=lane
+                ),
             )
 
-    def _report_shop_session(self: "MarketplaceMonitor", name: str, health: Any) -> None:
-        """Say what the shop did with the cookies that were just loaded."""
+    def _check_session_on_lane(self: "MarketplaceMonitor", name: str, lane_name: str) -> None:
+        """Run the check on the lane that owns this platform's browser.
+
+        Submitted rather than waited on.  The lane may be an hour into a pass,
+        and blocking the monitor thread until it comes up for air would stall
+        every other platform to print one log line.  The lane logs the answer
+        itself, which is also the honest place for it: it is the browser the
+        sentence is about.
+        """
+        lane = self.lanes.get(lane_name)
+        if lane is None or not lane.alive or self.config is None:
+            # No browser yet is not a bad answer, it is no answer.  The lane
+            # takes the session from disk when it opens (`_seed_profile_sessions`)
+            # and the next search reports what the shop does with it.
+            return
+        marketplace_config = self.config.marketplace.get(name)
+        if marketplace_config is None:
+            return
+
+        def check(context: BrowserContext) -> None:
+            marketplace = self._lane_marketplace(lane, context, marketplace_config)
+            health = getattr(marketplace, "session_health", None)
+            if health is not None:
+                self._report_shop_session(name, health, lane=lane_name)
+                return
+            probe = getattr(marketplace, "is_signed_in", None)
+            if probe is not None:
+                self._report_signed_in(name, bool(probe()), lane=lane_name)
+
+        try:
+            lane.submit(check)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            if self.logger:
+                self.logger.debug(
+                    f"Could not check the {name} session on lane {lane_name!r}", exc_info=True
+                )
+
+    def _report_shop_session(
+        self: "MarketplaceMonitor", name: str, health: Any, lane: str | None = None
+    ) -> None:
+        """Say what the shop did with the cookies that were just loaded.
+
+        ``lane`` names the browser that answered, because with several profiles
+        open "Sodimac is serving its pages" is only useful if you know which one
+        it served.
+        """
         try:
             answer = health()
         except KeyboardInterrupt:
@@ -1484,15 +1722,20 @@ class MarketplaceMonitor:
             # reported as a bad one.
             return
         served, sentence = answer
+        where = f""" (navegador de {lane})""" if lane else ""
         if served:
             self.logger.info(
-                f"""{hilight("[Login]", "succ")} {sentence}""",
-                extra=aimm_event("session_checked", marketplace=name, signed_in=True),
+                f"""{hilight("[Login]", "succ")} {sentence}{where}""",
+                extra=aimm_event(
+                    "session_checked", marketplace=name, signed_in=True, lane=lane
+                ),
             )
         else:
             self.logger.error(
-                f"""{hilight("[Login]", "fail")} {sentence}""",
-                extra=aimm_event("session_checked", marketplace=name, signed_in=False),
+                f"""{hilight("[Login]", "fail")} {sentence}{where}""",
+                extra=aimm_event(
+                    "session_checked", marketplace=name, signed_in=False, lane=lane
+                ),
             )
 
     def _seed_imported_sessions(self: "MarketplaceMonitor") -> None:
@@ -1504,8 +1747,13 @@ class MarketplaceMonitor:
         """
         if self.config is None or self.context is None:
             return
+        live = [None, *(lane.name for lane in self.lanes.values() if lane.alive)]
         for name in self.config.marketplace:
-            if import_is_pending(name):
+            # Asked of every browser that is up, not only the monitor's: a lane
+            # that started after the import was taken by the main profile is
+            # still owed it, and it is the browser that does that platform's
+            # searching.
+            if any(import_is_pending(name, lane) for lane in live):
                 self._load_session_into_browser(name)
 
     def _apply_pending_sessions(self: "MarketplaceMonitor") -> None:
@@ -1617,6 +1865,27 @@ class MarketplaceMonitor:
                             f"Could not tell {user!r} about the {name} cooldown",
                             exc_info=True,
                         )
+
+    def _skip_blocked(self: "MarketplaceMonitor", name: str) -> bool:
+        """Whether this platform is on a cooldown, said once where it happens.
+
+        Read before a browser is opened rather than inside the search, so a
+        platform being left alone costs nothing at all -- not a window, not a
+        Chromium process, not a tab at about:blank.
+        """
+        if not name or not control.marketplace_blocked(name):
+            return False
+        if self.logger:
+            block = control.marketplace_block(name) or {}
+            self.logger.info(
+                f"""{hilight("[Search]", "info")} Not opening a browser for """
+                f"""{hilight(name)}: it {block.get("reason") or "refused us"} and is """
+                f"""being left alone for another """
+                f"""{int(block.get("seconds_left", 0) // 60)} minutes. """
+                """Press "ejecutar ahora" to try it before then.""",
+                extra=aimm_event("search_skipped", marketplace=name),
+            )
+        return True
 
     def _run_job(self: "MarketplaceMonitor", job: schedule.Job) -> JobOutcome:
         """Run one scheduled search and say how it ended."""
@@ -2317,6 +2586,18 @@ class MarketplaceMonitor:
             if self._skip_stopped(pair[0], pair[1]):
                 # Told to stop before its turn came.  It counts as having run,
                 # so the queue moves past it rather than offering it again.
+                self._mark_ran({pair})
+                self._publish_schedule()
+                continue
+
+            if self._skip_blocked(name):
+                # Before the browser, not after it.  The parallel path has asked
+                # this for a while; this one opened Chromium and found out
+                # inside `Marketplace.search` that the platform was on a
+                # cooldown -- so a skipped search still cost a window, which sat
+                # at about:blank until the idle release closed it again.  That
+                # window is the whole of "se abre una página about:blank y luego
+                # se cierra".
                 self._mark_ran({pair})
                 self._publish_schedule()
                 continue
@@ -3856,6 +4137,7 @@ class MarketplaceMonitor:
                 marketplace = marketplace_class(
                     marketplace_config.name, self.context, self.keyboard_monitor, self.logger
                 )
+                marketplace.renew_browser = self._renew_main_browser
                 self.active_marketplaces[marketplace_config.name] = marketplace
 
             # Configure might have been changed

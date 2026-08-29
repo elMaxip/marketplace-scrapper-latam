@@ -55,9 +55,12 @@ import threading
 from logging import Logger
 from typing import Any, Callable, Dict, Optional
 
-from playwright.sync_api import BrowserContext, Playwright, sync_playwright
+from playwright.sync_api import BrowserContext, Playwright  # type: ignore
+
+from .browser_engine import sync_playwright
 
 from .marketplace import Marketplace
+from .session import reset_profile
 
 
 def context_is_alive(context: BrowserContext | None) -> bool:
@@ -151,6 +154,11 @@ class BrowserLane:
         self._queue: "queue.Queue[Optional[_Task]]" = queue.Queue()
         self._thread: threading.Thread | None = None
         self._context: BrowserContext | None = None
+        #: This lane's own Playwright, kept so work running on the lane can ask
+        #: for a new browser mid-task (:meth:`renew_context`).  Set and cleared
+        #: on the lane's thread, and touched only from there -- which is where
+        #: every task runs, so a task may read it safely.
+        self._playwright: Playwright | None = None
         self._ready = threading.Event()
         self._failure: BaseException | None = None
         self._lock = threading.Lock()
@@ -172,6 +180,7 @@ class BrowserLane:
         playwright: Playwright | None = None
         try:
             playwright = sync_playwright().start()
+            self._playwright = playwright
             self._context = self._launch(playwright, self.name)
         except BaseException as error:  # noqa: BLE001 - reported to the caller
             self._failure = error
@@ -244,6 +253,43 @@ class BrowserLane:
         self._context = self._launch(playwright, self.name)
         return self._context
 
+    def renew_context(self: "BrowserLane") -> BrowserContext:
+        """Throw this lane's browser away, profile and all, and open another.
+
+        For the recovery after a shop refuses us: a profile carrying an identity
+        the site has decided against is worth less than no profile at all, and a
+        new one is reseeded from ``sessions/`` on launch, so it arrives with the
+        account and nothing the wall recognises.
+
+        **Only callable from the lane's own thread**, which is where tasks run
+        -- the browser and the Playwright behind it belong to it, and this both
+        closes and opens one.  The marketplaces are dropped for the same reason
+        :meth:`_live_context` drops them: they hold pages on a browser that is
+        about to stop existing.
+        """
+        if self._playwright is None:
+            raise RuntimeError(f"Lane {self.name!r} has no Playwright to open a browser with")
+        for marketplace in list(self.marketplaces.values()):
+            try:
+                marketplace.stop()
+            except Exception:
+                pass
+        self.marketplaces.clear()
+        if self._context is not None:
+            try:
+                self._context.close()
+            except Exception:
+                if self.logger:
+                    self.logger.debug(
+                        f"Could not close the browser for lane {self.name!r}", exc_info=True
+                    )
+            self._context = None
+        # The profile goes with it, which is the whole point; a launch that
+        # reuses the directory would bring the flagged identity straight back.
+        reset_profile(self.name)
+        self._context = self._launch(self._playwright, self.name)
+        return self._context
+
     def _fail_pending(self: "BrowserLane", error: BaseException) -> None:
         while True:
             try:
@@ -277,6 +323,7 @@ class BrowserLane:
                 if self.logger:
                     self.logger.debug(f"Could not close lane {self.name!r}", exc_info=True)
             self._context = None
+        self._playwright = None
         if playwright is not None:
             try:
                 playwright.stop()

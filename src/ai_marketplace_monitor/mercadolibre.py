@@ -42,6 +42,7 @@ from .utils import (
     extract_price,
     fold_text,
     hilight,
+    human_delay,
     is_substring,
 )
 
@@ -321,6 +322,15 @@ class MercadoLibreItemConfig(ItemConfig, MercadoLibreItemCommonConfig):
 
 class MercadoLibreMarketplace(Marketplace):
     name = "mercadolibre"
+
+    #: Deliberately empty, and that is an answer rather than an omission.
+    #:
+    #: Mercado Libre's wall is its own -- there is no PerimeterX, Cloudflare or
+    #: DataDome in this jar -- and it hands out no clearance token, so there is
+    #: no third-party identity to burn and nothing here to throw away.  The
+    #: cookies that look device-ish (`_d2id`, `_csrf`) are the site's own and go
+    #: with the session.  See :attr:`Marketplace.challenge_cookies`.
+    challenge_cookies: Tuple[str, ...] = ()
 
     #: The site searched when the config does not say.
     DEFAULT_SITE = "MLC"
@@ -930,8 +940,10 @@ class MercadoLibreMarketplace(Marketplace):
 
                     if not from_cache:
                         # Space out item-page requests, as the Facebook
-                        # scraper does between listings.
-                        time.sleep(2)
+                        # scraper does between listings -- and unevenly, because
+                        # an exact interval is itself something a bot check
+                        # scores.  See `utils.human_delay`.
+                        human_delay(2)
 
                     matched = self.check_listing(details, item_config)
                     # Log the sighting whichever way the filters went: the

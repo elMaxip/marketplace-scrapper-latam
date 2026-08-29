@@ -663,6 +663,103 @@ class MonitorConfig(BaseConfig):
         return res
 
 
+# --------------------------------------------------------------------------- #
+# Pacing
+# --------------------------------------------------------------------------- #
+#
+# Why this is one function and not a `time.sleep` at each call site.
+#
+# The scrapers already paced themselves -- `SECONDS_BETWEEN_PRODUCTS = 2` and
+# friends -- and the pacing was the problem rather than the fix.  Two seconds,
+# exactly, forty-eight times in a row is not a slow visitor: it is a metronome,
+# and a metronome is the easiest thing in the world for a bot check to score.
+# Lider's product pages are refused in exactly that pattern while its results
+# grid, asked for once, is served.
+#
+# So the spacing keeps its average and loses its regularity.  One place to
+# change it, one switch to turn it off, and no scraper that has to know any of
+# this.
+
+#: Whether the spacing is varied at all.  ``AIMM_HUMAN_PACING=0`` turns it off
+#: and every delay becomes exactly its nominal length again -- which is what a
+#: test wants, and what somebody comparing timings before and after wants.
+HUMAN_PACING = os.environ.get("AIMM_HUMAN_PACING", "1").strip().lower() not in (
+    "0",
+    "n",
+    "no",
+    "false",
+    "off",
+)
+
+#: The spread of one delay, as a fraction of its nominal length.
+HUMAN_SPREAD = 0.3
+
+#: How far a delay may stray, as a multiple of its nominal length.
+#:
+#: Symmetric on purpose, and that is the whole reason the change is free.  With
+#: a spread of 0.3 these are the two-sigma points, so clipping takes as much off
+#: the long tail as off the short one and the **mean is unchanged**: a pass that
+#: opened forty-eight pages two seconds apart still takes ninety-six seconds of
+#: waiting, spent in different-sized pieces.  Widen one bound without the other
+#: and the pacing quietly becomes a slowdown.
+HUMAN_BOUNDS: Tuple[float, float] = (0.4, 1.6)
+
+
+def human_interval(seconds: float) -> float:
+    """How long to wait, this time, in place of exactly ``seconds``.
+
+    Gaussian around the nominal value, clipped symmetrically.  Deliberately not
+    the log-normal that real inter-action times follow: the realistic shape is
+    right-skewed, and its long tail is paid for in throughput on every pass for
+    a benefit nobody has measured.  The regularity is what is being removed
+    here, not the average.
+
+    Separate from :func:`human_delay` so the number can be tested without a
+    test that sleeps.
+    """
+    if seconds <= 0:
+        return 0.0
+    if not HUMAN_PACING:
+        return float(seconds)
+    low, high = HUMAN_BOUNDS
+    return min(max(random.gauss(seconds, seconds * HUMAN_SPREAD), seconds * low), seconds * high)
+
+
+def human_delay(seconds: float) -> float:
+    """Wait about ``seconds``, and never exactly.  Returns what it waited."""
+    waited = human_interval(seconds)
+    if waited > 0:
+        time.sleep(waited)
+    return waited
+
+
+def human_scroll(page: Any, logger: Logger | None = None) -> bool:
+    """Move down the page a little, the way somebody reading it would.
+
+    Not for the scraping: both shops publish the whole payload in
+    ``__NEXT_DATA__`` before anything is scrolled, so this changes nothing about
+    what can be read.  It is here because a results page that is opened, parsed
+    and abandoned without the viewport ever moving is a visitor with no
+    behaviour at all, and behaviour is half of what the bot checks on both
+    shops score.
+
+    Best effort in the strongest sense: a page that will not scroll is not a
+    reason to fail a search that has already got its results.
+    """
+    if not HUMAN_PACING:
+        return False
+    try:
+        page.mouse.wheel(0, random.randint(300, 900))
+        human_delay(0.4)
+        return True
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        if logger is not None:
+            logger.debug("Could not scroll the page", exc_info=True)
+        return False
+
+
 def fold_text(text: str) -> str:
     """Lowercase, strip accents and collapse whitespace, for marker matching.
 

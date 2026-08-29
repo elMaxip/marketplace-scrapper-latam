@@ -228,6 +228,10 @@ def sodimac_search() -> Dict[str, Any]:
     return {
         "props": {
             "pageProps": {
+                # Where the redirect actually put us.  The only thing that knows
+                # it: the address asked for carried `?Ntt=taladro` and the
+                # redirect kept none of the query string.
+                "canonicalUrl": "/sodimac-cl/lista/cat14080023/Taladros",
                 "pagination": {
                     "count": 546,
                     "perPage": 48,
@@ -642,6 +646,46 @@ def test_sodimac_asks_for_the_page_it_wants() -> None:
     item = sodimac.SodimacItemConfig(name="t", search_phrases=["taladro"])
     assert market.search_url("taladro", item, 1).endswith("search?Ntt=taladro")
     assert market.search_url("taladro", item, 2).endswith("&currentpage=2")
+
+
+def test_sodimac_pages_the_category_route_by_its_own_address() -> None:
+    # The one that cost eleven pages out of twelve.  `?Ntt=taladro&currentpage=2`
+    # never reached the category route at all -- the redirect drops the query
+    # string -- so page two has to be asked for at the address page one landed
+    # on, with the parameter *that* route understands.
+    market = _sodimac_market()
+    item = sodimac.SodimacItemConfig(name="t", search_phrases=["taladro"])
+    assert market.next_page_url(sodimac_search(), "taladro", item, 2) == (
+        "https://www.sodimac.cl/sodimac-cl/lista/cat14080023/Taladros?page=2"
+    )
+
+
+def test_sodimac_leaves_the_search_route_on_its_own_parameter() -> None:
+    # It publishes no canonical `/lista` address and needs none: it keeps what
+    # it was asked with.  Appending `?page` here would page nothing.
+    market = _sodimac_market()
+    item = sodimac.SodimacItemConfig(name="t", search_phrases=["cocina a gas licuado"])
+    url = market.next_page_url(sodimac_search_route(), "cocina a gas licuado", item, 2)
+    assert url.endswith("&currentpage=2")
+    assert "page=2" in url and "?page=2" not in url
+
+
+def test_sodimac_counts_pages_by_perpage_and_not_by_totalperpage() -> None:
+    # 546 at 48 is 12 pages.  At `totalPerPage` (56, the count with the
+    # sponsored cards) it would be 10, and the search would stop two pages from
+    # the end believing the shop had said so.
+    assert sodimac.SodimacMarketplace.total_pages(_sodimac_market(), sodimac_search()) == 12
+    assert (
+        sodimac.SodimacMarketplace.total_pages(_sodimac_market(), sodimac_search_route()) == 5
+    )
+
+
+def test_sodimac_says_nothing_about_pages_when_the_shop_did_not() -> None:
+    # Back to the old answer whenever a number is missing: a guessed divisor
+    # ends a search early, and that looks exactly like a catalogue that ended.
+    market = _sodimac_market()
+    assert market.total_pages({"props": {"pageProps": {"pagination": {"count": 42}}}}) is None
+    assert market.total_pages({"props": {"pageProps": {}}}) is None
 
 
 def test_sodimac_recognises_its_own_urls() -> None:
