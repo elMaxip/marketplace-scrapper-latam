@@ -358,3 +358,15 @@ def test_split_price_leaves_an_ordinary_price_alone() -> None:
     assert split_price("450 000") == ("450 000", None)
     assert split_price(None) == (None, None)
     assert split_price("**unspecified**") == (None, None)
+
+
+def test_the_item_a_card_names_can_be_overridden() -> None:
+    """A tracker in a group is known by the group's name, not by the slug the
+    scraper stamped on its listing -- see ``MarketplaceMonitor._item_label``."""
+    card = build_card(listing(), item_label="Sabanas")
+    assert card.template_values()["item"] == "Sabanas"
+
+
+def test_without_an_override_the_card_keeps_the_name_on_the_listing() -> None:
+    card = build_card(listing())
+    assert card.template_values()["item"] == listing().name

@@ -269,3 +269,63 @@ def test_a_browser_is_asked_for_only_when_there_is_something_to_read(
     monitor._ingest_trackers()
 
     assert started == []
+
+
+# --------------------------------------------------------------------------- #
+# Cómo se llama un seguimiento en el aviso
+# --------------------------------------------------------------------------- #
+#
+# `{item}` in a user's template used to be the name the scraper stamped on the
+# listing, which for a tracker is the slug the web interface made up out of the
+# page title -- "juego-de-sabanas-menta-lisas-1-plaza-tex".  The name the user
+# actually chose is the group they put it in, and that is the name a message
+# about it should carry.
+
+
+GROUPED = """
+[marketplace.facebook]
+search_city = "santiago"
+
+[user.ana]
+pushbullet_token = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+[item.ps5]
+search_phrases = "playstation 5"
+
+[track.sabana-negra-144-hilos]
+url = "https://t.cl/p/negra"
+group = "Sabanas"
+
+[track.sabana-menta-1-plaza]
+url = "https://t.cl/p/menta"
+group = "Sabanas"
+
+[track.notebook-x14]
+url = "https://t.cl/p/notebook"
+"""
+
+
+def label_of(monitor: MarketplaceMonitor, marketplace: str, name: str) -> str | None:
+    assert monitor.config is not None
+    return monitor._item_label(monitor.config.items[(marketplace, name)])
+
+
+def test_a_grouped_tracker_is_called_by_its_group(tmp_path: pathlib.Path) -> None:
+    monitor = build(tmp_path, GROUPED)
+    assert label_of(monitor, TRACKED, "sabana-negra-144-hilos") == "Sabanas"
+    assert label_of(monitor, TRACKED, "sabana-menta-1-plaza") == "Sabanas"
+
+
+def test_a_tracker_in_no_group_has_nothing_to_add(tmp_path: pathlib.Path) -> None:
+    """None, not its name: its name is already stamped on its listing, and the
+    card falls back to that."""
+    monitor = build(tmp_path, GROUPED)
+    assert label_of(monitor, TRACKED, "notebook-x14") is None
+
+
+def test_a_search_is_left_alone(tmp_path: pathlib.Path) -> None:
+    """The change must not reach the searches, and the way it does not is that
+    a search is never in the map -- so every message the search flow sends is
+    built exactly as it was."""
+    monitor = build(tmp_path, GROUPED)
+    assert label_of(monitor, "facebook", "ps5") is None

@@ -145,6 +145,10 @@ def _monitor(notify_immediately: bool, users: dict):
     config.monitor.notify_immediately = notify_immediately
     config.monitor.max_description_words = None
     config.user = users
+    # Every real config has one, and `_notify` reads it to work out what
+    # ``{item}`` should say -- a group, for a tracker that is in one.  Empty
+    # here because none of these scenarios has a tracker in it.
+    config.items = {}
     instance.config = config
     return instance
 

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from logging import Logger
-from typing import Any, List, Tuple, Type
+from typing import Any, List, Sequence, Tuple, Type
 
 from diskcache import Cache  # type: ignore
 
@@ -229,6 +229,8 @@ class User:
         description_words: int | None = None,
         reasons: NotifyReasons | None = None,
         forced_status: NotificationStatus | None = None,
+        item_label: str | None = None,
+        previous_prices: Sequence[str | None] | None = None,
     ) -> None:
         """Tell this user about these listings, once, through every channel.
 
@@ -250,6 +252,17 @@ class User:
         exists for the one notification that cannot be worked out from a
         listing's own history: see
         :attr:`~ai_marketplace_monitor.notification.NotificationStatus.TOP_LISTING`.
+
+        ``item_label`` is what ``{item}`` should say when it is not the name the
+        scraper stamped on the listing -- the group a tracker belongs to, which
+        is the name the user gave the thing they are watching.
+
+        ``previous_prices`` runs alongside ``listings`` and is only consulted
+        for a listing this user has never been told about: there is no "what you
+        were last told" to compare against, so a caller that knows what the
+        price was a moment ago -- the review, which just watched it fall -- hands
+        it over rather than letting the message say a listing got cheaper
+        without saying cheaper than what.
         """
         if self.config.enabled is False:
             if self.logger:
@@ -262,6 +275,8 @@ class User:
             if forced_status is not None
             else [self.notification_status(listing, local_cache) for listing in listings]
         )
+        fallbacks: List[str | None] = list(previous_prices or [])
+        fallbacks += [None] * (len(listings) - len(fallbacks))
         allowed = reasons or NotifyReasons()
         if not all(allowed.allows(entry) for entry in statuses):
             keep = [index for index, entry in enumerate(statuses) if allowed.allows(entry)]
@@ -275,18 +290,20 @@ class User:
             listings = [listings[index] for index in keep]
             ratings = [ratings[index] for index in keep]
             statuses = [statuses[index] for index in keep]
+            fallbacks = [fallbacks[index] for index in keep]
         cards = []
-        for listing, rating, status in zip(listings, ratings, statuses):
+        for listing, rating, status, fallback in zip(listings, ratings, statuses, fallbacks):
             when, price = self.last_notification(listing, local_cache)
             cards.append(
                 build_card(
                     listing,
                     rating,
                     status,
-                    previous_price=price,
+                    previous_price=price or fallback,
                     notified_at=when,
                     language=language,
                     marketplace_label=marketplace_label,
+                    item_label=item_label,
                 )
             )
 

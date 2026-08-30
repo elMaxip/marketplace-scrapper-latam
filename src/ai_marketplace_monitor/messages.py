@@ -734,6 +734,7 @@ def build_card(
     description: str = "",
     marketplace_label: str | None = None,
     description_words: int | None = None,
+    item_label: str | None = None,
 ) -> ListingCard:
     """Turn one listing (and what we know about it) into a card.
 
@@ -784,7 +785,15 @@ def build_card(
         # Neither is on the built-in card: the search's name is something the
         # reader already knows and the seller is a line that almost never helps
         # on a phone.  A template the user wrote is allowed to want both.
-        item=_clean(getattr(listing, "name", None)),
+        #
+        # ``item_label`` wins over the name stamped on the listing because the
+        # two answer different questions.  The stamp says which item the scraper
+        # filed this under, and for a tracker that is the tracker's own name --
+        # a slug the user never chose to read.  What they named is the group the
+        # tracker is in, and that is what a message about it should say.  A
+        # caller with nothing better to offer passes nothing and the stamp
+        # stands, which is every search.
+        item=_clean(item_label) or _clean(getattr(listing, "name", None)),
         seller=_clean(listing.seller),
         stock=_clean(getattr(listing, "stock", None)),
         availability=_clean(getattr(listing, "availability", None)),

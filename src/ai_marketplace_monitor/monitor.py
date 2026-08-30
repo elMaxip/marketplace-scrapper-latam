@@ -3486,6 +3486,25 @@ class MarketplaceMonitor:
                 scopes[item_name] = str(group)
         return scopes
 
+    def _item_label(self: "MarketplaceMonitor", item_config: TItemConfig) -> str | None:
+        """What ``{item}`` should say, or None to keep the name on the listing.
+
+        The same fact :meth:`_top_scopes` is built out of, asked for a different
+        purpose, and deliberately not a second mapping: a tracker in a group
+        competes under the group's name *because* that is the name of the thing
+        the user is watching, and a message that called it
+        ``juego-de-sabanas-menta-lisas-1-plaza-tex`` instead would be naming the
+        slug the web interface made up rather than the name they chose.
+
+        None for everything else, which is a search and an ungrouped tracker:
+        both are already stamped on their listings under the only name they
+        have, so there is nothing to say here and nothing to get wrong.
+        """
+        name = getattr(item_config, "name", None)
+        if not name:
+            return None
+        return self._top_scopes().get(str(name))
+
     def _announce_top_listing(
         self: "MarketplaceMonitor",
         users: List[str],
@@ -3728,10 +3747,24 @@ class MarketplaceMonitor:
         snapshot, and what makes a message worth sending is the fall against
         *the price this user was last told*.  Two users with different
         ``remind`` intervals honestly have different answers, and a user who was
-        never told about the listing at all gets nothing -- announcing it now as
-        a bargain would mean a message about a listing they have never heard of,
-        and, on the first round after this existed, one about every such listing
-        in the store.
+        told at a price the listing is still above hears nothing.
+
+        A user who was never told about the listing at all is the exception, and
+        it used to be a silence.  The reasoning was that announcing a fall on a
+        listing they have never heard of is a message about a stranger -- true
+        as far as it goes, and it made ``notify_price_drop`` depend on
+        ``notify_new`` having been on at the time.  Switch new listings off,
+        which is exactly what somebody who only wants to hear about falls does,
+        and nothing is ever written to that user's cache, so no fall ever
+        reaches the test above and the switch they turned *on* does nothing.
+        It is worse for a tracker, where "never heard of it" is false by
+        construction: they pasted the address themselves.
+
+        So a listing with no cache entry falls back to the store's own answer --
+        the price it held before this very re-check, which the refresher hands
+        over in :class:`~ai_marketplace_monitor.refresh.PriceDrop`.  That cannot
+        turn into a flood: ``report.drops`` holds only listings that got cheaper
+        *in this slice*, never the backlog.
         """
         if self.config is None or report is None or not report.drops:
             return
@@ -3757,7 +3790,12 @@ class MarketplaceMonitor:
                 for user in users
                 if user in self.config.user
                 and User(self.config.user[user], self.logger).notification_status(listing)
-                is NotificationStatus.LISTING_DISCOUNTED
+                in (
+                    NotificationStatus.LISTING_DISCOUNTED,
+                    # Never told about this listing, so there is no price of
+                    # theirs to be cheaper than; the store's own fall stands in.
+                    NotificationStatus.NOT_NOTIFIED,
+                )
             ]
             if not told:
                 continue
@@ -3780,14 +3818,21 @@ class MarketplaceMonitor:
                         url=listing.post_url,
                     ),
                 )
-            # No `forced_status`: the reason is worked out from this user's own
-            # cache entry, exactly as it is for a listing a search found, and
-            # the filter above has already established what that answer is.
+            # Forced, because the filter above has already established the
+            # reason and one of the two answers it accepts does not survive the
+            # round trip: a user with no cache entry reads back as NOT_NOTIFIED,
+            # whose reason is "new" -- and a monitor with `notify_new` off would
+            # drop the very message this exists to send.
             self._notify(
                 told,
                 [listing],
                 [rating],
                 item_config,
+                forced_status=NotificationStatus.LISTING_DISCOUNTED,
+                # What it cost before this re-check, for whoever has no price of
+                # their own on file: without it the message says a listing got
+                # cheaper without saying cheaper than what.
+                previous_prices=[drop.previous],
                 language=getattr(item_config, "language", None)
                 or getattr(marketplace_config, "language", None),
                 label=(
@@ -3913,8 +3958,9 @@ class MarketplaceMonitor:
         ``scope`` is what the record is filed under and what the message names:
         the search, or the group of trackers this one belongs to.  The listing
         handed over is still the individual page that won -- a group decides who
-        competes, never what is sent -- so the card, the link and the ``{item}``
-        of a user's own template all still name the tracker.
+        competes, never what is sent -- so the card and the link name the page,
+        while ``{item}`` names the group, exactly as it does in every other
+        message about a grouped tracker (see :meth:`_item_label`).
         """
         listing = top.as_listing()
         if listing is None or self.config is None:
@@ -3996,6 +4042,7 @@ class MarketplaceMonitor:
         label: str | None,
         immediate: bool,
         forced_status: NotificationStatus | None = None,
+        previous_prices: List[str | None] | None = None,
     ) -> None:
         """Hand a notification to the sender, and do not wait for it.
 
@@ -4014,6 +4061,7 @@ class MarketplaceMonitor:
         assert self.config is not None
         words = self._description_words()
         reasons = self._notify_reasons()
+        item_label = self._item_label(item_config)
         configs = [self.config.user[user] for user in users if user in self.config.user]
         if not configs:
             return
@@ -4029,6 +4077,8 @@ class MarketplaceMonitor:
                     description_words=words,
                     reasons=reasons,
                     forced_status=forced_status,
+                    item_label=item_label,
+                    previous_prices=previous_prices,
                 )
 
         if not self.notifier.submit(send):

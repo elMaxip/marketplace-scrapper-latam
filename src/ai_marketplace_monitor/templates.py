@@ -80,7 +80,11 @@ VARIABLES: Tuple[Tuple[str, str], ...] = (
     ("stock", "Cuántas unidades dice la tienda que quedan, cuando lo publica"),
     ("availability", "“in_stock” o “out_of_stock”, cuando la plataforma lo dice"),
     ("marketplace", "La plataforma: “Facebook Marketplace”, “Mercado Libre”…"),
-    ("item", "El nombre de la búsqueda que la encontró"),
+    (
+        "item",
+        "El nombre de la búsqueda que la encontró; en un seguimiento, "
+        "el grupo al que pertenece, o su propio nombre si no está en ninguno",
+    ),
     ("seller", "Quien vende, si la plataforma lo muestra"),
     ("rating", "El puntaje de la IA, de 1 a 5"),
     ("verdict", "El veredicto de la IA en una palabra"),

@@ -31,6 +31,11 @@ from ai_marketplace_monitor.observations import record_observation, reset_index_
 from ai_marketplace_monitor.refresh import PriceDrop, RefreshReport
 from ai_marketplace_monitor.user import User
 
+NEW_LISTINGS_OFF = """
+[monitor]
+notify_new = false
+"""
+
 CONFIG = """
 [marketplace.facebook]
 search_city = "santiago"
@@ -85,9 +90,13 @@ class Recorder:
 
     def __init__(self) -> None:
         self.calls: List[Tuple[List[str], str, str]] = []
+        #: The keyword arguments of each call, for the tests that are about how
+        #: the message is built rather than about who receives it.
+        self.kwargs: List[dict] = []
 
     def __call__(self, users, listings, ratings, item_config, **kwargs: Any) -> None:
         self.calls.append((list(users), listings[0].id, listings[0].price))
+        self.kwargs.append(kwargs)
 
 
 def build(
@@ -151,17 +160,59 @@ def test_a_fall_is_announced_to_the_users_who_were_told(
     assert recorder.calls == [(["ana", "beto"], "1", "$80 000")]
 
 
-def test_a_user_who_was_never_told_hears_nothing(
+def test_a_user_who_was_never_told_still_hears_the_fall(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, store: Cache
 ) -> None:
-    """Otherwise the first round after this existed would announce, as a
-    bargain, every listing in the store the user has never heard of."""
+    """This used to be a silence, and the silence was the bug.
+
+    With nobody's price on file there is no per-user answer, so the store's own
+    is used: the price this listing held before this very re-check.  Beto has
+    never been told about it and is told now, because a fall is a fall.  It
+    cannot become a flood -- ``report.drops`` holds only what got cheaper in
+    this slice, never the backlog.
+    """
     monitor, recorder = build(tmp_path, monkeypatch)
     told(store, "ana", monitor, "$100 000")
 
     monitor._announce_price_drops(report_of("$100 000", "$80 000"))
 
-    assert recorder.calls == [(["ana"], "1", "$80 000")]
+    assert recorder.calls == [(["ana", "beto"], "1", "$80 000")]
+
+
+def test_switching_new_listings_off_does_not_switch_price_drops_off(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, store: Cache
+) -> None:
+    """The three reasons are three switches, and this pair used to be one.
+
+    Nothing is written to a user's cache unless they were told about the
+    listing, so ``notify_new = false`` meant no listing ever had a price on
+    file, no fall ever passed the per-user test, and ``notify_price_drop``
+    silently did nothing at all -- for the person whose settings say plainly
+    that falls are the only thing they want to hear about.
+    """
+    monitor, recorder = build(tmp_path, monkeypatch, CONFIG + NEW_LISTINGS_OFF)
+
+    monitor._announce_price_drops(report_of("$100 000", "$80 000"))
+
+    assert recorder.calls == [(["ana", "beto"], "1", "$80 000")]
+    # Forced, or the message would be rebuilt as the "new listing" it reads as
+    # from an empty cache -- and dropped by the switch that is off.
+    assert recorder.kwargs[0]["forced_status"] is NotificationStatus.LISTING_DISCOUNTED
+
+
+def test_the_old_price_travels_with_the_fall(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, store: Cache
+) -> None:
+    """Otherwise the message says a listing got cheaper without saying than what.
+
+    A user with a price of their own on file still gets theirs; this is the
+    fallback for the one who has none.
+    """
+    monitor, recorder = build(tmp_path, monkeypatch)
+
+    monitor._announce_price_drops(report_of("$100 000", "$80 000"))
+
+    assert recorder.kwargs[0]["previous_prices"] == ["$100 000"]
 
 
 def test_cheaper_is_measured_against_what_the_user_was_told(
@@ -180,6 +231,23 @@ def test_cheaper_is_measured_against_what_the_user_was_told(
     monitor._announce_price_drops(report_of("$90 000", "$80 000"))
 
     assert recorder.calls == [(["ana"], "1", "$80 000")]
+
+
+def test_a_user_told_at_the_current_price_hears_nothing(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, store: Cache
+) -> None:
+    """Having no price on file and having the current one are different states.
+
+    The first is answered by the store's fall; the second is already answered,
+    and answered "no" -- so the fallback must not reach it.
+    """
+    monitor, recorder = build(tmp_path, monkeypatch)
+    told(store, "ana", monitor, "$80 000")
+    told(store, "beto", monitor, "$80 000")
+
+    monitor._announce_price_drops(report_of("$100 000", "$80 000"))
+
+    assert recorder.calls == []
 
 
 def test_the_switch_silences_it(
