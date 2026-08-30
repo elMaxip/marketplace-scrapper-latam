@@ -113,7 +113,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         novnc \
         ca-certificates \
         tini \
+        smartmontools \
     && rm -rf /var/lib/apt/lists/*
+
+# `smartmontools` is for the storage-life reading on the status screen, and
+# installing it grants nothing on its own: reading a drive's SMART log needs the
+# device nodes and CAP_SYS_RAWIO, which the compose file leaves commented out
+# for the operator to turn on deliberately. Without them the monitor reports the
+# reading as unavailable and stops asking.
 
 # noVNC's page is vnc.html on some versions and vnc_lite.html on others.
 RUN if [ ! -e /usr/share/novnc/vnc.html ] && [ -e /usr/share/novnc/vnc_lite.html ]; then \

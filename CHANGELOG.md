@@ -8,6 +8,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The status screen says *which machine* its numbers describe.** Reported as
+  a bug and it was one, though not the one it looked like: a 16 GB Windows
+  laptop showed 7.7 GB, and the reasonable conclusion was that the metric was
+  broken. It was measuring correctly -- the WSL2 virtual machine really does
+  have 7.7 GB, being handed half the host's RAM by default -- and saying nothing
+  about which machine that was. `machine.kind` now distinguishes a real host, a
+  container on Linux (whose figures *are* the host's, because `/proc/meminfo`,
+  `/proc/cpuinfo` and `/proc/stat` are not namespaced) and the virtual machine
+  Docker Desktop runs on Windows, where the host is on the other side of a
+  hypervisor and no mount can reach it.
+- **Temperatures, for every component that publishes one.** CPU, SSD, chipset,
+  GPU -- whatever `hwmon` exposes, grouped by part and named for the part rather
+  than for the kernel driver, because "k10temp - Tctl 61 C" is accurate and
+  tells nobody anything. Needs no extra privilege and no extra mount: Docker
+  already gives a container the host's `/sys` on Linux. What it does need is the
+  kernel modules (`coretemp`, `k10temp`, `nvme`), and a machine without them
+  says so instead of showing an empty box. **Hot and cold come from the
+  driver's own thresholds**, never from numbers chosen here: 85 C is routine on
+  a GPU and an emergency on an SSD, so a threshold invented in this repository
+  would paint healthy parts red. No threshold, no colour.
+- **Storage life.** How much of a drive's rated endurance is spent, its spare
+  blocks, its hours powered on, its temperature and its own SMART verdict.
+  Wear is not in `/sys` -- it lives in the drive's SMART log, read with an admin
+  command over the device node -- so `smartmontools` is now in the image and the
+  compose file carries the `cap_add: SYS_RAWIO` and `devices:` block it needs
+  **commented out**. Granting a container raw access to the disks is a real
+  permission and the decision belongs to whoever runs it; until then the reading
+  reports itself unavailable, with the missing piece named, and stops asking.
+  A spinning disk has no wear figure at all and is not thereby unhealthy, which
+  is why `life_used` is allowed to be absent beside a drive in perfect health.
+
+### Fixed
+- **A container's memory ceiling is now the number shown.** `/proc/meminfo`
+  knows nothing about cgroups, so a container capped at 4 GB on a 64 GB host
+  reported 64 GB and looked healthy right up to the moment the kernel killed it.
+  The cap replaces the total when there is one, is named as a cap, and the
+  machine's real size is carried beside it -- "4 GB of the 16 this machine has"
+  is a different sentence from "this machine has 4 GB". Both cgroup layouts are
+  read, including v1's habit of writing a number near 2**63 to mean "no limit",
+  which taken literally is a machine with eight exabytes of RAM.
+- **The disk reading measures the machine's filesystem, not the container's.**
+  With `/` mounted read-only at `AIMM_HOST_ROOT` (the compose file does this
+  now) it reports the real disk. Without it, a container measures its own
+  overlay -- and on Docker Desktop that is a sparse virtual disk advertising a
+  terabyte it does not have, which is the most misleading number this panel
+  could print: it reports free space right up until the *host* fills up.
+
+### Added
 - **Excluded price patterns can be saved under a name and reused**
   (`[price_patterns.<name>]`, referred to by `excluded_price_pattern_sets`).
   The noise belongs to the market rather than to one search — the run of nines
