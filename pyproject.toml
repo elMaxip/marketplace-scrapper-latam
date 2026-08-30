@@ -59,10 +59,16 @@ aimm = "ai_marketplace_monitor.cli:app"
 pynput = ["pynput>=1.7.0"]
 # An undetected fork of Playwright, API-compatible, used when it is present and
 # ignored when it is not (see `browser_engine.py`).  Optional on purpose: the
-# shops' bot checks are the only reason for it, the container does not need it,
-# and a dependency that can be uninstalled without touching code is one this
-# project's "no new runtime dependencies without a strong reason" rule can live
-# with.  Pinned to the Playwright minor it forks.
+# shops' bot checks are the only reason for it, and a dependency that can be
+# uninstalled without touching code is one this project's "no new runtime
+# dependencies without a strong reason" rule can live with.  Pinned to the
+# Playwright minor it forks.
+#
+# This used to say the container did not need it.  It does now -- the Dockerfile
+# installs `.[stealth]` -- because the container is where Lider does the walling:
+# it has no real Chrome to fall back on, so the driver is the only lever left.
+# Note what came with it: patchright's Chromium has no WebGL unless asked, which
+# is why `SOFTWARE_WEBGL_FLAG` exists.  Do not install one without the other.
 stealth = ["patchright>=1.62,<1.63"]
 dev = [
   "pre-commit>=4.0.1",

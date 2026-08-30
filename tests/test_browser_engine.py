@@ -11,7 +11,11 @@ from __future__ import annotations
 import pytest
 
 from ai_marketplace_monitor import browser_engine
-from ai_marketplace_monitor.monitor import TELLTALE_DEFAULT_ARGS, MarketplaceMonitor
+from ai_marketplace_monitor.monitor import (
+    SOFTWARE_WEBGL_FLAG,
+    TELLTALE_DEFAULT_ARGS,
+    MarketplaceMonitor,
+)
 
 
 def test_there_is_always_a_driver() -> None:
@@ -84,6 +88,19 @@ def test_the_housekeeping_flags_are_dropped() -> None:
     cannot read the command line but it can read what these flags do."""
     for flag in ("--disable-extensions", "--disable-component-update", "--no-first-run"):
         assert flag in TELLTALE_DEFAULT_ARGS
+
+
+def test_software_webgl_is_allowed() -> None:
+    """Measured in the container: patchright's Chromium returns *no* WebGL
+    context without this, and a browser with no WebGL is a stronger tell than
+    one rendering in software.  It permits the fallback rather than forcing it,
+    so a machine with a GPU is unaffected."""
+    options = MarketplaceMonitor._launch_options("chromium")
+    assert SOFTWARE_WEBGL_FLAG in options["args"]
+    # Not something to "clean up" into the dropped list: those are flags a
+    # person's Chrome never carries, and this one exists to make this browser
+    # behave more like one, not less.
+    assert SOFTWARE_WEBGL_FLAG not in TELLTALE_DEFAULT_ARGS
 
 
 def test_other_engines_take_no_chromium_arguments() -> None:

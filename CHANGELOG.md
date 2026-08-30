@@ -8,6 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **The container looks like the machine it is standing in for, and this is
+  measured rather than argued.** The same fingerprint probe was run on Windows
+  with real Chrome — which has never once been walled by Lider, across a run
+  that mapped 800 listings — and in the container, which was refused within ten
+  seconds. The browser binary was not the difference. The clock was `UTC` and
+  the language `en-US` while the request left from a Chilean address: the
+  signature of a rented server, not of somebody shopping for a television. The
+  image already carries `tzdata`, and Chromium reads `LANGUAGE` on its own, so
+  `TZ` and `LANGUAGE` in the compose file now make the container report
+  `America/Santiago` and `es-419` — character for character what Windows
+  reports. Set them to your own if you run this from somewhere else.
+- **`patchright` is installed in the image.** The comment in `pyproject.toml`
+  said the container did not need it, and that was true while the container was
+  only ever asked for Facebook and Mercado Libre. It is the one change here
+  with a mechanism rather than a correlation behind it: the tell that survives
+  every launch flag is the driver, and Playwright's leaves CDP traces a page can
+  read. Still optional, still a silent fallback — uninstalling it changes
+  nothing else.
+
+### Fixed
+- **A browser with no WebGL at all, which is worse than one rendering in
+  software.** patchright's Chromium returns `null` from
+  `canvas.getContext('webgl')` where Playwright's build quietly fell back to
+  SwiftShader, so installing it for stealth would have traded a CDP leak for a
+  browser unlike any that exists on a desktop. `--enable-unsafe-swiftshader`
+  brings the context back with the same renderer string and the same
+  thirty-five extensions as before. It permits the fallback rather than forcing
+  it, so a machine with a GPU is untouched — and it is the one flag here that
+  is *added* rather than dropped, because what a page reads is not the command
+  line but what the flag does.
+
+### Changed
 - **A shop's refusal is answered with a new browser, not with a wait.** Being
   walled used to cost fifteen minutes of doing nothing and abandon the search
   half way through a catalogue. Now the search drops the identity the shop just

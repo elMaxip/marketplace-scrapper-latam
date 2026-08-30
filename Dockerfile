@@ -45,10 +45,19 @@ WORKDIR /build
 # The package itself is installed again below; what this buys is that editing
 # the source does not re-download two hundred megabytes of wheels.  The stub
 # package exists only so the build backend has something to build.
+#
+# `[stealth]` is patchright, and it is in the image now where the comment in
+# pyproject.toml still says the container does not need it.  It did not, while
+# the container was only ever asked for Facebook and Mercado Libre.  Lider is
+# behind PerimeterX, and the tell that survives every launch flag is the
+# driver: Playwright drives Chromium over CDP and enabling the `Runtime` domain
+# to evaluate scripts leaves traces a page can read.  patchright runs them in
+# isolated contexts instead.  `browser_engine.py` picks it up by import, so
+# nothing else in the image changes -- and uninstalling it still falls back.
 COPY pyproject.toml README.md ./
 RUN mkdir -p src/ai_marketplace_monitor \
     && printf '__version__ = "0.0.0"\n' > src/ai_marketplace_monitor/__init__.py \
-    && pip install --no-cache-dir . \
+    && pip install --no-cache-dir ".[stealth]" \
     && pip uninstall -y ai-marketplace-monitor
 
 # Now the real thing.  `--no-deps` because the layer above already resolved
@@ -120,6 +129,14 @@ COPY --from=builder /opt/venv /opt/venv
 RUN playwright install --with-deps chromium \
     && chmod -R a+rX /ms-playwright \
     && rm -rf /var/lib/apt/lists/*
+
+# patchright's own Chromium, into the same PLAYWRIGHT_BROWSERS_PATH.  It is a
+# fork and shares the registry layout, so a matching revision costs nothing and
+# a differing one is the second copy that makes patchright work at all -- which
+# is why this is a separate layer with its own `chmod`: the apt half above is
+# already done and must not be repeated.
+RUN patchright install chromium \
+    && chmod -R a+rX /ms-playwright
 
 # An unprivileged user, and the reason is Chromium rather than principle: a
 # browser running as root is a browser one sandbox escape away from the host,

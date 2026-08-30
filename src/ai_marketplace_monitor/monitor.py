@@ -142,6 +142,22 @@ LANE_REAP_INTERVAL = 0.5
 #: whether it is the default browser.  A page cannot read the command line, but
 #: it can read what these flags *do* -- an extensions API with nothing in it, a
 #: component updater that never ran, feature flags that do not match the build.
+#: Let Chromium fall back to software WebGL when there is no GPU to use.
+#:
+#: This is the opposite kind of flag to the ones above: those are removed
+#: because a person's browser does not carry them, and this one is added
+#: because of what its absence *does*.  Measured, in the container, with
+#: patchright's Chromium: without it ``canvas.getContext('webgl')`` returns
+#: null and the page sees a browser with **no WebGL at all**, which is a
+#: stronger tell than software rendering could ever be -- every desktop browser
+#: on earth has WebGL.  With it, the context comes back with the same renderer
+#: string and the same thirty-five extensions Playwright's build reported on
+#: its own.
+#:
+#: Harmless where a GPU exists: it permits the software fallback, it does not
+#: force it, so the machines that have hardware WebGL keep using it.
+SOFTWARE_WEBGL_FLAG = "--enable-unsafe-swiftshader"
+
 TELLTALE_DEFAULT_ARGS: Tuple[str, ...] = (
     "--disable-back-forward-cache",
     "--disable-client-side-phishing-detection",
@@ -979,7 +995,10 @@ class MarketplaceMonitor:
         if browser_name != "chromium":
             return {}
         return {
-            "args": ["--disable-blink-features=AutomationControlled"],
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                SOFTWARE_WEBGL_FLAG,
+            ],
             "ignore_default_args": ["--enable-automation", *TELLTALE_DEFAULT_ARGS],
             # The window is a window, not a fixed viewport.  A browser whose
             # inner size never matches the screen it claims to be on is one more
