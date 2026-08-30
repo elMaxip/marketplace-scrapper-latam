@@ -19,7 +19,7 @@ traffic and is what Lider's bot check refuses -- so
 
 from __future__ import annotations
 
-from typing import List
+from typing import ClassVar, List
 
 import pytest
 
@@ -210,7 +210,7 @@ def test_the_item_wins_over_the_platform_default() -> None:
     """The precedence every other option in this codebase uses."""
 
     class Fallback:
-        antikeywords_title = ["PlayStation"]
+        antikeywords_title: ClassVar[List[str]] = ["PlayStation"]
 
     assert (
         keyword_filters.excluded_by(
