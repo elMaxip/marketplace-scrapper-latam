@@ -4153,43 +4153,63 @@ class MarketplaceMonitor:
     ) -> List[schedule.Job]:
         """Every job one (item, marketplace) pair runs on.
 
-        The schedule is global: it comes from ``[monitor]`` and says nothing
-        about which product or which platform it applies to.  An interval and a
-        list of fixed times are not alternatives -- both can be on at once, and
-        the searches they trigger are the same search.
+        Three sources, in this order, and only one of them is ever read:
 
-        The per-item and per-marketplace keys are the old way of saying this,
-        one copy per section.  They are still read when ``[monitor]`` is silent
-        about the schedule, so an existing config keeps its behaviour, but the
-        web UI no longer writes them.
+        1. the item's own schedule -- the three keys written on ``[item.*]``,
+        2. the global one in ``[monitor]``,
+        3. the pre-``[monitor]`` reading: the item's keys under the old
+           semantics, then the platform's, then the built-in defaults.
+
+        A search has a schedule of its own when it names **any** of the three
+        keys; naming none is how it says "use the global one", which is why
+        nothing is ever copied down from ``[monitor]`` into an item.  Turning
+        every checkbox off in the interface erases the three keys, and the
+        search goes back to inheriting on the next reload.
+
+        An interval and a list of fixed times are not alternatives -- both can
+        be on at once, and the searches they trigger are the same search.  The
+        one place that is *not* true is the third source: before ``[monitor]``
+        owned the schedule, ``start_at`` replaced the interval instead of
+        adding to it, and a file written back then means it.  So the old
+        reading is kept for the case that identifies such a file -- ``[monitor]``
+        saying nothing about the schedule at all.
         """
         assert self.config is not None
         monitor_config = self.config.monitor
-        legacy = not any(
+        global_schedule = any(
             (
                 monitor_config.search_interval,
                 monitor_config.max_search_interval,
                 monitor_config.start_at,
             )
         )
+        own_schedule = any(
+            (item_config.search_interval, item_config.max_search_interval, item_config.start_at)
+        )
 
-        if legacy:
-            start_at_list = item_config.start_at or marketplace_config.start_at or []
-            search_interval = item_config.search_interval or marketplace_config.search_interval
-            max_search_interval = (
-                item_config.max_search_interval or marketplace_config.max_search_interval
-            )
-            # Fixed times used to *replace* the interval, and a config written
-            # that way means it, so that reading is kept for it.
+        if own_schedule:
+            start_at_list = item_config.start_at or []
+            search_interval = item_config.search_interval
+            max_search_interval = item_config.max_search_interval
+            if not global_schedule and start_at_list:
+                # Pre-``[monitor]`` file: fixed times used to *replace* the
+                # interval.  Reading them as additive here would start
+                # searching every half hour under a config that has asked for
+                # 09:00 and nothing else since before the key existed.
+                search_interval = max_search_interval = None
+        elif global_schedule:
+            start_at_list = monitor_config.start_at or []
+            search_interval = monitor_config.search_interval
+            max_search_interval = monitor_config.max_search_interval
+        else:
+            start_at_list = marketplace_config.start_at or []
+            search_interval = marketplace_config.search_interval
+            max_search_interval = marketplace_config.max_search_interval
             if start_at_list:
                 search_interval = max_search_interval = None
             elif search_interval is None and max_search_interval is None:
                 search_interval = self.DEFAULT_SEARCH_INTERVAL
                 max_search_interval = self.DEFAULT_MAX_SEARCH_INTERVAL
-        else:
-            start_at_list = monitor_config.start_at or []
-            search_interval = monitor_config.search_interval
-            max_search_interval = monitor_config.max_search_interval
 
         jobs: List[schedule.Job] = []
         for start_at in start_at_list:

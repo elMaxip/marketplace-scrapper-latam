@@ -117,11 +117,13 @@ class MarketItemCommonConfig(BaseConfig):
             raise ValueError(f"Item {hilight(self.name)} exclude_sellers must be a list.")
 
     def handle_max_search_interval(self: "MarketItemCommonConfig") -> None:
-        """Deprecated: the schedule is the ``[monitor]`` section's business now.
+        """The high end of this search's own random range, in seconds.
 
-        Still parsed, because a config written before the move must keep
-        working, and still honored as a fallback when ``[monitor]`` says
-        nothing about the schedule.
+        The three schedule keys on an item are its own schedule, and a search
+        that names any of them uses it instead of ``[monitor]``'s -- see
+        :meth:`MarketplaceMonitor._schedule_for`.  Naming none is how a search
+        says "use the global one", so there is nothing to parse and nothing is
+        ever copied down from ``[monitor]``.
         """
         if self.max_search_interval is None:
             return
@@ -250,7 +252,9 @@ class MarketItemCommonConfig(BaseConfig):
             )
 
     def handle_search_interval(self: "MarketItemCommonConfig") -> None:
-        """Deprecated, like :meth:`handle_max_search_interval`."""
+        """The fixed interval, or the low end of the range.  See
+        :meth:`handle_max_search_interval` for what a search's own schedule is.
+        """
         if self.search_interval is None:
             return
         self.search_interval = interval_in_seconds(
@@ -405,7 +409,12 @@ class MarketItemCommonConfig(BaseConfig):
         ]
 
     def handle_start_at(self: "MarketItemCommonConfig") -> None:
-        """Deprecated, like :meth:`handle_search_interval`."""
+        """Times of day this search runs at, on top of any interval it has.
+
+        Additive, not an alternative, exactly like the global ``start_at`` --
+        with the one exception :meth:`MarketplaceMonitor._schedule_for`
+        documents for files older than the ``[monitor]`` schedule.
+        """
         if self.start_at is None:
             return
         self.start_at = validated_start_at(self.start_at, f"Item {hilight(self.name)}")
