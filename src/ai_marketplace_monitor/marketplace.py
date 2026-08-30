@@ -82,6 +82,15 @@ class MarketItemCommonConfig(BaseConfig):
     #: before every other price test, because a junk price is not a cheap
     #: listing or an expensive one, it is a listing whose price is unknown.
     excluded_price_patterns: List[str] | None = None
+    #: Saved pattern lists this search uses, by name (``[price_patterns.*]``).
+    #:
+    #: A reference rather than a copy, exactly like ``search_region``: the same
+    #: four rules are wanted by every search somebody has, and retyping them is
+    #: how two searches end up excluding ``9*`` and ``99999`` respectively.
+    #: :meth:`Config.expand_price_patterns` folds the named lists into
+    #: ``excluded_price_patterns`` before anything runs, so nothing below this
+    #: point -- :meth:`Marketplace.junk_price` included -- knows sets exist.
+    excluded_price_pattern_sets: List[str] | None = None
     rating: List[int] | None = None
     prompt: str | None = None
     extra_prompt: str | None = None
@@ -373,6 +382,28 @@ class MarketItemCommonConfig(BaseConfig):
         if problems:
             raise ValueError(f"Item {hilight(self.name)}: {' '.join(problems)}")
 
+    def handle_excluded_price_pattern_sets(self: "MarketItemCommonConfig") -> None:
+        """Accept one name or a list.  Whether they exist is the loader's job.
+
+        Checked there and not here because a section cannot see the rest of the
+        file, and "you named a set that does not exist" needs the rest of the
+        file to be answerable -- see :meth:`Config.expand_price_patterns`.
+        """
+        if self.excluded_price_pattern_sets is None:
+            return
+        if isinstance(self.excluded_price_pattern_sets, str):
+            self.excluded_price_pattern_sets = [self.excluded_price_pattern_sets]
+        if not isinstance(self.excluded_price_pattern_sets, list) or not all(
+            isinstance(x, str) for x in self.excluded_price_pattern_sets
+        ):
+            raise ValueError(
+                f"Item {hilight(self.name)} excluded_price_pattern_sets must be a string "
+                "or a list of strings."
+            )
+        self.excluded_price_pattern_sets = [
+            name.strip() for name in self.excluded_price_pattern_sets if name.strip()
+        ]
+
     def handle_start_at(self: "MarketItemCommonConfig") -> None:
         """Deprecated, like :meth:`handle_search_interval`."""
         if self.start_at is None:
@@ -450,8 +481,27 @@ class ItemConfig(MarketItemCommonConfig):
 
     # keywords is required, all others are optional
     search_phrases: List[str] = field(default_factory=list)
+    #: Words the listing must have, anywhere -- title or description.
     keywords: List[str] | None = None
+    #: Words that exclude it, anywhere.
     antikeywords: List[str] | None = None
+    #: The same two rules, narrowed to one half of the listing.
+    #:
+    #: Both of the keys above read the title and the description glued
+    #: together, which is the right default and a poor only option: "no busco
+    #: fundas" is a rule about the *title* (every listing of a console mentions
+    #: a case somewhere in its description) and "tiene que decir sellado" is a
+    #: rule about the *description* (a title has room for four words).  The
+    #: two above are unchanged, so a search written before these existed
+    #: behaves exactly as it did.
+    #:
+    #: Where a rule looks decides when it can be answered, which is the part
+    #: that reaches the scrapers: a title is on a shop's results grid and a
+    #: description is not.  See :mod:`ai_marketplace_monitor.keyword_filters`.
+    keywords_title: List[str] | None = None
+    keywords_description: List[str] | None = None
+    antikeywords_title: List[str] | None = None
+    antikeywords_description: List[str] | None = None
     description: str | None = None
     marketplace: str | None = None
 
@@ -489,6 +539,36 @@ class ItemConfig(MarketItemCommonConfig):
             isinstance(x, str) for x in self.keywords
         ):
             raise ValueError(f"Item {hilight(self.name)} keywords must be a list.")
+
+    def _handle_word_list(self: "ItemConfig", key: str) -> None:
+        """One of the four scoped word lists: a string, or a list of them.
+
+        Shared rather than written out four times because the four are the same
+        rule, and a copy that drifts is how one of them ends up accepting a
+        shape the other three reject.
+        """
+        value = getattr(self, key)
+        if value is None:
+            return
+        if isinstance(value, str):
+            value = [value]
+            setattr(self, key, value)
+        if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+            raise ValueError(
+                f"Item {hilight(self.name)} {key} must be a string or a list of strings."
+            )
+
+    def handle_keywords_title(self: "ItemConfig") -> None:
+        self._handle_word_list("keywords_title")
+
+    def handle_keywords_description(self: "ItemConfig") -> None:
+        self._handle_word_list("keywords_description")
+
+    def handle_antikeywords_title(self: "ItemConfig") -> None:
+        self._handle_word_list("antikeywords_title")
+
+    def handle_antikeywords_description(self: "ItemConfig") -> None:
+        self._handle_word_list("antikeywords_description")
 
     def handle_description(self: "ItemConfig") -> None:
         if self.description is None:

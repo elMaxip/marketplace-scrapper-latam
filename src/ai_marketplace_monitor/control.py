@@ -291,6 +291,25 @@ def _blank_updates() -> Dict[str, Any]:
         "lane": None,
     }
 
+
+#: Which browsers the scraper has open, and how many tabs each one holds.
+#:
+#: Reported by the thread that owns the browser, and reported here rather than
+#: read on demand, because a Playwright object belongs to the thread that made
+#: it: asking a context for its pages from the web UI thread reaches the driver
+#: and raises.  So the owner publishes, and this module is what the interface
+#: reads -- the same arrangement as everything else in here.
+#:
+#: Publishing on task boundaries is not an approximation.  A tab is opened and
+#: closed by a task, so between two tasks the count cannot change; a lane that
+#: has been idle for ten minutes is reporting a number that is still exactly
+#: right.
+#:
+#: Only the scraper's own browsers are in here -- one entry per browser the
+#: monitor launched -- so a Chrome the user has open on the same machine is not
+#: counted, which is the difference between a useful figure and a random one.
+_browsers: Dict[str, Dict[str, Any]] = {}
+
 #: Every phase the loop can report.  Named rather than free text so the
 #: interface can style them; ``detail`` carries whatever else is worth saying.
 PHASES: Tuple[str, ...] = (
@@ -1280,6 +1299,43 @@ def is_claimed(marketplace: str, listing_id: str) -> bool:
         return (marketplace, listing_id) in _claims
 
 
+def report_browser(name: str, tabs: int, profile: str | None = None) -> None:
+    """Say that this browser is open and holding ``tabs`` tabs.
+
+    Called by whichever thread owns the browser, after anything that can change
+    the count: opening it, finishing a task, renewing it.
+    """
+    with _lock:
+        _browsers[name] = {
+            "lane": name,
+            "tabs": max(0, int(tabs)),
+            "profile": profile,
+            "at": _now(),
+        }
+
+
+def forget_browser(name: str) -> None:
+    """Say that this browser is closed.  Idempotent."""
+    with _lock:
+        _browsers.pop(name, None)
+
+
+def browsers() -> Dict[str, Any]:
+    """How many browsers the scraper has open, and how many tabs in total.
+
+    The per-browser rows are carried as well as the totals: "three browsers,
+    nine tabs" is the headline, and which lane is holding six of them is the
+    part that explains it.
+    """
+    with _lock:
+        rows = sorted(_browsers.values(), key=lambda row: str(row["lane"]))
+    return {
+        "count": len(rows),
+        "tabs": sum(int(row["tabs"]) for row in rows),
+        "detail": rows,
+    }
+
+
 def reset_for_tests() -> None:
     """Forget every in-memory flag.  For tests, which share the process."""
     global _last, _run_requested, _phase, _loaded_config, _next_runs
@@ -1287,6 +1343,7 @@ def reset_for_tests() -> None:
     _guard = None
     with _lock:
         _lanes.clear()
+        _browsers.clear()
         _stops.clear()
         _next_search = None
         _cancel_mode = "stop"

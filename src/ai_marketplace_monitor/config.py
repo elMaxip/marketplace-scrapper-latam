@@ -26,6 +26,7 @@ from .mercadolibre import MercadoLibreMarketplace
 from .sodimac import SodimacMarketplace
 from .tracking import PLATFORM as TRACKED_PLATFORM, TrackedMarketplace
 from .notification import NotificationConfig
+from .price_pattern_set import PricePatternsConfig
 from .region import RegionConfig
 from .user import User, UserConfig
 from .utils import MonitorConfig, Translator, hilight, merge_dicts
@@ -135,6 +136,10 @@ class ConfigItem(Enum):
     REGION = "region"
     NOTIFICATION = "notification"
     TRANSLATION = "translation"
+    #: A named list of excluded price patterns, reusable across searches.
+    #: A sibling of `region`: written once, referred to by name, and
+    #: resolved into the real values before anything runs.
+    PRICE_PATTERNS = "price_patterns"
     #: One product page followed by address.  A sibling of `item` rather than a
     #: kind of it: a search has phrases and filters, a tracker has a URL.
     TRACK = "track"
@@ -153,6 +158,7 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
     items: Dict[Tuple[str, str], TItemConfig] = field(init=False)
     translator: Dict[str, Translator] = field(init=False)
     region: Dict[str, RegionConfig] = field(init=False)
+    price_patterns: Dict[str, PricePatternsConfig] = field(init=False)
 
     def __init__(self: "Config", config_files: List[Path], logger: Logger | None = None) -> None:
         self.logger = logger
@@ -181,11 +187,13 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
         self.get_marketplace_config(config)
         self.get_user_config(config)
         self.get_region_config(config)
+        self.get_price_patterns_config(config)
         self.get_item_config(config)
         self.validate_users()
         self.validate_ais()
         self.expand_notifications(logger)
         self.expand_regions()
+        self.expand_price_patterns()
         self.validate_items()
 
     def get_translator_config(self: "Config", config: Dict[str, Any]) -> None:
@@ -329,6 +337,23 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
         self.region: Dict[str, RegionConfig] = {}
         for region_name, region_config in config.get("region", {}).items():
             self.region[region_name] = RegionConfig(name=region_name, **region_config)
+
+    def get_price_patterns_config(self: "Config", config: Dict[str, Any]) -> None:
+        """Build one config per ``[price_patterns.<name>]`` section.
+
+        Zero of them is the normal state: a search may still write its patterns
+        out itself, and nothing here replaces that.
+        """
+        self.price_patterns = {}
+        sections = config.get(ConfigItem.PRICE_PATTERNS.value, {}) or {}
+        if not isinstance(sections, dict):
+            raise ValueError("price_patterns section must be a dictionary.")
+        for name, section in sections.items():
+            if not isinstance(section, dict):
+                raise ValueError(
+                    f"Price patterns {hilight(name)} must be a section of settings."
+                )
+            self.price_patterns[name] = PricePatternsConfig(name=name, **section)
 
     def get_item_config(self: "Config", config: Dict[str, Any]) -> None:
         """Build one item configuration per marketplace the item runs on.
@@ -548,6 +573,7 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
             "ai": sorted(self.ai),
             "notifications": sorted(self.notification),
             "regions": sorted(self.region),
+            "price_patterns": sorted(self.price_patterns),
         }
 
     def validate_sections(self: "Config", config: Dict[str, Any]) -> None:
@@ -677,6 +703,51 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
                 # half-filled column would attach the wrong currency to a city.
                 # Better none at all than one that is quietly wrong.
                 config.currency = []
+
+    def expand_price_patterns(self: "Config") -> None:
+        """Fold every named pattern set into the list the filters actually read.
+
+        The resolved list is written back onto ``excluded_price_patterns``, so
+        nothing downstream has to know that sets exist: ``junk_price`` reads one
+        flat list, ``describe()`` publishes the resolved one, and "what is the
+        scraper really excluding?" has one answer instead of two half-answers.
+
+        The set's patterns come first and the search's own after, deduplicated
+        while keeping the first occurrence.  Order is only cosmetic -- the
+        matcher tries every rule -- but the duplicate is not: a search that
+        names a set *and* copies its patterns is the exact inconsistency the
+        sets exist to remove, and leaving both in the resolved list would put
+        the same rule twice in every log line and every readback.
+
+        A set that is not there is refused by name, the way a missing region is,
+        and for a sharper reason: an unknown *region* leaves a search with no
+        city and the marketplace complains, whereas an unknown pattern set would
+        leave a search that runs perfectly and silently stops excluding the
+        placeholder prices -- which is only visible weeks later, in a group whose
+        maximum is 999999.
+        """
+        for config in chain(self.marketplace.values(), self.items.values()):
+            names = getattr(config, "excluded_price_pattern_sets", None)
+            if not names:
+                continue
+            resolved: List[str] = []
+            for name in names:
+                if name not in self.price_patterns:
+                    raise ValueError(
+                        f"Price patterns {hilight(name)} used by {hilight(config.name)} do "
+                        "not exist. Saved price patterns are defined in the web UI under "
+                        "Ajustes -> Patrones de precios guardados; pick another one there, "
+                        "or write the patterns into the search directly."
+                    )
+                pattern_set = self.price_patterns[name]
+                if pattern_set.enabled is False:
+                    continue
+                resolved.extend(pattern_set.patterns)
+            for pattern in config.excluded_price_patterns or []:
+                resolved.append(pattern)
+            # dict.fromkeys rather than a set: the order the user reads back is
+            # the order they wrote, and a set would reshuffle it per run.
+            config.excluded_price_patterns = list(dict.fromkeys(resolved))
 
     def validate_items(self: "Config") -> None:
         """Let each marketplace say whether it can run the items assigned to it.

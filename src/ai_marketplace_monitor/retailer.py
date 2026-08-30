@@ -42,7 +42,7 @@ from typing import Any, Dict, Generator, List, Tuple, Type
 
 from playwright.sync_api import BrowserContext, Page  # type: ignore
 
-from . import control
+from . import control, keyword_filters
 from .listing import Listing
 from .marketplace import (
     ItemConfig,
@@ -65,6 +65,27 @@ from .utils import (
     is_substring,
     price_value,
 )
+
+
+#: What each rule is called in the log line that fires it.
+#:
+#: The words alone are not enough: with three exclusion lists in one search,
+#: "excluded keywords: ps4" leaves the user to work out which of the three threw
+#: the listing away, and whether the match was in the title or buried in the
+#: description.  Defined here rather than in `keyword_filters`, which is kept
+#: free of user-facing text so it stays a pure predicate.
+EXCLUDE_LABELS = {
+    "antikeywords": "excluded keywords",
+    "antikeywords_title": "excluded keywords in the title",
+    "antikeywords_description": "excluded keywords in the description",
+}
+
+REQUIRE_LABELS = {
+    "keywords": "without required keywords",
+    "keywords_title": "without required keywords in the title",
+    "keywords_description": "without required keywords in the description",
+}
+
 
 #: Hard stop on how far a search will page, whatever the shop says.
 #:
@@ -910,8 +931,11 @@ class RetailerMarketplace(Marketplace):
 
         So it is asked for when it decides something:
 
-        * ``keywords`` / ``antikeywords`` read the description as well as the
-          title, so the entry's fate depends on it;
+        * a word rule whose answer can depend on the description -- which is
+          every one of them except the two ``*_title`` lists, and which
+          :func:`keyword_filters.needs_description` is the authority on: a
+          search filtering only on the title reads a whole catalogue from the
+          grid, and that distinction is the point of the scoped rules;
         * an AI is scoring the listing, and the description is most of what it
           has to score;
         * ``in_stock_only`` needs ``availability``, which neither shop prints on
@@ -924,10 +948,11 @@ class RetailerMarketplace(Marketplace):
         """
         if self._option(item_config, "in_stock_only"):
             return True
-        for key in ("keywords", "antikeywords", "ai"):
-            if getattr(item_config, key, None) or getattr(self.config, key, None):
-                return True
-        return False
+        if keyword_filters.needs_description(item_config, self.config):
+            return True
+        return bool(
+            getattr(item_config, "ai", None) or getattr(self.config, "ai", None)
+        )
 
     def _with_description(
         self: "RetailerMarketplace",
@@ -1124,29 +1149,42 @@ class RetailerMarketplace(Marketplace):
         if not self._within_price_bounds(item, item_config):
             return False
 
-        antikeywords = item_config.antikeywords or getattr(self.config, "antikeywords", None)
-        if antikeywords and is_substring(
-            antikeywords, f"{item.title} {item.description}", logger=self.logger
-        ):
+        # The word rules -- excluded and required, each in three scopes -- all
+        # live in `keyword_filters`, which also decides *when* each one can be
+        # answered.  Not a boolean: a requirement that needs a description the
+        # card does not carry is unanswered rather than failed, and treating
+        # those two as the same is how a filter empties a search.
+        excluded = keyword_filters.excluded_by(
+            item_config,
+            item.title,
+            item.description,
+            fallback=self.config,
+            description_available=description_available,
+            logger=self.logger,
+        )
+        if excluded is not None:
+            key, words = excluded
             if self.logger:
                 self.logger.info(
                     f"""{hilight("[Skip]", "fail")} Exclude {hilight(item.title)} due to """
-                    f"""{hilight("excluded keywords", "fail")}: {", ".join(antikeywords)}"""
+                    f"""{hilight(EXCLUDE_LABELS[key], "fail")}: {", ".join(words)}"""
                 )
             return False
 
-        keywords = item_config.keywords
-        if (
-            description_available
-            and keywords
-            and not is_substring(
-                keywords, f"{item.title}  {item.description}", logger=self.logger
-            )
-        ):
+        missing = keyword_filters.missing_required(
+            item_config,
+            item.title,
+            item.description,
+            fallback=self.config,
+            description_available=description_available,
+            logger=self.logger,
+        )
+        if missing is not None:
+            key, words = missing
             if self.logger:
                 self.logger.info(
                     f"""{hilight("[Skip]", "fail")} Exclude {hilight(item.title)} """
-                    f"""{hilight("without required keywords", "fail")}."""
+                    f"""{hilight(REQUIRE_LABELS[key], "fail")}: {", ".join(words)}"""
                 )
             return False
 

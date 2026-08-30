@@ -112,6 +112,30 @@ class CounterItem(Enum):
 
 
 class Currency(Enum):
+    """A currency code a price may be written in.
+
+    Two lists used to be one, which is where the crashes came from.  This is
+    what the monitor *accepts* -- what a user may write after a number
+    (``max_price = "500 USD"``) or attach to a search city.  Whether that code
+    can be *converted* is a separate and smaller question, answered by
+    :func:`convertible_currencies`, because the conversion comes from the ECB's
+    daily reference rates via ``CurrencyConverter`` and the ECB publishes rates
+    for the currencies it publishes rates for.
+
+    Chile is the case that forced the split.  CLP was absent, so a Chilean city
+    could not name its own currency at all; and ARS was present while the
+    converter has never known it, so an Argentine one that did named a code that
+    crashed the search the first time a price needed converting.  Both are the
+    same mistake in opposite directions: a list of *convertible* currencies used
+    as a list of *valid* ones.
+
+    Codes no longer in circulation (CYP, EEK, LTL, LVL, MTL, ROL, SIT, SKK, TRL,
+    HRK) are kept because the converter still carries historical rates for them
+    and because refusing to load a configuration over a currency it accepted
+    yesterday helps nobody.  The web UI does not offer them; see
+    ``CURRENCIES`` in the interface, which is the list a person picks from.
+    """
+
     USD = "USD"
     JPY = "JPY"
     BGN = "BGN"
@@ -154,7 +178,85 @@ class Currency(Enum):
     SGD = "SGD"
     THB = "THB"
     ZAR = "ZAR"
-    ARS_unsupported = "ARS"
+    # Latin America.  None of these is convertible -- the ECB publishes no rate
+    # for any of them -- and every one of them is a currency the monitor is
+    # actually pointed at: Mercado Libre alone is searched on seven sites in
+    # this region.  Accepting the code is what lets a search say which currency
+    # its city prices in; `convert_price` is what makes saying so harmless.
+    ARS = "ARS"
+    CLP = "CLP"
+    COP = "COP"
+    PEN = "PEN"
+    UYU = "UYU"
+
+
+#: The converter, built once.
+#:
+#: It parses the ECB's rate table on construction, and the code that needed it
+#: built a fresh one *per city and per bound* -- four table loads to convert two
+#: numbers, inside the loop that assembles a search URL.
+#: ``False`` means "tried and could not", which is distinct from ``None``,
+#: "not tried yet": without the distinction a machine with no rate table
+#: would retry the load on every price.
+_converter: Any = None
+
+
+def _currency_converter() -> Any:
+    """The shared converter, or ``None`` when there is no rate table."""
+    global _converter
+    if _converter is None:
+        try:
+            from currency_converter import CurrencyConverter  # type: ignore
+
+            _converter = CurrencyConverter()
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            _converter = False
+    return _converter or None
+
+
+def convertible_currencies() -> "frozenset[str]":
+    """The currency codes a conversion can actually be asked for.
+
+    Read from the converter itself rather than copied out of it: a
+    hand-maintained copy of somebody else's list is a copy that goes stale
+    without saying so, and this one already did -- ARS sat in the enum for as
+    long as the enum existed and the converter never knew it.
+    """
+    converter = _currency_converter()
+    return frozenset(converter.currencies) if converter is not None else frozenset()
+
+
+def convert_price(amount: int, source: str, target: str) -> int | None:
+    """``amount`` expressed in ``target``, or ``None`` when it cannot be.
+
+    ``None`` is a real answer and the reason this function exists.  The
+    conversion is a convenience -- it lets somebody write a maximum once, in
+    their own currency, and search cities that price in another -- and there is
+    no rate for CLP, ARS, COP, PEN or UYU, which is to say for most of the
+    region this monitor is pointed at.  Declining leaves the caller to send the
+    number as written, which is exactly what happens when no currency is named
+    at all, and is a filter that is slightly wrong rather than a search that
+    raises in the middle of building its URL.
+    """
+    source, target = (source or "").upper(), (target or "").upper()
+    if not source or not target or source == target:
+        return amount
+    available = convertible_currencies()
+    if source not in available or target not in available:
+        return None
+    converter = _currency_converter()
+    if converter is None:
+        return None
+    try:
+        return int(converter.convert(amount, source, target))
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        # A pair the converter knows both halves of but has no rate for on the
+        # day it was asked about.  Same answer, same reason.
+        return None
 
 
 class KeyboardMonitor:

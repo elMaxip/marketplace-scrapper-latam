@@ -266,6 +266,10 @@ One or more `item.item_name` where `item_name` is the name of the item.
 | `description`      | Optional    | String      | A longer description of the item that better describes your requirements (e.g., manufacture, condition, location, seller reputation, shipping options). Only used if AI assistance is enabled. |
 | `keywords`         | Optional    | String/List | Excludes listings whose titles and description do not contain any of the keywords.                                                                                                             |
 | `antikeywords`     | Optional    | String/List | Excludes listings whose titles or descriptions contain any of the specified keywords.                                                                                                          |
+| `keywords_title`   | Optional    | String/List | The same rule, narrowed to the **title**.                                                                                                                                                       |
+| `keywords_description` | Optional | String/List | The same rule, narrowed to the **description**.                                                                                                                                                 |
+| `antikeywords_title` | Optional  | String/List | Excludes listings whose **title** contains any of these.                                                                                                                                        |
+| `antikeywords_description` | Optional | String/List | Excludes listings whose **description** contains any of these.                                                                                                                                  |
 | `marketplace`      | Optional    | String      | Restricts the item to one marketplace. Unset, it is searched on every one of them. Prefer `enabled = false` in the item's per-marketplace block, which is what the web UI writes.               |
 | `language`         | Optional    | String      | Facebook only, and per search: the interface language its pages are served in, so the parser can find the labels. Set it in `[item.<name>.facebook]`. Defaults to `es_LA`.                      |
 | **Common options** |             |             | Options listed below. These options, if specified in the item section, will override options in the marketplace section.                                                                       |
@@ -276,7 +280,25 @@ return related items under different names. To select the right items, you can
 1. Use `keywords` to keep only items with certain words in the title. For example, you can set `keywords = ['gopro', 'go pro']` when you search for `search_phrases = 'gopro'`.
 2. Use `antikeywords` to narrow down the search. For example, setting `antikeywords=['HERO 4']` will exclude items with `HERO 4` or `hero 4`in the title or description.
 3. The `keywords` and `antikeywords` options allows the specification of multiple keywords with a `OR` relationship, but it also allows complex `AND`, `OR` and `NOT` logics. See [Advanced Keyword-based filters](../README.md#advanced-keyword-based-filters) for details.
-4. It is usually more effective to write a longer `description` and let the AI know what exactly you want. This will make sure that you will not get a drone when you are looking for a `DJI` camera. It is still a good idea to pre-filter listings using non-AI criteria to reduce the cost of AI services.
+4. The four scoped variants (`*_title`, `*_description`) exist because the two
+   original keys read the title and the description glued together, which is the
+   right default and a poor only option. "I do not want cases" is a rule about
+   the *title* — every listing of a console mentions a case somewhere in its
+   description, so `antikeywords = ['case']` throws away the whole market — and
+   "it has to say sealed" is a rule about the *description*, because a title has
+   room for four words. `keywords` and `antikeywords` keep their exact meaning,
+   so a configuration written before these existed behaves identically.
+5. **Where a rule looks decides when it can be answered, and that reaches the
+   scrapers.** A shop's results grid carries titles and no descriptions, and
+   opening a product page per catalogue entry is the bulk of a search's traffic
+   (and, on Lider, the exact requests its bot check refuses). So a search whose
+   only word rules are `*_title` ones reads a whole catalogue from the grid
+   without opening a single product page, while any rule that can depend on the
+   description makes the monitor open them. A rule that cannot be answered yet
+   is *undecided*, never "failed" and never "met": a card that does not yet show
+   a required word has not broken the rule, and a banned word found in the title
+   is settled whatever else is missing.
+6. It is usually more effective to write a longer `description` and let the AI know what exactly you want. This will make sure that you will not get a drone when you are looking for a `DJI` camera. It is still a good idea to pre-filter listings using non-AI criteria to reduce the cost of AI services.
 
 ### Common item and marketplace options
 
@@ -308,6 +330,7 @@ The following options that can specified for both `marketplace` sections and `it
 | `seller_locations`    | Optional          | String/List         | Only allow searched items from these locations.                                                                                                             |
 | `sort_by`             | Optional          | String              | Order of search results. One of `suggested`, `new`, `price_ascend`, `price_descend`, and `distance_ascend`.                                                 |
 | `start_at`            | Deprecated        | String/List         | Moved to the [`monitor` section](#monitor-configuration). Still read when `monitor` sets no schedule, where it overrides `search_interval`.                  |
+| `excluded_price_pattern_sets` | Optional | String/List | Names of `[price_patterns.*]` sections whose patterns this search uses. Resolved into `excluded_price_patterns` before anything runs, so the two add up and duplicates collapse. |
 | `target_price`        | Optional          | Integer/String      | What you hope to pay. Never sent to the marketplace and never used as a filter; the web dashboard measures the cheapest listing found against it. Belongs in `[item.<name>.<marketplace>]`, since the same product is worth a different price on each platform. |
 
 Note that
@@ -317,7 +340,7 @@ Note that
 3. `prompt`, `extra_prompt`, `rating_prompt`, and `rating` are used to adjust how to interact with an AI service. See [Adjust prompt and notification level](../README.md#adjust-prompt-and-notification-level) for details.
 4. `start_at` supports one or more of the following values: <br> - `HH:MM:SS` or `HH:MM` for every day at `HH:MM:SS` or `HH:MM:00` <br> - `*:MM:SS` or `*:MM` for every hour at `MM:SS` or `MM:00` <br> - `*:*:SS` for every minute at `SS`.
 5. A list of two values can be specified for options `rating`, `availability`, `delivery_method`, and `date_listed`. See [First and subsequent searches](../README.md#first-and-subsequent-searches) for details.
-6. `min_price` and `max_price` can be specified as a number (e.g. `min_price=100`) or a number followed by a currency name (e.g. `min_price='100 USD'`). If different currencies are specified for both `min_price/max_price` and `search_city` (or `region`), the `min_price` and `max_price` will be adjusted to use currency for the `search_city`. See [Searching across regions with different currencies](../README.md#searching-across-regions-with-different-currencies) for details.
+6. `min_price` and `max_price` can be specified as a number (e.g. `min_price=100`) or a number followed by a currency name (e.g. `min_price='100 USD'`). If different currencies are specified for both `min_price/max_price` and `search_city` (or `region`), the `min_price` and `max_price` will be adjusted to use currency for the `search_city`. See [Searching across regions with different currencies](../README.md#searching-across-regions-with-different-currencies) for details. **The conversion needs an exchange rate, and there is not always one.** Rates come from the ECB's daily table via `CurrencyConverter`, which publishes none for CLP, ARS, COP, PEN or UYU — most of the region this monitor is usually pointed at. When there is no rate the bound is sent as the plain number and a warning is logged; it used to raise out of the middle of building a search URL. Naming a currency on a city is still worth doing: it says what that city prices in, and a bound written in the same currency needs no conversion at all. Leaving it unset is the safe default and sends the number exactly as written.
 7. `category` can be `vehicles`, `propertyrentals`, `apparel`, `electronics`, `entertainment`, `family`, `freestuff`, `free`, `garden`, `hobbies`, `homegoods`, `homeimprovement`, `homesales`, `musicalinstruments`, `officesupplies`, `petsupplies`, `sportinggoods`, `tickets`, `toys`, and `videogames`. If `catgory=freestuff` or `catgory=free` is set, `min_price` and `max_price` is ignored.
 8. `sort_by` controls the order of the search results. `suggested` (the default) uses Facebook's own ranking, `new` lists the newest items first (useful for catching newly listed items), `price_ascend` and `price_descend` sort by price, and `distance_ascend` sorts by distance from the search city.
 
@@ -339,6 +362,53 @@ Note that
 
 1. `radius` has a default value of `500` (miles). You can specify different `radius` for different `search_city`.
 2. Options `full_name` and `city_name` are for documentation and logging purposes only.
+
+### Saved price patterns
+
+One or more sections of `[price_patterns.<name>]`: a list of excluded price
+patterns written once and referred to by name from as many searches as you like.
+
+A price pattern says "this number is not an asking price" — the run of nines
+somebody typed to get past a required field, the keyboard walk, the `0` that
+means the listing is really an advert. They are applied *before* `min_price`,
+`max_price` and `target_price`, because a junk price is not a cheap listing or
+an expensive one: it is a listing whose price is unknown. The syntax is the same
+one `excluded_price_patterns` takes and is documented with that option.
+
+The reason for naming them is that the noise belongs to the market rather than
+to one search, so the same three or four rules are wanted everywhere — and
+retyped rules drift: one search excludes `9*` and its neighbour excludes
+`99999`, and the group with the placeholder still in it is the one whose average
+nobody can trust.
+
+| Parameter     | Required/Optional | Data Type   | Description                                                     |
+| ------------- | ----------------- | ----------- | --------------------------------------------------------------- |
+| `patterns`    | Required          | String/List | The patterns themselves.                                        |
+| `description` | Optional          | String      | A line for your own benefit. Never read by anything that matches. |
+| `enabled`     | Optional          | Boolean     | `false` switches the list off without deleting it, which leaves every reference to it valid. |
+
+```toml
+[price_patterns.junk]
+description = "Form filler"
+patterns = ["9*", "0", "123456"]
+
+[item.ps5.mercadolibre]
+excluded_price_pattern_sets = ["junk"]
+excluded_price_patterns = ["777"]      # and this one, only here
+```
+
+Note that
+
+1. The names are **references, not copies**. Editing a list changes every search
+   that uses it, which is the point of having them; the loader refuses a search
+   naming a list that does not exist, with the name in the message, rather than
+   ignoring it — an ignored reference would leave a search running perfectly and
+   silently excluding nothing, which only shows up weeks later as a group whose
+   maximum price is 999999. Renaming one from the web UI carries the new name
+   through to every search that used it.
+2. The resolved list is what everything downstream sees: `excluded_price_patterns`
+   in the effective configuration the web UI shows is the real, flat list of
+   patterns, deduplicated, not the names.
 
 ### Translators
 

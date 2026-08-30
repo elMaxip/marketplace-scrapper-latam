@@ -10,10 +10,10 @@ from typing import Any, Generator, List, Tuple, Type, cast
 from urllib.parse import quote
 
 import humanize
-from currency_converter import CurrencyConverter  # type: ignore
 from playwright.sync_api import BrowserContext, ElementHandle, Page  # type: ignore
 from rich.pretty import pretty_repr
 
+from . import keyword_filters
 from .control import claim, raise_if_cancelled
 from .listing import Listing
 from .marketplace import ItemConfig, ListingStatus, Marketplace, MarketplaceConfig, WebPage
@@ -25,6 +25,7 @@ from .utils import (
     KeyboardMonitor,
     Translator,
     aimm_event,
+    convert_price,
     convert_to_seconds,
     counter,
     extract_price,
@@ -32,6 +33,26 @@ from .utils import (
     hilight,
     is_substring,
 )
+
+
+#: What each rule is called in the log line that fires it.
+#:
+#: The words alone are not enough: with three exclusion lists in one search,
+#: "excluded keywords: ps4" leaves the user to work out which of the three threw
+#: the listing away, and whether the match was in the title or buried in the
+#: description.  Defined here rather than in `keyword_filters`, which is kept
+#: free of user-facing text so it stays a pure predicate.
+EXCLUDE_LABELS = {
+    "antikeywords": "excluded keywords",
+    "antikeywords_title": "excluded keywords in the title",
+    "antikeywords_description": "excluded keywords in the description",
+}
+
+REQUIRE_LABELS = {
+    "keywords": "without required keywords",
+    "keywords_title": "without required keywords in the title",
+    "keywords_description": "without required keywords in the description",
+}
 
 
 class Condition(Enum):
@@ -805,33 +826,11 @@ class FacebookMarketplace(Marketplace):
 
             max_price = item_config.max_price or self.config.max_price
             if max_price:
-                if max_price.isdigit():
-                    options.append(f"maxPrice={max_price}")
-                else:
-                    price, cur = max_price.split(" ", 1)
-                    if currency and cur != currency:
-                        c = CurrencyConverter()
-                        price = str(int(c.convert(int(price), cur, currency)))
-                        if self.logger:
-                            self.logger.debug(
-                                f"""{hilight("[Search]", "info")} Converting price {max_price} {cur} to {price} {currency}"""
-                            )
-                    options.append(f"maxPrice={price}")
+                options.append(f"maxPrice={self._price_in(max_price, currency)}")
 
             min_price = item_config.min_price or self.config.min_price
             if min_price:
-                if min_price.isdigit():
-                    options.append(f"minPrice={min_price}")
-                else:
-                    price, cur = min_price.split(" ", 1)
-                    if currency and cur != currency:
-                        c = CurrencyConverter()
-                        price = str(int(c.convert(int(price), cur, currency)))
-                        if self.logger:
-                            self.logger.debug(
-                                f"""{hilight("[Search]", "info")} Converting price {max_price} {cur} to {price} {currency}"""
-                            )
-                    options.append(f"minPrice={price}")
+                options.append(f"minPrice={self._price_in(min_price, currency)}")
 
             category = item_config.category or self.config.category
             if category:
@@ -973,6 +972,44 @@ class FacebookMarketplace(Marketplace):
                         yield listing
                     else:
                         counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
+
+    def _price_in(self: "FacebookMarketplace", price: str, currency: str | None) -> str:
+        """A configured bound as the number Facebook's ``minPrice`` wants.
+
+        ``"600000"`` passes straight through.  ``"500 USD"`` is converted into
+        the currency the city prices in, when there is a rate -- that is the
+        whole point of naming a currency on a city, and it lets one maximum be
+        written once for cities in different countries.
+
+        When there is no rate the number is sent as written, with a warning.
+        Declining is not a detail: the ECB publishes no rate for CLP, ARS, COP,
+        PEN or UYU, which is most of where this monitor looks, and the code that
+        was here converted unconditionally -- so a Chilean city that named its
+        own currency raised out of the middle of building a search URL.  A
+        filter that is slightly wrong is recoverable; a search that cannot
+        assemble its address is not.
+        """
+        if price.isdigit():
+            return price
+        amount, source = price.split(" ", 1)
+        if not currency or source == currency:
+            return amount
+        converted = convert_price(int(amount), source, currency)
+        if converted is None:
+            if self.logger:
+                self.logger.warning(
+                    f"""{hilight("[Search]", "fail")} No exchange rate for """
+                    f"""{hilight(source)} to {hilight(currency)}, so {price} is sent to """
+                    """Facebook as the plain number. Write the bound in the city's own """
+                    """currency to filter exactly."""
+                )
+            return amount
+        if self.logger:
+            self.logger.debug(
+                f"""{hilight("[Search]", "info")} Converting price {price} to """
+                f"""{converted} {currency}"""
+            )
+        return str(converted)
 
     def get_listing_details(
         self: "FacebookMarketplace",
@@ -1128,29 +1165,42 @@ class FacebookMarketplace(Marketplace):
         if self.junk_price(item, item_config):
             return False
 
-        # get antikeywords from both item_config or config
-        antikeywords = item_config.antikeywords
-        if antikeywords and (
-            is_substring(antikeywords, item.title + " " + item.description, logger=self.logger)
-        ):
+        # The word rules -- excluded and required, each in three scopes -- all
+        # live in `keyword_filters`, which also decides *when* each one can be
+        # answered.  Not a boolean: a requirement that needs a description the
+        # card does not carry is unanswered rather than failed, and treating
+        # those two as the same is how a filter empties a search.
+        excluded = keyword_filters.excluded_by(
+            item_config,
+            item.title,
+            item.description,
+            fallback=None,
+            description_available=description_available,
+            logger=self.logger,
+        )
+        if excluded is not None:
+            key, words = excluded
             if self.logger:
                 self.logger.info(
-                    f"""{hilight("[Skip]", "fail")} Exclude {hilight(item.title)} due to {hilight("excluded keywords", "fail")}: {", ".join(antikeywords)}"""
+                    f"""{hilight("[Skip]", "fail")} Exclude {hilight(item.title)} due to """
+                    f"""{hilight(EXCLUDE_LABELS[key], "fail")}: {", ".join(words)}"""
                 )
             return False
 
-        # if the return description does not contain any of the search keywords
-        keywords = item_config.keywords
-        if (
-            description_available
-            and keywords
-            and not (
-                is_substring(keywords, item.title + "  " + item.description, logger=self.logger)
-            )
-        ):
+        missing = keyword_filters.missing_required(
+            item_config,
+            item.title,
+            item.description,
+            fallback=None,
+            description_available=description_available,
+            logger=self.logger,
+        )
+        if missing is not None:
+            key, words = missing
             if self.logger:
                 self.logger.info(
-                    f"""{hilight("[Skip]", "fail")} Exclude {hilight(item.title)} {hilight("without required keywords", "fail")} in title and description."""
+                    f"""{hilight("[Skip]", "fail")} Exclude {hilight(item.title)} """
+                    f"""{hilight(REQUIRE_LABELS[key], "fail")}: {", ".join(words)}"""
                 )
             return False
 

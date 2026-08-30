@@ -16,6 +16,13 @@ kind of confident wrong answer this module exists to prevent.
 **Runtime** -- what is happening: the phase, the search under way, when each
 search last ran and runs next, how the listing re-checks are getting on.
 
+**Resources** -- what the machine running all this is spending, and how many
+browsers and tabs the scraper is holding.  On this response rather than an
+endpoint of its own, because every screen already polls this one and both
+halves are read from state somebody else keeps: the machine's from a background
+sample (:mod:`ai_marketplace_monitor.system_metrics`), the browsers' from the
+threads that own them (:mod:`ai_marketplace_monitor.control`).
+
 **Applied** -- the last change the loop took up *while running*, and what it
 cost: which searches were added, removed or edited, and whether one had to be
 abandoned half way because the user deleted it.  Two equal hashes say a change
@@ -33,7 +40,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .. import control
+from .. import control, system_metrics
 from ..pause import pause_state, run_state
 from ..utils import calculate_file_hash
 from .secrets_redact import redact_tree
@@ -226,4 +233,10 @@ def scraper_state(config_files: List[Path]) -> Dict[str, Any]:
         "search_count": len({str(row["item"]) for row in searches if row.get("enabled")}),
         "active_count": sum(1 for row in searches if row.get("running")),
         "updates": control.updates(),
+        # What the machine running all this is spending, and how many browsers
+        # and tabs the scraper is holding.  Carried on the poll every screen
+        # already makes rather than on an endpoint of its own: it is read from
+        # a background sample and a stale dictionary, so it costs a copy, and a
+        # second endpoint would be a second timer to keep in step with this one.
+        "resources": system_metrics.snapshot(),
     }

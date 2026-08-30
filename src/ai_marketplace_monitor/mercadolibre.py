@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import BrowserContext, Page  # type: ignore
 
-from . import control
+from . import control, keyword_filters
 from .listing import Listing
 from .marketplace import ItemConfig, ListingStatus, Marketplace, MarketplaceConfig
 from .observations import is_known, record_observation
@@ -45,6 +45,27 @@ from .utils import (
     human_delay,
     is_substring,
 )
+
+
+#: What each rule is called in the log line that fires it.
+#:
+#: The words alone are not enough: with three exclusion lists in one search,
+#: "excluded keywords: ps4" leaves the user to work out which of the three threw
+#: the listing away, and whether the match was in the title or buried in the
+#: description.  Defined here rather than in `keyword_filters`, which is kept
+#: free of user-facing text so it stays a pure predicate.
+EXCLUDE_LABELS = {
+    "antikeywords": "excluded keywords",
+    "antikeywords_title": "excluded keywords in the title",
+    "antikeywords_description": "excluded keywords in the description",
+}
+
+REQUIRE_LABELS = {
+    "keywords": "without required keywords",
+    "keywords_title": "without required keywords in the title",
+    "keywords_description": "without required keywords in the description",
+}
+
 
 #: Site id -> the host that serves its search pages.  Only the ids Mercado Libre
 #: itself publishes; the Chilean one is the one verified against live pages.
@@ -1070,29 +1091,42 @@ class MercadoLibreMarketplace(Marketplace):
         if self.junk_price(item, item_config):
             return False
 
-        antikeywords = item_config.antikeywords or getattr(self.config, "antikeywords", None)
-        if antikeywords and is_substring(
-            antikeywords, f"{item.title} {item.description}", logger=self.logger
-        ):
+        # The word rules -- excluded and required, each in three scopes -- all
+        # live in `keyword_filters`, which also decides *when* each one can be
+        # answered.  Not a boolean: a requirement that needs a description the
+        # card does not carry is unanswered rather than failed, and treating
+        # those two as the same is how a filter empties a search.
+        excluded = keyword_filters.excluded_by(
+            item_config,
+            item.title,
+            item.description,
+            fallback=self.config,
+            description_available=description_available,
+            logger=self.logger,
+        )
+        if excluded is not None:
+            key, words = excluded
             if self.logger:
                 self.logger.info(
                     f"""{hilight("[Skip]", "fail")} Exclude {hilight(item.title)} due to """
-                    f"""{hilight("excluded keywords", "fail")}: {", ".join(antikeywords)}"""
+                    f"""{hilight(EXCLUDE_LABELS[key], "fail")}: {", ".join(words)}"""
                 )
             return False
 
-        keywords = item_config.keywords
-        if (
-            description_available
-            and keywords
-            and not is_substring(
-                keywords, f"{item.title}  {item.description}", logger=self.logger
-            )
-        ):
+        missing = keyword_filters.missing_required(
+            item_config,
+            item.title,
+            item.description,
+            fallback=self.config,
+            description_available=description_available,
+            logger=self.logger,
+        )
+        if missing is not None:
+            key, words = missing
             if self.logger:
                 self.logger.info(
                     f"""{hilight("[Skip]", "fail")} Exclude {hilight(item.title)} """
-                    f"""{hilight("without required keywords", "fail")}."""
+                    f"""{hilight(REQUIRE_LABELS[key], "fail")}: {", ".join(words)}"""
                 )
             return False
 

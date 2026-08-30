@@ -7,6 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Excluded price patterns can be saved under a name and reused**
+  (`[price_patterns.<name>]`, referred to by `excluded_price_pattern_sets`).
+  The noise belongs to the market rather than to one search — the run of nines
+  somebody typed to get past a required field, the keyboard walk, the `0` that
+  means the listing is an advert — so the same three or four rules are wanted in
+  every search, and until now they had to be retyped into each one. Retyped
+  rules drift: one search excludes `9*` and its neighbour excludes `99999`, and
+  the group with the placeholder still in it is the one whose average nobody can
+  trust. Deliberately the same shape as `[region.*]` rather than a mechanism of
+  its own: a section you name, referred to by that name, and resolved into the
+  real values before anything runs, so nothing downstream learns a new concept —
+  `junk_price` still reads one flat list, and the effective configuration the web
+  UI shows is that resolved list rather than a name you have to go and look up.
+  A search's own patterns still work and add to the named ones, duplicates
+  collapsing. A name that does not exist is refused with the name in the message.
+- **Excluded and required words can be narrowed to the title or to the
+  description** (`keywords_title`, `keywords_description`, `antikeywords_title`,
+  `antikeywords_description`). The two original keys read the title and the
+  description glued together, which is the right default and a poor only option:
+  "no busco fundas" is a rule about the *title*, because every listing of a
+  console mentions a case somewhere in its description, and "tiene que decir
+  sellado" is a rule about the *description*, because a title has room for four
+  words. `keywords` and `antikeywords` are untouched, so a configuration written
+  before this behaves identically.
+
+  **Where a rule looks decides when it can be answered, and that is the half
+  that reaches the scrapers.** A shop's results grid carries titles and no
+  descriptions, so a search whose only word rules are title ones now reads a
+  whole catalogue without opening a single product page — which on Lider is the
+  difference between one request that is served and forty-eight that are
+  refused. A rule that cannot be answered yet is *undecided*, never "failed" and
+  never "met": a card that does not show a required word has not broken the
+  rule, and a banned word found in the title is settled whatever else is
+  missing. Facebook and Mercado Libre still open every listing they keep, because
+  the page is where the seller, the location and the condition are, and that was
+  never about the filters.
+- **The status screen reports what the machine running the scraper is
+  spending**: CPU, RAM, disk, GPU, the monitor's own process, and how many
+  browsers and tabs the *scraper* has open. Sampled on a background thread every
+  five seconds and served from that sample, so the screen costs a dictionary
+  copy and nothing ever waits on a measurement. Nothing is invented: a reading
+  that cannot be taken says so, with its reason, rather than reporting a zero —
+  a GPU at 0% on a machine that has none reads as an idle GPU, which is worse
+  than no number at all. The browser count is built from what the threads owning
+  those browsers publish, so a Chrome you have open beside it is never counted.
+  `psutil` is a new dependency and is imported defensively.
+
+### Changed
+- **CLP, ARS, COP, PEN and UYU are accepted currencies.** The list of codes the
+  monitor accepted *was* the list `CurrencyConverter` has rates for, and those
+  are two different lists. Chile is the case that forced them apart: CLP was
+  absent, so a Chilean city could not name its own currency at all — while ARS
+  had been in the enum from the start and the converter has never known it, so
+  an Argentine city that named its currency crashed the search the first time a
+  price needed converting. The conversion is now allowed to decline: a bound
+  written as `500 USD` for a city that prices in CLP is sent as the plain
+  number, with a warning, which is exactly what happens when no currency is
+  named. A filter that is slightly wrong is recoverable; a search that cannot
+  assemble its own address is not. The converter is also built once instead of
+  four times per city.
+
+### Fixed
+- **Pressing "Iniciar" reads the configuration file.** Reported as intermittent
+  and was not: a stopped monitor held the configuration it was stopped with, and
+  nothing between the button and the schedule being rebuilt consulted the file
+  again. A search created while the monitor was stopped was therefore invisible
+  to it — the count of configured searches came from the *old* object, found
+  none, and the wait that followed watched for a change that had already
+  happened. `doze` starts its file watcher when it is called, so an edit made a
+  minute earlier is not an edit it can ever see; the monitor then sat there for
+  an hour, and stopping and starting again appeared to help only when whatever
+  the user did next happened to touch the file at the right moment. Resuming now
+  re-reads and adopts, and the wait for searches asks the file before it decides
+  there is nothing to do. Same for a plain pause.
+- **A search switched off while the monitor was stopped loses its slot.** The
+  second half of the same bug and a separate cause: `schedule_jobs` registers
+  jobs with the `schedule` package, which keeps them for the life of the
+  process, and the loop added to that registry rather than rebuilding it. So the
+  entry a search had before the stop outlived the configuration that created it,
+  the loop found a non-empty registry, took the "idle" branch, and the interface
+  announced "próxima búsqueda" for a search that could not run. Rebuilt on every
+  pass now; each job's last run is put back, so nothing gains a fresh interval.
+- **A stop while the monitor had nothing to search no longer opens a browser.**
+  The wait for searches returns early when the switch is thrown, and what
+  followed it opened Chromium — so "Detener" on an idle monitor answered with a
+  browser window.
+
 ### Changed
 - **The container looks like the machine it is standing in for, and this is
   measured rather than argued.** The same fingerprint probe was run on Windows

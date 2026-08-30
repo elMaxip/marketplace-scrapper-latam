@@ -707,6 +707,33 @@ class MarketplaceMonitor:
         # happens now rather than at the end of whatever is running.
         self._ingest_trackers()
 
+    def _refresh_config(self: "MarketplaceMonitor") -> bool:
+        """Re-read the files and take up what is there.  True when it changed.
+
+        The counterpart of :meth:`_config_guard` for the moments when nothing is
+        running.  A checkpoint inside a search asks "has the file moved under
+        me?"; this asks "what does the file say?", which is a different question
+        and the one that has to be answered before the loop decides it has
+        nothing to do.
+
+        Both places that call it were the same bug.  A stopped monitor holds the
+        configuration it was stopped with, and nothing between the "Iniciar"
+        button and the schedule being rebuilt used to consult the file: the loop
+        resumed on the old object, ``_configured_searches`` counted the old
+        searches, and a search added while the monitor was stopped was invisible
+        to it.  ``doze`` could not save it either -- it starts its file watcher
+        when it is called, so a change that already happened is not a change it
+        can ever see -- which is why the wait that followed lasted an hour and
+        why stopping and starting again sometimes appeared to help and sometimes
+        did not.  A start reads the configuration.  That is all this is.
+        """
+        probe = self._probe_config(force=True)
+        if probe is None or not probe.readable:
+            return False
+        self._adopt_config(probe)
+        self._schedule_dirty = True
+        return True
+
     def _apply_changes_while_running(self: "MarketplaceMonitor") -> bool:
         """Whether an edit to the running search is taken into it, or ends it."""
         if self.config is None:
@@ -1431,7 +1458,29 @@ class MarketplaceMonitor:
             # started after the import.
             self._seed_imported_sessions()
         self._browsers_idle = False
+        self._report_browser()
         return self.context
+
+    def _report_browser(self: "MarketplaceMonitor") -> None:
+        """Publish the monitor's own browser and its tab count.
+
+        The counterpart of :meth:`BrowserLane._report`, and on this thread for
+        the same reason: ``context.pages`` reaches the Playwright driver, and
+        the driver belongs to the thread that started it, so the web UI is told
+        the number rather than allowed to ask for it.
+        """
+        try:
+            if context_is_alive(self.context):
+                assert self.context is not None
+                control.report_browser(
+                    control.MAIN_LANE, len(self.context.pages), "browser-profile-main"
+                )
+            else:
+                control.forget_browser(control.MAIN_LANE)
+        except KeyboardInterrupt:
+            raise
+        except Exception:  # pragma: no cover - reporting must not break a search
+            control.forget_browser(control.MAIN_LANE)
 
     def _renew_main_browser(self: "MarketplaceMonitor") -> BrowserContext:
         """Throw the monitor's own browser away, profile and all, and reopen it.
@@ -1457,6 +1506,7 @@ class MarketplaceMonitor:
         for marketplace in self.active_marketplaces.values():
             marketplace.set_context(self.context)
         self._browsers_idle = False
+        self._report_browser()
         return self.context
 
     def _release_idle_browsers(self: "MarketplaceMonitor", idle_seconds: float) -> None:
@@ -1509,6 +1559,7 @@ class MarketplaceMonitor:
         never do this itself -- which is the whole reason cancellation is a flag
         the loop reads rather than a close() from the request handler.
         """
+        control.forget_browser(control.MAIN_LANE)
         for marketplace in self.active_marketplaces.values():
             try:
                 marketplace.stop()
@@ -1917,6 +1968,9 @@ class MarketplaceMonitor:
         try:
             with control.running(item=tags[0] if tags else None):
                 job.run()
+            # Between two searches on this thread nothing can open or close a
+            # tab, so this is the moment the count is both settled and current.
+            self._report_browser()
         except CancelledScrape:
             self._abandon_scrape()
             return JobOutcome.CANCELLED
@@ -4304,6 +4358,12 @@ class MarketplaceMonitor:
             )
         # Resuming cancels the cancellation: whatever was asked for is over.
         control.clear_cancel()
+        # And it reads the configuration, before anything is scheduled from it.
+        # Starting means starting on what the file says now: the whole reason a
+        # person stops the monitor is often to change something, and the change
+        # they made while it was stopped is exactly the one nothing else would
+        # have noticed.  See `_refresh_config`.
+        self._refresh_config()
         # From now, not from whenever the round was due before the pause: a slot
         # drawn an hour ago has no claim on a monitor that has just come back.
         self._plan_next_review()
@@ -4343,7 +4403,15 @@ class MarketplaceMonitor:
         ends as soon as a search is added from the web UI, without a restart.
         """
         announced = False
-        while self._configured_searches() == 0:
+        while True:
+            # The file first, then the decision.  This used to read a snapshot
+            # taken before the monitor was stopped, so a search added while it
+            # was stopped was not there to be counted -- and the wait below then
+            # waited for a *future* change, which the one that had already
+            # happened could never be.  See `_refresh_config`.
+            self._refresh_config()
+            if self._configured_searches() > 0:
+                break
             control.set_phase(
                 "waiting_for_config", "No searches are configured; nothing to do."
             )
@@ -4371,7 +4439,6 @@ class MarketplaceMonitor:
             )
             if is_paused():
                 return
-            self.load_config_file()
         if announced and self.logger:
             self.logger.info(
                 f"""{hilight("[Config]", "succ")} """
@@ -4458,12 +4525,27 @@ class MarketplaceMonitor:
             self.wait_while_paused()
             self.handle_pause()
             self._wait_for_searches()
+            # `_wait_for_searches` returns early when the switch is thrown while
+            # it waits, and what follows opens a browser: without this, pressing
+            # "Detener" on a monitor with nothing to search opened a Chromium
+            # window as its answer.  Back to the top, where a stop is waited out.
+            if is_paused():
+                continue
             self._ensure_browser()
             # Reviews with a lane of their own start here and keep going while
             # everything below searches: that concurrency is the whole point of
             # the setting.  A no-op when it is off.
             self._start_review_lane()
-            self.schedule_jobs()
+            # Rebuilt, not added to.  `schedule_jobs` registers jobs and the
+            # `schedule` package keeps them for the life of the process, so a
+            # search switched off while the monitor was stopped kept the entry
+            # it had before the stop: the loop found a non-empty registry, took
+            # the "idle" branch, and the interface reported "próxima búsqueda:
+            # consola" for a search that could not run.  Clearing first is the
+            # same step `_config_guard` takes when a change lands mid-pass, and
+            # it costs nothing: `_seed_job_from_memory` puts each job's last run
+            # back, so rebuilding does not hand anything a fresh interval.
+            self._rebuild_schedule()
             self._publish_schedule()
             if not schedule.get_jobs():
                 # Searches exist but none could be scheduled -- every one of

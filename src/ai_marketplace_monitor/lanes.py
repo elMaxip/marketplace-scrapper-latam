@@ -57,6 +57,7 @@ from typing import Any, Callable, Dict, Optional
 
 from playwright.sync_api import BrowserContext, Playwright  # type: ignore
 
+from . import control
 from .browser_engine import sync_playwright
 
 from .marketplace import Marketplace
@@ -201,6 +202,7 @@ class BrowserLane:
             return
 
         self._ready.set()
+        self._report()
         try:
             while True:
                 task = self._queue.get()
@@ -212,9 +214,38 @@ class BrowserLane:
                 except BaseException as error:  # noqa: BLE001 - handed to the caller
                     task.error = error
                 finally:
+                    # After the task, not during: a tab is opened and closed by
+                    # a task, so between two of them the count cannot change --
+                    # which is what makes a boundary report exact rather than a
+                    # sample.  Before `done` is set, so a caller that reads the
+                    # inventory the instant its task returns sees this lane's
+                    # answer rather than the previous one.
+                    self._report()
                     task.done.set()
         finally:
             self._teardown(playwright)
+
+    def _report(self: "BrowserLane") -> None:
+        """Publish this lane's tab count.  Only ever called on its own thread.
+
+        Reading ``context.pages`` reaches the Playwright driver, and the driver
+        belongs to the thread that started it -- which is why the web UI is told
+        the number instead of asking for it.  A context that has died answers by
+        raising; that is "no browser here", not an error worth propagating out
+        of a lane doing something else.
+        """
+        try:
+            if context_is_alive(self._context):
+                assert self._context is not None
+                control.report_browser(
+                    self.name, len(self._context.pages), f"browser-profile-{self.name}"
+                )
+            else:
+                control.forget_browser(self.name)
+        except KeyboardInterrupt:
+            raise
+        except Exception:  # pragma: no cover - reporting must not break a lane
+            control.forget_browser(self.name)
 
     def _live_context(self: "BrowserLane", playwright: Playwright) -> BrowserContext:
         """This lane's browser, opened again if it is no longer there.
@@ -251,6 +282,7 @@ class BrowserLane:
             except Exception:
                 pass
         self._context = self._launch(playwright, self.name)
+        self._report()
         return self._context
 
     def renew_context(self: "BrowserLane") -> BrowserContext:
@@ -288,6 +320,7 @@ class BrowserLane:
         # reuses the directory would bring the flagged identity straight back.
         reset_profile(self.name)
         self._context = self._launch(self._playwright, self.name)
+        self._report()
         return self._context
 
     def _fail_pending(self: "BrowserLane", error: BaseException) -> None:
@@ -307,6 +340,7 @@ class BrowserLane:
         On the lane's own thread, always: these are Playwright objects, and the
         thread that made them is the only one allowed to close them.
         """
+        control.forget_browser(self.name)
         for marketplace in list(self.marketplaces.values()):
             try:
                 marketplace.stop()

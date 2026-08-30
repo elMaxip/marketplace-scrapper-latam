@@ -43,6 +43,10 @@ dependencies = [
   "itsdangerous>=2.1",
   "bcrypt>=4.0",
   "python-multipart>=0.0.9",
+  # System metrics for the status screen (`system_metrics.py`).  Read
+  # defensively, so an environment without it shows what it can and says
+  # "no disponible" for the rest rather than failing.
+  "psutil>=5.9",
 ]
 
 [project.urls]
