@@ -1264,6 +1264,23 @@ def hilight(text: str, style: str = "name") -> str:
     return f"[{color}]{text}[/{color}]"
 
 
+#: Every tag `hilight` above can produce, plus the few Rich styles used
+#: directly.  Kept beside the function that writes them so the two cannot drift.
+_MARKUP = re.compile(r"\[/?(?:cyan|red|blue|green|gray|grey|yellow|magenta|bold|dim)\]")
+
+
+def strip_markup(text: str) -> str:
+    """A log line as a person reads it, with Rich's colour tags removed.
+
+    The terminal handler renders the tags as colour; the file handler used to
+    write them out literally, so ``ai-marketplace-monitor.log`` was full of
+    ``[blue][Pause][/blue]`` and the reader had to mentally delete half of every
+    line.  Used on the way *out* to the file, and again when an old file that
+    still has the tags in it is shown in the interface.
+    """
+    return _MARKUP.sub("", text)
+
+
 def fetch_with_retry(
     url: str,
     timeout: int = 10,

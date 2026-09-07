@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The log files are readable from the interface.** The console has always
+  shown the live buffer -- the last couple of thousand records, in memory -- and
+  the monitor has always *also* been writing a rotating file beside it: a
+  megabyte each, five backups, roughly six megabytes of history that was
+  reachable only by opening a shell in the container. "Registro del scraper" now
+  says which file it is showing, offers the rotations by name, and has a button
+  that hands over all of them as one zip. A rotated file is labelled as what it
+  is, because reading an hour-old file without being told looks exactly like a
+  scraper that has stopped. The rotation itself is untouched: same handler, same
+  size, same five backups.
 - **The status screen says *which machine* its numbers describe.** Reported as
   a bug and it was one, though not the one it looked like: a 16 GB Windows
   laptop showed 7.7 GB, and the reasonable conclusion was that the metric was
@@ -40,6 +50,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is why `life_used` is allowed to be absent beside a drive in perfect health.
 
 ### Fixed
+- **`get_condition failed: AttributeError: 'Locator' object has no attribute
+  'query_selector_all'`.** patchright -- the stealth driver, which is installed
+  in the container -- is a *fork* of Playwright, so its `Locator` is a different
+  class object. The code that turns a locator into a walkable element handle
+  tested `isinstance(x, playwright.sync_api.Locator)`, which was False for every
+  locator the monitor actually held, read that as "this is already a handle" and
+  walked the locator. Intermittent because only the layouts that climb the DOM
+  from a locator reach it: one listing parsed perfectly and the next lost its
+  condition and its location. Both drivers' classes are now known to
+  `browser_engine`, and `as_element_handle()` is the single place a locator
+  becomes a node.
+- **Sessions stopped overwriting each other.**  Reported as "las sesiones son
+  impredecibles: a veces funciona una y a veces la otra".  One browser profile
+  holds every platform, and ``Marketplace.save_session`` wrote the *whole* cookie
+  jar into ``sessions/<name>.json`` -- so on a real installation
+  ``sessions/facebook.json`` held 50 cookies of which **9 were Facebook's and 32
+  were Mercado Libre's**: a snapshot of whatever state Mercado Libre was in when
+  Facebook last signed in, which for a logged-out moment is a logged-out session
+  filed under another platform's name.  Fifteen of those share a name with one
+  in a freshly imported ``sessions/mercadolibre.json``, so seeding a profile
+  replayed both files and whichever went in last won -- decided by the order of
+  the sections in the config file.  Every platform now writes only its own
+  domains, as the shops already did, and the filter is applied when *reading*
+  too, so a file that is already polluted stops doing damage without anybody
+  re-pasting anything.
+- **The sessions panel describes the session, not the file.**  On a real
+  installation ``sessions/facebook.json`` written before the save learned to
+  filter holds 52 cookies, 43 of them Mercado Libre's -- and the panel said "52
+  cookies guardadas de facebook.com, listado.mercadolibre.cl,
+  mercadoclics.com...", which is a true sentence about a file and a false one
+  about a Facebook session, shown to somebody already trying to work out why
+  their sessions behave oddly.  The counts are now of the cookies that will
+  actually be used, with the foreign ones reported separately rather than
+  hidden.
+- **Lider's "signed in" test is one measured cookie, not three guessed ones.**
+  It declared ``customer``, ``auth`` and ``CID``, and the check that keeps a
+  stored session up to date requires *every* name -- so one name that is not
+  always set makes the whole test silently unanswerable and the session is never
+  refreshed, with nothing saying so.  Measured against the live site (anonymous
+  visit, page fully loaded, 23 cookies on ``lider.cl``): none of the three
+  appears without an account, so ``customer`` alone is safe in the direction
+  that matters.  The measurement is kept as a test, because the useful fact is a
+  negative one: Lider hands ``ACID`` to every anonymous visitor, one character
+  from the ``CID`` that was declared, and "correcting" it would make a
+  signed-out browser look signed in.
+- **Sodimac's saved session stopped losing its login half.**  Its sign-in is
+  Falabella's, so the import accepts ``falabella.com`` cookies -- but the save
+  kept only ``hosts``, i.e. ``sodimac.cl``.  The first page Sodimac served
+  rewrote the file without the Falabella cookies, so a profile rebuilt after
+  that had no copy of the login anywhere.  A save now keeps everything the
+  import accepts, which is a rule with a test behind it rather than a habit: the
+  suite checks it for every platform, so the next one added cannot get it wrong
+  quietly.
+- **A failed Facebook login no longer destroys a pasted session.**
+  ``save_device_state`` keeps ``datr`` across a failed attempt so the next one
+  arrives as the same device -- and it did that by replacing the file with five
+  device cookies.  Right when the stored file is a session this monitor wrote
+  and has just watched fail; destruction when it is the user's own paste, which
+  a login failing for a challenge, a two-factor timeout or a slow site says
+  nothing about.  An imported file now keeps its cookies and takes the device
+  ones on top.  It was also filtering by cookie *name* alone, so a profile
+  holding several sites wrote Mercado Libre's ``locale`` into Facebook's file;
+  it filters by domain too.
+- **The stored session keeps up with the live one.**  A site rotates its
+  session while it is being used -- Mercado Libre issues a new ``ssid`` as you
+  browse -- and the file was only ever written by an interactive sign-in, so
+  ``sessions/mercadolibre.json`` went on holding the token imported weeks
+  earlier.  Nothing breaks while the profile lives; the day it is rebuilt (a
+  recovery after a refusal, a new container, a ``reset_profile``) the monitor
+  reseeded a token the site had long retired.  It is now written back at the end
+  of a search that finished, and only while the browser still holds the cookies
+  that mean signed in -- ``ssid`` for Mercado Libre, ``c_user`` and ``xs`` for
+  Facebook.  Every one of them, not any: measured on a signed-out Mercado Libre
+  profile, ``orgnickp``, ``orguserid`` and ``orguseridp`` are all still there and
+  only the session is gone, so an "any" test would have written a signed-out jar
+  over a good import.  Costs a read of the cookie jar the browser already has;
+  no page is loaded to decide it.
+- **A session that falls out of the profile is put back.**  An import was marked
+  applied once and never replayed, so a session lost afterwards -- the site
+  logged us out, another platform's file overwrote it, the profile was rebuilt
+  -- stayed lost with a good copy sitting on disk and a button nobody knew to
+  press.  When a platform reports it is not signed in *and* stored cookies are
+  missing from the browser, they are put back and the question asked again.
+  Bounded on purpose: when every stored cookie **is** in the browser and the
+  answer is still no, the site was handed the session and refused it, and
+  re-injecting that for ever would be a loop.
+- **A refused session says which cookie the site threw away.**  "Loaded the
+  imported session (17 cookies)" counted what was read off disk, not what the
+  browser kept: two were already expired (a browser drops those silently) and
+  the site deleted ``ssid`` -- the session itself -- on the first request.  The
+  monitor then blamed the export ("probably copied from a different country's
+  site"), sending the reader to re-export cookies that were fine.  It now names
+  what was discarded, which is the difference between "your paste is wrong" and
+  "the site has invalidated that session".
+- **A monitor that stopped searching and did not say so.**  The driver is a
+  *node process*, and it can die -- a container short of memory, a crash, a
+  Docker Desktop hiccup.  Nothing about the Python object changes when it does,
+  and the two ways it then behaves are why this was so hard to see: a call on
+  something that already exists raises at once ("Connection closed while reading
+  from the driver"), while ``launch_persistent_context`` **blocks for ever** --
+  its timeout is enforced by the driver, so a missing driver is a missing
+  timeout.  The log's last line was "Attempting to launch chromium browser..."
+  and nothing followed it, on a monitor that from the outside was simply not
+  searching any more.  A driver is now never kept across a browser that has been
+  closed or lost: stopping a dead one returns immediately, and a fresh one costs
+  about half a second, once per idle gap.  The lanes get the same rule, and each
+  one now stops the driver it *has* rather than the one it started with, which
+  used to leave a node process per replacement running for the life of the
+  container.
+- **Tabs are closed when nothing is using them.** A marketplace used to keep its
+  tab for the life of the process, so a browser sitting idle between rounds was
+  holding a rendered Facebook results page, the last listing a review round
+  read, and -- the one that made it obvious -- a Mercado Libre tab parked on the
+  account page by the session probe that opened it and never gave it back. A tab
+  now belongs to a task and is given back when that task ends, including when it
+  ends by raising, by being cancelled or by timing out. Never the last tab: a
+  persistent context with no pages closes itself, so the last one is parked on
+  `about:blank` and claimed again by the next search.
+- **The log file has a timestamp and a level in it.** It was written with the
+  terminal's own format -- the bare message -- so `ai-marketplace-monitor.log`
+  said *what* happened and never *when*, with Rich's `[blue]...[/blue]` around
+  every phrase. It now carries a time, a level, and the line without the colour
+  tags.
+- **A shop's session probe can no longer close the browser.** It borrows a tab
+  when there is none to borrow and closed it afterwards unconditionally; when
+  that was the only tab, closing it took the persistent context down with it,
+  and with it the profile lock and the shop's cookies.
 - **A container's memory ceiling is now the number shown.** `/proc/meminfo`
   knows nothing about cgroups, so a container capped at 4 GB on a 64 GB host
   reported 64 GB and looked healthy right up to the moment the kernel killed it.

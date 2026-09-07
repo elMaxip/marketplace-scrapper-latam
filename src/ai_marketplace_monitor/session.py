@@ -350,7 +350,9 @@ def _write_now(marketplace_name: str, state: Dict[str, Any]) -> bool:
 DEVICE_COOKIES = frozenset({"datr", "sb", "wd", "dpr", "locale"})
 
 
-def save_device_state(marketplace_name: str, context: Any) -> bool:
+def save_device_state(
+    marketplace_name: str, context: Any, domains: Iterable[str] = ()
+) -> bool:
     """Persist only the device-identity cookies, discarding session state.
 
     Called when a login *fails*.  Without this, every failed attempt throws away
@@ -362,16 +364,39 @@ def save_device_state(marketplace_name: str, context: Any) -> bool:
     Session and checkpoint cookies are deliberately dropped: replaying those
     would restore the half-authenticated state that failed, putting the next run
     straight back into the same challenge.
+
+    **Except over an import.**  Dropping the session cookies is right when the
+    stored file is one this monitor wrote and has just watched fail; it is
+    destruction when the stored file is the user's own paste.  A login can fail
+    for reasons that say nothing about the cookies -- a challenge, a two-factor
+    prompt that timed out, the site being slow -- and a failed attempt used to
+    reduce ``sessions/facebook.json`` to five device cookies, taking a
+    hand-pasted session with it and leaving no copy anywhere.  An imported file
+    therefore keeps its cookies and takes the device ones on top.
+
+    Filtered by domain as well as by name, which it was not.  ``locale``,
+    ``dpr``, ``wd`` and ``sb`` are names any site may use, so a jar holding
+    Facebook and Mercado Libre at once wrote Mercado Libre's ``locale`` into
+    Facebook's file -- the same cross-contamination
+    :func:`own_cookies` exists to stop.
     """
     try:
         state = context.storage_state()
         kept = [
             cookie
-            for cookie in state.get("cookies", [])
+            for cookie in own_cookies(state.get("cookies", []), domains)
             if cookie.get("name") in DEVICE_COOKIES
         ]
         if not kept:
             return False
+        stored = load_session(marketplace_name) or {}
+        if _is_imported(stored):
+            fresh = {(c.get("name"), c.get("domain")) for c in kept}
+            kept = [
+                cookie
+                for cookie in stored.get("cookies") or []
+                if (cookie.get("name"), cookie.get("domain")) not in fresh
+            ] + kept
         return _write(marketplace_name, {"cookies": kept, "origins": []})
     except KeyboardInterrupt:
         raise
@@ -472,6 +497,39 @@ def domain_allowed(domain: str, allowed: Iterable[str]) -> bool:
         host == candidate.lower() or host.endswith("." + candidate.lower())
         for candidate in allowed
     )
+
+
+def own_cookies(cookies: Iterable[Any], domains: Iterable[str]) -> List[Dict[str, Any]]:
+    """Only the cookies that belong to this platform.
+
+    Applied on the way *in* as well as on the way out, and the "in" half is the
+    repair.  ``Marketplace.save_session`` used to write the whole jar, so a
+    profile that holds Facebook and Mercado Libre at once produced a
+    ``sessions/facebook.json`` carrying thirty Mercado Libre cookies -- a
+    snapshot of whatever state Mercado Libre happened to be in when Facebook
+    last signed in, which for a logged-out moment means a *logged-out* Mercado
+    Libre session stored under Facebook's name.
+
+    Seeding then replayed it.  Fifteen of the seventeen cookies in a freshly
+    imported ``mercadolibre.json`` share a name with one in that file, so
+    whichever was seeded last won, and which one that was depended on the order
+    of the sections in the config file.  That is the whole of "a veces funciona
+    en una y en la otra no, y cuando quiera".
+
+    Filtering on read means an already-polluted file is repaired without the
+    user re-pasting anything: the foreign cookies simply stop being replayed.
+
+    No domains means the platform cannot say which are its own, and everything
+    is kept -- the behaviour before any of this existed.
+    """
+    allowed = list(domains)
+    if not allowed:
+        return [cookie for cookie in cookies if isinstance(cookie, dict)]
+    return [
+        cookie
+        for cookie in cookies
+        if isinstance(cookie, dict) and domain_allowed(cookie.get("domain"), allowed)
+    ]
 
 
 def normalize_cookie(raw: Any, default_domain: str = "") -> Optional[Dict[str, Any]]:
@@ -700,6 +758,16 @@ def drop_cookies(marketplace_name: str, names: Iterable[str]) -> int:
         return removed if _write_now(marketplace_name, state) else 0
 
 
+def _is_imported(state: Dict[str, Any]) -> bool:
+    """Whether this stored session is the user's own paste.
+
+    The one thing that must never be thrown away by a routine save: the monitor
+    can always write another session of its own, and cannot reproduce a paste.
+    """
+    meta = state.get("aimm")
+    return isinstance(meta, dict) and meta.get("source") == "imported"
+
+
 def import_is_pending(marketplace_name: str, lane: str | None = None) -> bool:
     """Whether a stored session is waiting to be loaded into *this* profile.
 
@@ -734,10 +802,9 @@ def import_is_unapplied(marketplace_name: str) -> bool:
     copy there is.
     """
     state = load_session(marketplace_name) or {}
-    meta = state.get("aimm")
-    if not isinstance(meta, dict) or meta.get("source") != "imported":
+    if not _is_imported(state):
         return False
-    return not _applied_profiles(meta)
+    return not _applied_profiles(state.get("aimm") or {})
 
 
 def rearm_import(marketplace_name: str) -> bool:
@@ -791,11 +858,21 @@ def mark_import_applied(marketplace_name: str, lane: str | None = None) -> None:
         _write_now(marketplace_name, state)
 
 
-def session_info(marketplace_name: str) -> Dict[str, Any]:
+def session_info(marketplace_name: str, domains: Iterable[str] = ()) -> Dict[str, Any]:
     """What is stored for a marketplace -- never *what* is stored.
 
     Counts, domains and dates only.  A cookie value is the session itself, and
     an interface that could read one back would be a way to lift it.
+
+    ``domains`` is the platform's own, and the counts are of the cookies that
+    will actually be *used*.  Without it the panel described the file rather
+    than the session: a ``sessions/facebook.json`` written before
+    :meth:`Marketplace.save_session` learned to filter holds 52 cookies of which
+    43 are Mercado Libre's, and the interface said "52 cookies guardadas de
+    facebook.com, listado.mercadolibre.cl, mercadoclics.com..." -- which is a
+    true sentence about a file and a false one about a Facebook session.  The
+    foreign ones are counted separately rather than hidden, because "there is
+    something in here that is not yours" is worth being able to see.
     """
     path = session_path(marketplace_name)
     state = load_session(marketplace_name)
@@ -803,6 +880,7 @@ def session_info(marketplace_name: str) -> Dict[str, Any]:
         return {
             "saved": False,
             "cookies": 0,
+            "foreign": 0,
             "domains": [],
             "saved_at": None,
             "expires_at": None,
@@ -810,7 +888,8 @@ def session_info(marketplace_name: str) -> Dict[str, Any]:
             "pending": False,
         }
 
-    cookies = [cookie for cookie in state.get("cookies") or [] if isinstance(cookie, dict)]
+    stored = [cookie for cookie in state.get("cookies") or [] if isinstance(cookie, dict)]
+    cookies = own_cookies(stored, domains)
     expiries = [
         float(cookie["expires"])
         for cookie in cookies
@@ -820,6 +899,9 @@ def session_info(marketplace_name: str) -> Dict[str, Any]:
     return {
         "saved": True,
         "cookies": len(cookies),
+        # Cookies in the file that belong to another platform and are therefore
+        # ignored on the way into a browser.  Normally zero.
+        "foreign": len(stored) - len(cookies),
         # Where it came from and whether a browser has taken it yet: an import
         # that is still pending is the difference between "nothing happened"
         # and "it will happen when the browser next starts".

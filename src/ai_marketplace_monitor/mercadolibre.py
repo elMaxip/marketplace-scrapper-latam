@@ -33,6 +33,7 @@ from .listing import Listing
 from .marketplace import ItemConfig, ListingStatus, Marketplace, MarketplaceConfig
 from .observations import is_known, record_observation
 from .session import load_session
+from .tabs import close_page
 from .utils import (
     BaseConfig,
     CounterItem,
@@ -393,6 +394,13 @@ class MercadoLibreMarketplace(Marketplace):
         domains = {urlparse(host).netloc.split(".", 1)[1] for host in LOGIN_HOSTS.values()}
         return tuple(sorted(domains))
 
+    #: Just `ssid`, and deliberately not the account cookies beside it.
+    #: Measured on a signed-out profile: `orgnickp`, `orguserid` and
+    #: `orguseridp` are all still there -- Mercado Libre leaves the identity
+    #: behind and clears only the session.  Listing them here would make a
+    #: signed-out browser look signed in.
+    session_cookies = ("ssid",)
+
     @classmethod
     def handles_url(cls: Type["MercadoLibreMarketplace"], url: str) -> bool:
         host = urlparse(url).netloc.lower()
@@ -541,13 +549,10 @@ class MercadoLibreMarketplace(Marketplace):
         finally:
             if temporary:
                 probe, self.page = self.page, working
-                try:
-                    # Never the last tab: a persistent context with no pages is
-                    # a browser that has closed itself.
-                    if probe is not None and self.context is not None and len(self.context.pages) > 1:
-                        probe.close()
-                except Exception:
-                    pass
+                # Never the last tab: a persistent context with no pages is a
+                # browser that has closed itself.  That rule lives in `tabs`
+                # now, so this and the shops' probe cannot drift apart.
+                close_page(probe, self.context, self.logger)
 
     def _session_cookie_names(self: "MercadoLibreMarketplace") -> List[str]:
         """Which Mercado Libre cookies this browser carries -- names only.

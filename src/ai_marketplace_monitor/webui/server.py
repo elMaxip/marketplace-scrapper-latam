@@ -67,6 +67,15 @@ from .config_auth import extract_credentials
 from .found_export import iter_found_csv, iter_found_rows
 from .listings_api import MAX_DELETE_KEYS, build_sync_response, delete_listings
 from .listings_export import iter_group_csv, iter_group_rows
+from .log_files import (
+    DEFAULT_LINES,
+    archive as log_archive,
+    base_log_path,
+    find as find_log_file,
+    log_files,
+    strip_markup,
+    tail as tail_log_file,
+)
 from .log_handler import LogBroadcastHandler
 from .scraper_state import config_sync, scraper_state
 
@@ -711,8 +720,11 @@ def create_app(
         result: Dict[str, Any] = {}
         for name in sorted(_configured_marketplaces()):
             fields = sections.get(name, {})
+            marketplace = _marketplace_class(name)
             result[name] = {
-                **session_info(name),
+                # The platform's own domains, so the counts describe the session
+                # rather than the file -- see `session_info`.
+                **session_info(name, marketplace.session_domains() if marketplace else ()),
                 "credentials": bool(fields.get("username")) and bool(fields.get("password")),
             }
         return {"sessions": result}
@@ -816,6 +828,65 @@ def create_app(
             ),
             "capacity": log_handler._buffer.maxlen,
         }
+
+    # ------------------------------------------------------------------
+    # The log files, as opposed to the live buffer above
+    # ------------------------------------------------------------------
+    #
+    # The buffer holds the last couple of thousand records and nothing older.
+    # The monitor has been writing a rotating file all along -- six megabytes of
+    # it -- and until now the only way to read it was a shell in the container.
+    # See `log_files` for why the path is asked of the handler rather than
+    # rebuilt, and why a requested name is matched against a list instead of
+    # joined to a directory.
+
+    @app.get("/api/logs/files")
+    def list_log_files(_: str = Depends(require_session)) -> Dict[str, Any]:
+        """Which log files exist, newest first, and which one is being written."""
+        files = log_files()
+        return {
+            "files": [entry.as_dict() for entry in files],
+            "directory": str(base_log_path().parent),
+            "current": next((entry.name for entry in files if entry.current), None),
+        }
+
+    @app.get("/api/logs/file")
+    def read_log_file(
+        name: str,
+        limit: int = DEFAULT_LINES,
+        _: str = Depends(require_session),
+    ) -> Dict[str, Any]:
+        """The tail of one log file, as plain lines.
+
+        Lines and not records: what is on disk is text the monitor formatted, so
+        parsing it back into levels and timestamps here would be guessing at
+        something the live stream already answers properly.  The reader gets
+        what the file says.
+        """
+        entry = find_log_file(name)
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"Unknown log file {name!r}")
+        lines, truncated = tail_log_file(entry, limit=limit)
+        return {
+            "file": entry.as_dict(),
+            "lines": [strip_markup(line) for line in lines],
+            "truncated": truncated,
+        }
+
+    @app.get("/api/logs/download")
+    def download_logs(_: str = Depends(require_session)) -> Response:
+        """Every log file in one zip.
+
+        Sync def, like the exports below: reading six megabytes off disk is
+        blocking work that has no business on the event loop.
+        """
+        payload = log_archive()
+        filename = f"logs-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+        return Response(
+            content=payload,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @app.websocket("/ws/stream")
     async def ws_stream(websocket: WebSocket) -> None:

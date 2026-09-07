@@ -321,10 +321,30 @@ class LiderMarketplace(RetailerMarketplace):
     label = "Lider"
     hosts = ("lider.cl",)
     home_url = HOST
-    #: What the site sets once it knows who is asking.  Read off a signed-in
-    #: session rather than guessed: these are the names in the stored session
-    #: file, and `customer` is the one that survives longest.
-    session_cookies = ("customer", "auth", "CID")
+    #: What the site sets once it knows who is asking.
+    #:
+    #: One name, not the three this used to list (``customer``, ``auth``,
+    #: ``CID``).  ``looks_signed_in`` requires *every* name here, so a list is a
+    #: bet that all of them are always set together -- and only ``customer`` was
+    #: ever observed to be the durable one.  A name that is not always there
+    #: makes the whole test silently unanswerable, and Lider's stored session
+    #: would then never be refreshed without anything saying so.
+    #:
+    #: Measured twice, and both halves were needed.  Against the live site
+    #: (anonymous visit to ``lider.cl/inicio``, page fully loaded, 23 cookies on
+    #: ``lider.cl``): none of the three appears without an account, so a jar
+    #: holding ``customer`` is a signed-in jar.  And against a real imported
+    #: session, which is what settled the list: all three are there, but
+    #: ``auth`` expires in **29 days** where ``customer`` and ``CID`` last
+    #: **169**.  Requiring all three would therefore have gone quiet a month
+    #: after any sign-in -- the session would simply stop being kept up to date,
+    #: with nothing saying why.  That is the failure this one-name list avoids.
+    #:
+    #: **Do not "correct" this to ``ACID``.**  Lider sets ``ACID`` on every
+    #: anonymous visitor; it is one character away and it is not a session.
+    #: Listing it would make a signed-out browser look signed in, and the next
+    #: save would write that over a session the user pasted by hand.
+    session_cookies = ("customer",)
     #: PerimeterX's own cookies, read off a live jar rather than guessed:
     #: ``_px3`` is the short-lived clearance, ``_pxvid``/``__pxvid`` are the
     #: device id that accumulates a reputation, ``pxcts`` is its telemetry.

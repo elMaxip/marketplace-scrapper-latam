@@ -2,14 +2,22 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from logging import Logger
-from typing import Any, Callable, Generator, Generic, List, Tuple, Type, TypeVar
+from typing import Any, Callable, Dict, Generator, Generic, List, Tuple, Type, TypeVar
 
 from playwright.sync_api import BrowserContext, ElementHandle, Locator, Page  # type: ignore
 
+from .browser_engine import as_element_handle
 from .control import raise_if_cancelled
 from .listing import Listing
 from .price_patterns import compile_patterns, matches as price_pattern_match, validate_patterns
-from .session import drop_cookies, load_session, save_session
+from .session import (
+    drop_cookies,
+    load_session,
+    own_cookies,
+    save_session,
+    save_site_session,
+)
+from .tabs import close_page
 from .utils import (
     BaseConfig,
     Currency,
@@ -921,6 +929,31 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
                 # A tab that will not close is not worth failing a search over.
                 continue
 
+    def release_page(self: "Marketplace") -> None:
+        """Give the tab back now that the task holding it has ended.
+
+        A marketplace used to keep its tab for the life of the process, so a
+        search that ran for two minutes left a Facebook results page loaded for
+        the twenty-eight it waited -- and a review left the last listing it read
+        sitting there until the next round, which is what "una pestaña de
+        revisión abierta sin ninguna revisión en curso" was.
+
+        Cheap to give back, because what makes a session is the *profile*, not
+        the tab: the cookies are on disk and in the context, so the next
+        :meth:`create_page` claims a tab and is signed in exactly as this one
+        was.  What it costs is one navigation on the next search, which is the
+        right trade for not holding a rendered page for half an hour.
+
+        Safe from any ``finally``: it touches the driver only through
+        :mod:`ai_marketplace_monitor.tabs`, which treats a browser that cannot
+        be asked as one to leave alone.  Must still be called on the thread that
+        owns the browser -- like every other Playwright call here.
+        """
+        page, self.page = self.page, None
+        if page is None:
+            return
+        close_page(page, self.context, self.logger)
+
     def seed_session(self: "Marketplace") -> bool:
         """Import a previously saved storage state into a brand-new profile.
 
@@ -931,20 +964,189 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
         """
         if self.context is None:
             return False
-        state = load_session(self.name)
-        if not state or not state.get("cookies"):
+        cookies = self.stored_cookies()
+        if not cookies:
             return False
         try:
-            self.context.add_cookies(state["cookies"])
+            self.context.add_cookies(cookies)
             return True
         except Exception:
             return False
 
-    def save_session(self: "Marketplace") -> bool:
-        """Persist the current session for the next run."""
-        if self.page is None:
+    #: The cookies that are only there while this platform recognises us.
+    #:
+    #: :meth:`looks_signed_in` requires *all* of them, and that is load-bearing.
+    #: (``RetailerMarketplace.session_health`` asks for *any* of them, which is
+    #: the right reading for a line of prose in the log and the wrong one for a
+    #: guard on overwriting a file.)  Measured on a
+    #: signed-out Mercado Libre profile: ``orgnickp``, ``orguserid`` and
+    #: ``orguseridp`` are all still present -- they identify the account, and
+    #: the site leaves them behind when it clears the session.  Only ``ssid``
+    #: goes.  Treating "any of these" as signed in would therefore let a
+    #: signed-out jar be written over a good stored session, which is the one
+    #: thing :meth:`refresh_stored_session` must never do.
+    #:
+    #: Empty means the platform cannot say, and nothing is refreshed.
+    session_cookies: Tuple[str, ...] = ()
+
+    def looks_signed_in(self: "Marketplace") -> bool:
+        """Whether this browser holds every cookie that means "signed in".
+
+        Free: it reads the jar this browser already has and loads no page.
+        That is the whole reason it exists beside ``is_signed_in``, which costs
+        a navigation and so cannot be asked on every search.
+        """
+        if not self.session_cookies:
             return False
-        return save_session(self.name, self.page.context)
+        live = set(self.live_cookie_names())
+        return all(name in live for name in self.session_cookies)
+
+    def refresh_stored_session(self: "Marketplace") -> bool:
+        """Keep the stored file in step with the session the browser now holds.
+
+        Sites rotate a session while it is being used: Mercado Libre issues a
+        new ``ssid`` as you browse, the profile takes it, and
+        ``sessions/mercadolibre.json`` went on holding the token that was
+        imported weeks ago -- because the file was only ever written by an
+        interactive sign-in.  Nothing breaks while the profile lives.  The day
+        it is rebuilt (a recovery after a refusal, a new container, a
+        ``reset_profile``) the monitor reseeds a token the site retired long
+        ago, and the session is lost with no way back but another export.
+
+        Only when the browser looks signed in, which is the guard that makes
+        this safe rather than dangerous: writing a signed-out jar over a good
+        stored session would destroy the one copy there is.  Before
+        :meth:`save_session` learned to write only this platform's own domains
+        this could not be done at all -- refreshing Facebook's file would have
+        overwritten it with the whole browser, Mercado Libre included.
+        """
+        if not self.looks_signed_in():
+            return False
+        return self.save_session()
+
+    def stored_cookies(self: "Marketplace") -> List[Dict[str, Any]]:
+        """The cookies on disk for this platform, and only this platform's.
+
+        Filtered on read as well as on write, which is what repairs a file
+        written before :meth:`save_session` learned the difference -- see there.
+        """
+        state = load_session(self.name)
+        return own_cookies((state or {}).get("cookies") or [], self.session_domains())
+
+    def live_cookie_names(self: "Marketplace") -> Tuple[str, ...]:
+        """The cookie names this browser holds for our own domains.
+
+        Names and never values: a cookie value *is* the session, and anything
+        that could print one is a way to lift it.
+        """
+        context = self.context or (self.page.context if self.page is not None else None)
+        if context is None:
+            return ()
+        try:
+            cookies = context.cookies()
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            return ()
+        return tuple(
+            sorted(
+                {
+                    str(cookie.get("name"))
+                    for cookie in own_cookies(cookies, self.session_domains())
+                    if cookie.get("name")
+                }
+            )
+        )
+
+    def missing_session_cookies(self: "Marketplace") -> Tuple[str, ...]:
+        """Which stored cookies are *not* in this browser right now.
+
+        The question that tells two very different failures apart, and the
+        reason they were indistinguishable for hours:
+
+        * **missing** -- the cookies never reached this profile, or something
+          replaced them.  Putting them back is worth trying, and
+          :meth:`restore_session` does exactly that.
+        * **present, and still signed out** -- the site was handed the session
+          and refused it.  Re-injecting that for ever is a loop; the only thing
+          that helps is a fresh export.
+
+        Already-expired cookies are left out: a browser drops one on the way in,
+        so counting it as missing would report a permanent fault.
+        """
+        stored = self.stored_cookies()
+        if not stored:
+            return ()
+        now = time.time()
+        live = set(self.live_cookie_names())
+        wanted = set()
+        for cookie in stored:
+            expires = cookie.get("expires")
+            if isinstance(expires, (int, float)) and 0 < expires <= now:
+                continue
+            name = cookie.get("name")
+            if name:
+                wanted.add(str(name))
+        return tuple(sorted(wanted - live))
+
+    def restore_session(self: "Marketplace") -> Tuple[int, Tuple[str, ...]]:
+        """Put the stored cookies back into this browser.
+
+        ``(how many went in, which are still missing afterwards)``.  This is the
+        "force the injection" the profile bookkeeping never does on its own: an
+        import is marked applied once and never replayed, so a session that
+        falls out of the profile afterwards -- the site logged us out, another
+        platform's file overwrote it, the profile was rebuilt -- stayed lost
+        with a perfectly good copy sitting on disk.
+
+        Reading back afterwards is the half that keeps it honest.  What is still
+        missing after the cookies were just added is what the *site* refused to
+        keep, and that is a fact worth reporting rather than a reason to try
+        again.
+        """
+        context = self.context or (self.page.context if self.page is not None else None)
+        cookies = self.stored_cookies()
+        if context is None or not cookies:
+            return 0, ()
+        try:
+            context.add_cookies(cookies)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            if self.logger:
+                self.logger.debug(
+                    f"Could not put the stored {self.name} session back", exc_info=True
+                )
+            return 0, self.missing_session_cookies()
+        return len(cookies), self.missing_session_cookies()
+
+    def save_session(self: "Marketplace") -> bool:
+        """Persist *this platform's* session for the next run.
+
+        Only this platform's cookies, which is the fix for a bug that read as
+        the sessions being unpredictable.  This used to write
+        ``context.storage_state()`` -- the whole jar -- and one profile holds
+        Facebook, Mercado Libre and both shops at once, so
+        ``sessions/facebook.json`` came to hold thirty Mercado Libre cookies:
+        whatever state Mercado Libre was in when Facebook last signed in.
+        Fifteen of them share a name with one in a freshly imported
+        ``sessions/mercadolibre.json``, so seeding a new profile replayed both
+        files and whichever went in last won -- decided by the order of the
+        sections in the config file.  From the outside: "a veces funciona en una
+        y en la otra no".
+
+        The shops worked this out first and had their own override; it lives
+        here now, so a platform added later cannot inherit the old behaviour by
+        forgetting to override anything.  A platform that cannot name its
+        domains still writes the whole jar, which is what it did before.
+        """
+        context = self.context or (self.page.context if self.page is not None else None)
+        if context is None:
+            return False
+        domains = self.session_domains()
+        if not domains:
+            return save_session(self.name, context)
+        return save_site_session(self.name, context, domains)
 
     def login_interactively(self: "Marketplace", timeout: int = 3600) -> bool:
         """Sign in with the user driving, then save the session.
@@ -1013,10 +1215,13 @@ class WebPage:
         if element is None:
             return ""
         # get up at the DOM level, testing the children elements with cond,
-        # apply the res callable to return a string
-        parent: ElementHandle | None = (
-            element.element_handle() if isinstance(element, Locator) else element
-        )
+        # apply the res callable to return a string.  Resolved through
+        # `as_element_handle` rather than by an isinstance test written here:
+        # the driver may be patchright, whose `Locator` is a different class
+        # from Playwright's, and a locator that slips through unresolved fails
+        # with `'Locator' object has no attribute 'query_selector_all'` on the
+        # very next line.
+        parent: ElementHandle | None = as_element_handle(element)
         # look for parent of approximate_element until it has two children and the first child is the heading
         while parent:
             children = parent.query_selector_all(":scope > *")
@@ -1038,9 +1243,9 @@ class WebPage:
             return ""
         # Getting the children of an element, test condition, return the `index` or apply res
         # on the children element if the condition is met. Otherwise locate the first child and repeat the process.
-        child: ElementHandle | None = (
-            element.element_handle() if isinstance(element, Locator) else element
-        )
+        # Resolved the same way as in `_parent_with_cond`, and for the same
+        # reason -- see there.
+        child: ElementHandle | None = as_element_handle(element)
         # look for parent of approximate_element until it has two children and the first child is the heading
         while child:
             children = child.query_selector_all(":scope > *")

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from logging import Logger
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Dict, List, Set, Tuple
+from typing import Any, Callable, ClassVar, Dict, Iterable, List, Set, Tuple
 
 import humanize
 import inflect
@@ -67,11 +67,13 @@ from .session import (
     import_is_pending,
     load_session,
     mark_import_applied,
+    own_cookies,
     profile_dir,
     profile_is_new,
     release_stale_profile_lock,
     reset_profile,
 )
+from .tabs import close_idle_pages
 from .user import User
 from .utils import (
     CacheType,
@@ -381,7 +383,10 @@ class MarketplaceMonitor:
         self.defer_login_until_credentials: bool = False
         self.ai_agents: List[AIBackend] = []
         self.keyboard_monitor: KeyboardMonitor | None = None
-        self.playwright: Playwright = sync_playwright().start()
+        #: The connection to the driver process, or ``None`` between one
+        #: browser and the next.  Never held across a browser that has gone --
+        #: see :meth:`_drop_driver`.
+        self.playwright: Playwright | None = sync_playwright().start()
         self.context: BrowserContext | None = None
         self.logger = logger
         # The refresher that shares the search's tab.  A second one, bound to
@@ -1095,6 +1100,39 @@ class MarketplaceMonitor:
             if self.logger:
                 self.logger.debug("Could not adjust the headless user agent", exc_info=True)
 
+    def _stored_cookies(self: "MarketplaceMonitor", name: str) -> List[Dict[str, Any]]:
+        """The cookies stored for one platform, and only that platform's.
+
+        Filtered on the way *in*, which is what repairs a file that is already
+        polluted.  Before `Marketplace.save_session` learned to write only its
+        own domains, `sessions/facebook.json` came to hold thirty Mercado Libre
+        cookies -- a logged-out snapshot -- and seeding replayed them over the
+        ones the user had just imported.  Filtering here means those files stop
+        doing damage without anybody re-pasting anything.
+        """
+        state = load_session(name)
+        cookies = (state or {}).get("cookies") or []
+        if not cookies:
+            return []
+        config = (self.config.marketplace.get(name) if self.config else None)
+        marketplace_class = all_marketplaces.get(
+            str(getattr(config, "market_type", None) or name).lower()
+        )
+        domains = marketplace_class.session_domains() if marketplace_class else ()
+        kept = own_cookies(cookies, domains)
+        if len(kept) != len(cookies) and self.logger:
+            self.logger.debug(
+                f"""Ignoring {len(cookies) - len(kept)} cookie(s) in the {name} session """
+                """file that belong to another platform""",
+                extra=aimm_event(
+                    "session_foreign_cookies",
+                    marketplace=name,
+                    kept=len(kept),
+                    dropped=len(cookies) - len(kept),
+                ),
+            )
+        return kept
+
     def _seed_profile_sessions(
         self: "MarketplaceMonitor",
         context: BrowserContext,
@@ -1126,11 +1164,11 @@ class MarketplaceMonitor:
             imported = import_is_pending(name, lane)
             if not first_run and not imported:
                 continue
-            state = load_session(name)
-            if not state or not state.get("cookies"):
+            cookies = self._stored_cookies(name)
+            if not cookies:
                 continue
             try:
-                context.add_cookies(state["cookies"])
+                context.add_cookies(cookies)
             except Exception:
                 if self.logger:
                     self.logger.debug(
@@ -1148,13 +1186,13 @@ class MarketplaceMonitor:
                     f"""{hilight("[Login]", "succ")} Loaded the """
                     f"""{"imported " if imported else "saved "}{hilight(name)} session into """
                     f"""the {lane + " lane's" if lane else "main"} browser profile """
-                    f"""({len(state["cookies"])} cookies).""",
+                    f"""({len(cookies)} cookies).""",
                     extra=aimm_event(
                         "session_seeded",
                         marketplace=name,
                         lane=lane,
                         imported=imported,
-                        cookies=len(state["cookies"]),
+                        cookies=len(cookies),
                     ),
                 )
 
@@ -1178,7 +1216,7 @@ class MarketplaceMonitor:
         instance: Playwright's synchronous objects belong to the thread that
         made them, which is the reason lanes exist at all.
         """
-        engine = playwright or self.playwright
+        engine = playwright or self._ensure_driver()
         user_data_dir = str(profile_dir(lane))
         first_run = profile_is_new(lane)
         proxy = self._proxy_for_launch()
@@ -1501,6 +1539,11 @@ class MarketplaceMonitor:
                 if self.logger:
                     self.logger.debug("Could not close the browser being renewed", exc_info=True)
             self.context = None
+        # The same rule as `_close_browser`: the driver goes with the browser.
+        # This path exists because a shop refused us, and one of the ways it
+        # refuses is by the browser dying under us -- which is exactly when the
+        # driver is likely to have gone too.
+        self._drop_driver()
         reset_profile(None)
         self.context = self._launch_context()
         for marketplace in self.active_marketplaces.values():
@@ -1508,6 +1551,118 @@ class MarketplaceMonitor:
         self._browsers_idle = False
         self._report_browser()
         return self.context
+
+    def _ensure_driver(self: "MarketplaceMonitor") -> Playwright:
+        """The driver to open browsers with, started if there is none.
+
+        On the scraping thread only, which is where every launch happens: a
+        Playwright object belongs to the thread that made it.
+        """
+        driver = getattr(self, "playwright", None)
+        if driver is None:
+            driver = sync_playwright().start()
+            self.playwright = driver
+        return driver
+
+    def _drop_driver(self: "MarketplaceMonitor") -> None:
+        """Let go of the driver along with the browser it was driving.
+
+        This is the fix for a monitor that stopped searching and did not say
+        so.  When the driver process dies -- a container short of memory, a
+        crash, a Docker Desktop hiccup -- the Python object stays perfectly
+        valid, calls on things that already exist raise at once ("Connection
+        closed while reading from the driver"), and the next
+        ``launch_persistent_context`` **blocks for ever**: its timeout is
+        enforced by the driver, so a missing driver is a missing timeout, and a
+        synchronous Playwright call cannot be interrupted from another thread.
+        The log's last line was "Attempting to launch chromium browser..." and
+        nothing followed it.
+
+        There is no way to ask a driver whether it is alive that does not risk
+        the same hang, so the rule is positional rather than diagnostic: a
+        driver is not kept across a browser that has been closed or lost.
+        Stopping a dead one returns immediately, and a fresh one costs about
+        half a second on the next launch -- once per idle gap, which is nothing
+        beside the failure it removes.
+        """
+        driver, self.playwright = getattr(self, "playwright", None), None
+        if driver is None:
+            return
+        try:
+            driver.stop()
+        except Exception:
+            if self.logger:
+                self.logger.debug("Could not stop the Playwright driver", exc_info=True)
+
+    def _release_tabs(
+        self: "MarketplaceMonitor",
+        context: BrowserContext | None,
+        marketplaces: Iterable[Marketplace],
+        why: str,
+    ) -> None:
+        """Let go of the tabs on one browser: the task using them has ended.
+
+        Called from a ``finally`` at every task boundary -- the end of a search
+        pass, of a round of re-checks, of a session probe -- so a task that ends
+        by raising, by being cancelled or by timing out gives its tab back on
+        exactly the same path as one that finishes.  That is the whole of the
+        guarantee: a tab outlives its task only for as long as it takes to
+        unwind to the boundary.
+
+        The named marketplaces first, then a sweep of whatever is left.  The
+        sweep is what catches a tab no marketplace has a name for -- a pop-up a
+        site opened for itself, a tab left by a task that raised before it could
+        tidy up -- and it is safe here only because this runs on the thread that
+        owns this browser, at a moment when nothing else on it is running.
+
+        Never the browser itself: closing that is
+        :meth:`_release_idle_browsers`'s decision, made on how long the monitor
+        has had nothing to do, and a review round finishing is not that.
+        """
+        for marketplace in marketplaces:
+            try:
+                marketplace.release_page()
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                if self.logger:
+                    self.logger.debug(
+                        f"Could not release the {marketplace.name} tab", exc_info=True
+                    )
+        try:
+            closed = close_idle_pages(context, logger=self.logger)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            return
+        if closed and self.logger:
+            self.logger.debug(
+                f"""{hilight("[Browser]", "info")} Closed {closed} idle """
+                f"""{"tab" if closed == 1 else "tabs"} after {why}.""",
+                extra=aimm_event("tabs_released", closed=closed, why=why),
+            )
+        # The count the interface shows has just changed, and this is the last
+        # moment it is settled: `_run_job` reports after each search, which is
+        # now *before* the tabs go back, so without this the panel kept showing
+        # the tabs a finished pass was holding until the next search opened one.
+        # Only for this thread's own browser -- a lane reports its own, on its
+        # own thread, immediately after the task this is running inside.
+        if context is not None and context is getattr(self, "context", None):
+            self._report_browser()
+
+    def _release_search_tabs(self: "MarketplaceMonitor", why: str) -> None:
+        """Give back the tabs on the monitor's own browser.
+
+        Read through ``getattr`` because this is called from a ``finally`` that
+        wraps a whole pass: it has to work on a monitor that has not got as far
+        as opening a browser, and the end of a pass is the last place that
+        should be able to raise something of its own.
+        """
+        self._release_tabs(
+            getattr(self, "context", None),
+            list(getattr(self, "active_marketplaces", {}).values()),
+            why,
+        )
 
     def _release_idle_browsers(self: "MarketplaceMonitor", idle_seconds: float) -> None:
         """Close the browsers while there is nothing for them to do.
@@ -1573,6 +1728,9 @@ class MarketplaceMonitor:
                 if self.logger:
                     self.logger.debug("Could not close the browser context", exc_info=True)
             self.context = None
+        # And the driver with it.  See `_drop_driver`: a driver kept across a
+        # browser that has gone is how the next launch came to block for ever.
+        self._drop_driver()
 
     def _seed_lanes_with_session(
         self: "MarketplaceMonitor", name: str, cookies: List[Dict[str, Any]]
@@ -1638,8 +1796,7 @@ class MarketplaceMonitor:
         """
         if self.context is None:
             return False
-        state = load_session(name)
-        cookies = (state or {}).get("cookies") or []
+        cookies = self._stored_cookies(name)
         if not cookies:
             return False
         try:
@@ -1689,28 +1846,83 @@ class MarketplaceMonitor:
         marketplace = self.active_marketplaces.get(name)
         if marketplace is None:
             return
-        # A shop answers a different question, and it is the one that matters
-        # for a shop: a catalogue is public, so "am I signed in" is not the
-        # thing an import can fail.  See `RetailerMarketplace.session_health`.
-        health = getattr(marketplace, "session_health", None)
-        if health is not None:
-            self._report_shop_session(name, health)
-            return
-        check = getattr(marketplace, "is_signed_in", None)
-        if check is None:
-            return
         try:
-            signed_in = bool(check())
+            # A shop answers a different question, and it is the one that matters
+            # for a shop: a catalogue is public, so "am I signed in" is not the
+            # thing an import can fail.  See `RetailerMarketplace.session_health`.
+            health = getattr(marketplace, "session_health", None)
+            if health is not None:
+                self._report_shop_session(name, health)
+                return
+            if getattr(marketplace, "is_signed_in", None) is None:
+                return
+            self._report_signed_in(
+                name, self._ask_signed_in(marketplace), lane=None, marketplace=marketplace
+            )
+        finally:
+            # Same rule as the lane's probe: the tab this asked for belongs to
+            # the question, and the question has been answered.
+            self._release_tabs(self.context, [marketplace], f"the {name} session check")
+
+    def _ask_signed_in(self: "MarketplaceMonitor", marketplace: Marketplace) -> bool:
+        """Whether this platform recognises us, putting the cookies back first if
+        they are not in the browser at all.
+
+        This is "si tiene cookies pero no tiene la sesión iniciada, forzar la
+        inyección" -- and the guard on it is what stops it from being a loop.
+        An import is marked applied once and never replayed, so a session that
+        fell out of the profile stayed lost with a good copy on disk: that is
+        the case worth retrying, and it is exactly the case where the stored
+        cookies are *missing* from the browser.
+
+        When they are all there and the answer is still no, the site was handed
+        the session and refused it.  Re-injecting that changes nothing, so it is
+        not retried -- it is reported.
+        """
+        probe = getattr(marketplace, "is_signed_in", None)
+        if probe is None:
+            return False
+        try:
+            if bool(probe()):
+                return True
+            missing = marketplace.missing_session_cookies()
+            if not missing:
+                return False
+            if self.logger:
+                self.logger.info(
+                    f"""{hilight("[Login]", "info")} {hilight(marketplace.name)} is not """
+                    f"""signed in and {len(missing)} stored cookie(s) are not in this """
+                    f"""browser ({", ".join(missing)}); putting them back and asking again.""",
+                    extra=aimm_event(
+                        "session_restored",
+                        marketplace=marketplace.name,
+                        missing=list(missing),
+                    ),
+                )
+            marketplace.restore_session()
+            return bool(probe())
         except KeyboardInterrupt:
             raise
         except Exception:
-            return
-        self._report_signed_in(name, signed_in, lane=None)
+            return False
 
     def _report_signed_in(
-        self: "MarketplaceMonitor", name: str, signed_in: bool, lane: str | None
+        self: "MarketplaceMonitor",
+        name: str,
+        signed_in: bool,
+        lane: str | None,
+        marketplace: Marketplace | None = None,
     ) -> None:
-        """Say what a marketplace made of the cookies, and in which browser."""
+        """Say what a marketplace made of the cookies, and in which browser.
+
+        The failure message names the cookies the site did not keep, because
+        without it the two reasons a session fails look identical.  It used to
+        say "probably copied from a different country's site, or they have
+        expired", which sent the reader off to re-export cookies that were
+        perfectly good -- while the actual event was Mercado Libre deleting
+        `ssid` on the first request, which is the site saying it has invalidated
+        that session and no export from the same browser will help either.
+        """
         if not self.logger:
             return
         where = f""" (navegador de {lane})""" if lane else ""
@@ -1723,13 +1935,34 @@ class MarketplaceMonitor:
                 ),
             )
         else:
+            dropped = marketplace.missing_session_cookies() if marketplace is not None else ()
+            if dropped:
+                # The cookies went in and are not there any more: the site sent
+                # a deletion for them on the first request, which is a site
+                # saying "I have invalidated that session".  A fresh export from
+                # the same browser is then the only thing that helps, and it is
+                # worth saying so rather than leaving the reader to guess.
+                why = (
+                    f"""It kept the rest and discarded {", ".join(dropped)}, which is """
+                    """the site saying that session is no longer valid — sign in again in """
+                    """your own browser and export the cookies once more."""
+                )
+            else:
+                why = (
+                    """Every stored cookie is in the browser, so the session was handed """
+                    """over and refused: it was probably copied from a different country's """
+                    """site, or the account is being challenged. Export it again from the """
+                    """site the monitor searches, while signed in there."""
+                )
             self.logger.error(
                 f"""{hilight("[Login]", "fail")} {hilight(name)} does not recognise the """
-                f"""imported session{where}. The cookies were probably copied from a """
-                """different country's site, or they have expired — export them again from """
-                """the site the monitor searches, while signed in there.""",
+                f"""imported session{where}. {why}""",
                 extra=aimm_event(
-                    "session_checked", marketplace=name, signed_in=False, lane=lane
+                    "session_checked",
+                    marketplace=name,
+                    signed_in=False,
+                    lane=lane,
+                    discarded=list(dropped),
                 ),
             )
 
@@ -1754,13 +1987,24 @@ class MarketplaceMonitor:
 
         def check(context: BrowserContext) -> None:
             marketplace = self._lane_marketplace(lane, context, marketplace_config)
-            health = getattr(marketplace, "session_health", None)
-            if health is not None:
-                self._report_shop_session(name, health, lane=lane_name)
-                return
-            probe = getattr(marketplace, "is_signed_in", None)
-            if probe is not None:
-                self._report_signed_in(name, bool(probe()), lane=lane_name)
+            try:
+                health = getattr(marketplace, "session_health", None)
+                if health is not None:
+                    self._report_shop_session(name, health, lane=lane_name)
+                    return
+                if getattr(marketplace, "is_signed_in", None) is not None:
+                    self._report_signed_in(
+                        name,
+                        self._ask_signed_in(marketplace),
+                        lane=lane_name,
+                        marketplace=marketplace,
+                    )
+            finally:
+                # A probe is a task like any other, and a short one.  Left to
+                # itself it parked the tab on whatever it had asked for -- the
+                # Mercado Libre account page, titled "Resumen", open in the
+                # window the searches use and belonging to nothing.
+                self._release_tabs(context, [marketplace], f"the {name} session check")
 
         try:
             lane.submit(check)
@@ -2172,6 +2416,23 @@ class MarketplaceMonitor:
         """
 
         def work(context: BrowserContext) -> bool:
+            """The pass, and the tabs given back however it ends.
+
+            The ``finally`` is the point: a lane that stops on a cancellation,
+            on a stopped search or on an exception unwinds through here, so
+            there is no way for a lane to end a pass still holding a tab.
+            """
+            lane = self.lanes.get(lane_name)
+            try:
+                return run_pass(context)
+            finally:
+                self._release_tabs(
+                    context,
+                    list(lane.marketplaces.values()) if lane is not None else (),
+                    f"the {lane_name} pass",
+                )
+
+        def run_pass(context: BrowserContext) -> bool:
             lane = self.lanes.get(lane_name)
             if lane is None:
                 return True
@@ -2322,11 +2583,20 @@ class MarketplaceMonitor:
         queue, each platform gets a browser and a thread of its own and they run
         side by side -- see :meth:`_run_jobs_in_parallel`.
         """
-        if self._marketplaces_run_in_parallel():
-            groups = self._job_groups(only, due_only=due_only)
-            if groups:
-                return self._run_jobs_in_parallel(groups, only=only, due_only=due_only)
-        return self._run_jobs_sequentially(only, due_only=due_only)
+        # The pass is the task, so the pass is where the tabs go back.  Not
+        # each search: several searches in a row on one platform genuinely
+        # share a tab, and closing it between two of them would buy nothing and
+        # cost a sign-in page load each time.  Between passes nothing is using
+        # it, which is exactly when it must not still be holding a rendered
+        # results page.
+        try:
+            if self._marketplaces_run_in_parallel():
+                groups = self._job_groups(only, due_only=due_only)
+                if groups:
+                    return self._run_jobs_in_parallel(groups, only=only, due_only=due_only)
+            return self._run_jobs_sequentially(only, due_only=due_only)
+        finally:
+            self._release_search_tabs("a search pass")
 
     def _run_jobs_in_parallel(
         self: "MarketplaceMonitor",
@@ -3003,6 +3273,12 @@ class MarketplaceMonitor:
                 self.logger.debug(f"Listing refresh slice failed: {e}", exc_info=True)
             self._plan_next_review()
             return True
+        finally:
+            # The round is over, whichever way it ended.  In this mode the
+            # review shares the searches' tab, so what is given back here is the
+            # last listing page it read -- which is what used to sit in the
+            # window until the next search happened to navigate away from it.
+            self._release_search_tabs("a review round")
 
         self._plan_next_review()
         self._log_review(report)
@@ -3082,6 +3358,17 @@ class MarketplaceMonitor:
             except Exception as error:
                 if self.logger:
                     self.logger.debug(f"A review round failed: {error}", exc_info=True)
+            finally:
+                # The lane's browser goes back to one blank tab between rounds.
+                # This is the tab the user found open with no review running:
+                # the loop waits here for as long as the review interval, and
+                # it was waiting with the last listing page still loaded.
+                lane = self.lanes.get(control.UPDATES_LANE)
+                self._release_tabs(
+                    context,
+                    list(lane.marketplaces.values()) if lane is not None else (),
+                    "a review round",
+                )
             self._plan_next_review()
             self._log_review(report, lane=control.UPDATES_LANE)
             self._announce_price_drops(report)
@@ -3218,8 +3505,42 @@ class MarketplaceMonitor:
             self._apply_item_language(marketplace, marketplace_config, item_config)
             with control.search(item_config.name, marketplace_config.name):
                 self._search_item(marketplace_config, marketplace, item_config)
+            # Only after a search that finished, and only if the browser still
+            # looks signed in.  A site rotates its session while it is being
+            # used, and the stored file was written once at import and never
+            # again -- so the day the profile is rebuilt the monitor reseeded a
+            # token the site had retired, and the session was gone with no way
+            # back but another export.  Costs a read of the cookie jar this
+            # browser already has; no page is loaded to decide it.
+            self._refresh_stored_session(marketplace)
         finally:
             self._searching = None
+
+    def _refresh_stored_session(
+        self: "MarketplaceMonitor", marketplace: Marketplace
+    ) -> None:
+        """Write the live session back to disk, if there is one to write.
+
+        Best effort in the strongest sense: this runs at the end of a search
+        that worked, and a session file that could not be written is not a
+        reason to make that search look like a failure.
+        """
+        try:
+            if not marketplace.refresh_stored_session():
+                return
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            if self.logger:
+                self.logger.debug(
+                    f"Could not refresh the stored {marketplace.name} session", exc_info=True
+                )
+            return
+        if self.logger:
+            self.logger.debug(
+                f"""Refreshed the stored {marketplace.name} session from the browser""",
+                extra=aimm_event("session_refreshed", marketplace=marketplace.name),
+            )
 
     def _apply_item_language(
         self: "MarketplaceMonitor",
@@ -4957,7 +5278,7 @@ class MarketplaceMonitor:
             except Exception:
                 pass
             self.context = None
-        self.playwright.stop()
+        self._drop_driver()
         if self.keyboard_monitor:
             self.keyboard_monitor.stop()
         cache.close()

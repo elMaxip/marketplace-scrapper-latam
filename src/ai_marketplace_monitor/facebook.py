@@ -446,6 +446,12 @@ class FacebookMarketplace(Marketplace):
     def session_domains(cls: Type["FacebookMarketplace"]) -> Tuple[str, ...]:
         return ("facebook.com", "messenger.com")
 
+    #: `c_user` is the account id and `xs` the session secret; Facebook sets
+    #: both on a sign-in and clears both on a sign-out.  `is_logged_in` reads
+    #: `c_user` alone because it is answering "can we search"; this pair guards
+    #: *writing* the session file, where the stricter test is the safe one.
+    session_cookies = ("c_user", "xs")
+
     @classmethod
     def handles_url(cls: Type["FacebookMarketplace"], url: str) -> bool:
         return url.startswith("https://www.facebook.com/marketplace/item")
@@ -670,7 +676,7 @@ class FacebookMarketplace(Marketplace):
         # would make the next attempt arrive as a brand-new browser, which is
         # what turns a single challenge into an endless loop of them.
         if self.page is not None:
-            save_device_state(self.name, self.page.context)
+            save_device_state(self.name, self.page.context, self.session_domains())
 
         if self.logger:
             self.logger.error(
@@ -729,7 +735,7 @@ class FacebookMarketplace(Marketplace):
             return self.save_session()
 
         if self.page is not None:
-            save_device_state(self.name, self.page.context)
+            save_device_state(self.name, self.page.context, self.session_domains())
         return False
 
     def search(

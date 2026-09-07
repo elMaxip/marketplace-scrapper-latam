@@ -14,9 +14,52 @@ from rich.text import Text
 
 from . import __version__, app_version
 from .session import clear_all_sessions, clear_profile
-from .utils import CacheType, amm_home, cache, counter, hilight
+from .utils import CacheType, amm_home, cache, counter, hilight, strip_markup
 
 app = typer.Typer()
+
+
+class PlainFileFormatter(logging.Formatter):
+    """What the log file gets: a time, a level, and the line without colour.
+
+    The terminal handler renders Rich's markup as colour.  The file handler was
+    given the same ``%(message)s`` format, so it wrote the tags out literally --
+    ``[blue][Pause][/blue] Searching is paused`` -- and wrote no time and no
+    level at all.  That was survivable while nothing read the file; now that the
+    interface serves it, a line with no timestamp cannot answer the only
+    question anybody opens an old log to ask.
+
+    Rotation is untouched: same handler, same megabyte, same five backups.  Only
+    what goes into a line changed.
+    """
+
+    def __init__(self: "PlainFileFormatter") -> None:
+        super().__init__(
+            fmt="%(asctime)s %(levelname)-8s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+    def format(self: "PlainFileFormatter", record: logging.LogRecord) -> str:
+        return strip_markup(super().format(record))
+
+
+def _log_file_handler() -> RotatingFileHandler:
+    """The rotating log on disk, and the formatter that makes it readable.
+
+    One megabyte a file and five backups, exactly as before: the interface now
+    lists and serves them (see ``webui/log_files.py``), and it finds them by
+    asking this handler where it writes rather than by guessing.
+    """
+    handler = RotatingFileHandler(
+        amm_home / "ai-marketplace-monitor.log",
+        encoding="utf-8",
+        maxBytes=1024 * 1024,
+        backupCount=5,
+    )
+    # Set on the handler, not through `basicConfig`, whose `format` applies to
+    # every handler -- and the terminal's markup must stay markup.
+    handler.setFormatter(PlainFileFormatter())
+    return handler
 
 
 def _silence_noisy_loggers() -> None:
@@ -284,12 +327,7 @@ def main(
             show_path=False if verbose is None else verbose,
             level="DEBUG" if verbose else "INFO",
         ),
-        RotatingFileHandler(
-            amm_home / "ai-marketplace-monitor.log",
-            encoding="utf-8",
-            maxBytes=1024 * 1024,
-            backupCount=5,
-        ),
+        _log_file_handler(),
     ]
     if webui:
         from .webui.log_handler import LogBroadcastHandler

@@ -52,7 +52,7 @@ from .marketplace import (
 )
 from .nextdata import from_page
 from .observations import is_known, record_observation
-from .session import save_site_session
+from .tabs import close_page
 from .utils import (
     BaseConfig,
     CounterItem,
@@ -196,7 +196,6 @@ class RetailerMarketplace(Marketplace):
     #: Empty for a shop with no sign-in worth having -- and empty is not a gap:
     #: a catalogue is public, and reporting "not signed in" about a site that
     #: never asked anybody to sign in is an alarm about nothing.
-    session_cookies: Tuple[str, ...] = ()
 
     def __init__(
         self: "RetailerMarketplace",
@@ -372,7 +371,7 @@ class RetailerMarketplace(Marketplace):
             # A probe, not a search: being refused here is worth reporting and
             # is not a reason to stop the platform searching.
             payload = self.open_payload(self.home_url, is_the_page_we_came_for=False)
-            names = self._cookie_names()
+            names = self.live_cookie_names()
             signed_in = bool(self.session_cookies) and any(
                 name in names for name in self.session_cookies
             )
@@ -395,49 +394,13 @@ class RetailerMarketplace(Marketplace):
             return None
         finally:
             if temporary and self.page is not None:
-                try:
-                    self.page.close()
-                except Exception:
-                    pass
+                # Through `close_page`, not `page.close()`: a persistent context
+                # with no pages left has closed itself, taking the profile lock
+                # and the shop's cookies with it.  The probe borrows a tab when
+                # there is none to borrow, so it is exactly the caller that can
+                # be holding the only one.
+                close_page(self.page, self.context, self.logger)
                 self.page = None
-
-    def save_session(self: "RetailerMarketplace") -> bool:
-        """Keep what this shop's browser earned, and only what is this shop's.
-
-        The base class writes the whole cookie jar, which in this profile also
-        holds Facebook and Mercado Libre; this writes the shop's own domains.
-
-        Worth doing at all because of what a shop's cookies *are*.  Lider hands
-        out a short-lived clearance token once its bot check has decided we are
-        a person; that token lives in the browser profile and nowhere else, so a
-        profile discarded or replaced started from being challenged again, with
-        the stored session -- login cookies pasted in by hand -- unable to help.
-        Saving it means the clearance survives the profile.
-        """
-        context = self.context or (self.page.context if self.page is not None else None)
-        if context is None:
-            return False
-        return save_site_session(self.name, context, self.hosts)
-
-    def _cookie_names(self: "RetailerMarketplace") -> Tuple[str, ...]:
-        """The cookie names this browser holds for the shop's own hosts.
-
-        Names only.  A cookie's value *is* the session, and a log line that
-        could carry one is a way to lift it.
-        """
-        context = self.context or (self.page.context if self.page is not None else None)
-        if context is None:
-            return ()
-        try:
-            cookies = context.cookies()
-        except Exception:
-            return ()
-        wanted: List[str] = []
-        for cookie in cookies:
-            domain = str(cookie.get("domain") or "").lstrip(".").lower()
-            if any(domain.endswith(host) for host in self.hosts):
-                wanted.append(str(cookie.get("name") or ""))
-        return tuple(wanted)
 
     # ------------------------------------------------------------------ #
     # Reading a page
@@ -503,6 +466,18 @@ class RetailerMarketplace(Marketplace):
         self._products_walled = None
         control.clear_marketplace_block(self.name)
         if not self._session_kept:
+            # Worth saving at all because of what a shop's cookies *are*: Lider
+            # hands out a short-lived clearance token once its bot check has
+            # decided we are a person, and that token lives in the browser
+            # profile and nowhere else -- so a profile discarded or replaced
+            # started from being challenged again, with the stored session
+            # (login cookies pasted in by hand) unable to help.
+            #
+            # `Marketplace.save_session` keeps everything this shop's
+            # `session_domains()` covers, which for Sodimac means Falabella's
+            # cookies too.  It used to keep only `hosts` -- `sodimac.cl` -- so
+            # the first page Sodimac served deleted the Falabella login half of
+            # an imported session from the file, leaving a copy nowhere.
             self._session_kept = True
             self.save_session()
         return payload

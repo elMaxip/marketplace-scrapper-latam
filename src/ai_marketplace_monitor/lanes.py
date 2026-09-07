@@ -58,7 +58,7 @@ from typing import Any, Callable, Dict, Optional
 from playwright.sync_api import BrowserContext, Playwright  # type: ignore
 
 from . import control
-from .browser_engine import sync_playwright
+from .browser_engine import restart_driver, sync_playwright
 
 from .marketplace import Marketplace
 from .session import reset_profile
@@ -281,9 +281,31 @@ class BrowserLane:
                 self._context.close()
             except Exception:
                 pass
+            self._context = None
+        # And the driver with it.  A browser that has gone is the case where
+        # the driver process has most likely gone too, and a driver kept across
+        # that is one whose next `launch_persistent_context` blocks for ever --
+        # no timeout can fire, because the timeout is the driver's.  This lane
+        # would then never answer another task, and its searches would look
+        # like searches that simply stopped happening.
+        playwright = self._new_driver(playwright)
         self._context = self._launch(playwright, self.name)
         self._report()
         return self._context
+
+    def _new_driver(self: "BrowserLane", playwright: Playwright | None) -> Playwright:
+        """Replace this lane's driver.  On the lane's own thread, always.
+
+        Kept in one place because both callers have to remember the same third
+        thing: ``self._playwright`` is what ``renew_context`` reads, so a driver
+        swapped without updating it would leave the recovery path opening
+        browsers on the connection that has just been thrown away.
+        """
+        # `sync_playwright` by the module-level name this lane started its own
+        # driver with, so the replacement is made the same way the original was.
+        driver = restart_driver(playwright, lambda: sync_playwright().start(), self.logger)
+        self._playwright = driver
+        return driver
 
     def renew_context(self: "BrowserLane") -> BrowserContext:
         """Throw this lane's browser away, profile and all, and open another.
@@ -319,7 +341,10 @@ class BrowserLane:
         # The profile goes with it, which is the whole point; a launch that
         # reuses the directory would bring the flagged identity straight back.
         reset_profile(self.name)
-        self._context = self._launch(self._playwright, self.name)
+        # And so does the driver -- the same rule as `_live_context`.  This is
+        # the recovery after a shop refused us, and a browser closed under a
+        # driver that has died is precisely the shape that hangs.
+        self._context = self._launch(self._new_driver(self._playwright), self.name)
         self._report()
         return self._context
 
@@ -339,7 +364,14 @@ class BrowserLane:
 
         On the lane's own thread, always: these are Playwright objects, and the
         thread that made them is the only one allowed to close them.
+
+        ``self._playwright`` first, and the argument only as a fallback: the
+        lane may have replaced its driver since ``_run`` took that local
+        (:meth:`_new_driver`), and stopping the one it *used* to have would
+        leave the one it has now running as an orphan node process for the life
+        of the container.
         """
+        playwright = self._playwright or playwright
         control.forget_browser(self.name)
         for marketplace in list(self.marketplaces.values()):
             try:
