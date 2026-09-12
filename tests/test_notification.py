@@ -19,10 +19,8 @@ When writing tests for async functionality:
             asyncio.run(obj.async_method())
 
 REASON: Direct async tests cause event loop conflicts when run in full test suite,
-even though they pass in isolation. This is explicitly documented in the PRD
-at docs/telegram_support_prd.md to avoid sync/async boundary corruption.
-
-See Task 8.3 implementation for examples of proper async test patterns.
+even though they pass in isolation, so the sync/async boundary is never crossed
+from a test.
 
 =============================================================================
 TESTING PHILOSOPHY - Focus on Business Logic, Not Implementation Details

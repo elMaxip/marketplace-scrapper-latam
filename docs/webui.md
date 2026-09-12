@@ -1,8 +1,8 @@
 # Web UI
 
-AI Marketplace Monitor includes a built-in web interface for editing your configuration and monitoring activity in real time. The web UI starts automatically when you run the monitor — no extra setup needed.
+AI Marketplace Monitor serves a web API (REST + WebSocket) for editing your configuration and monitoring activity in real time. It starts automatically when you run the monitor — no extra setup needed.
 
-![Web UI Screenshot](webui_screenshot.png)
+The frontend that talks to it lives in its own repository, [platform-scrapper-ui](https://github.com/elMaxip/platform-scrapper-ui), which is the official UI for this monitor; this document describes what the monitor exposes and how it behaves behind that interface.
 
 ## Overview
 

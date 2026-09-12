@@ -49,6 +49,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A spinning disk has no wear figure at all and is not thereby unhealthy, which
   is why `life_used` is allowed to be absent beside a drive in perfect health.
 
+### Changed
+- **The repository is a fork and now says so.** The README is written for this
+  project -- what it searches, how it is installed from a checkout, the
+  container, and where the official interface lives
+  ([platform-scrapper-ui](https://github.com/elMaxip/platform-scrapper-ui)) --
+  instead of upstream's PyPI page. The Sphinx site, the Read the Docs and
+  Codecov hooks, the release-to-PyPI, CodeQL and stale-issue workflows, the
+  issue templates, `CITATION.cff`, `CONTRIBUTING.md`, `SECURITY.md` and the
+  other files that belonged to upstream's project are gone, along with a
+  profiling dump and two throwaway scripts that had been committed by
+  accident. `uv.lock` is no longer tracked: the project installs from
+  `pyproject.toml`. Nothing the monitor does has changed.
+
 ### Fixed
 - **`get_condition failed: AttributeError: 'Locator' object has no attribute
   'query_selector_all'`.** patchright -- the stealth driver, which is installed

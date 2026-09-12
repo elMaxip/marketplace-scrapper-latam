@@ -15,9 +15,6 @@ from invoke.context import Context
 from invoke.runners import Result
 
 ROOT_DIR = Path(__file__).parent
-DOCS_DIR = ROOT_DIR.joinpath("docs")
-DOCS_BUILD_DIR = DOCS_DIR.joinpath("_build")
-DOCS_INDEX = DOCS_BUILD_DIR.joinpath("index.html")
 COVERAGE_FILE = ROOT_DIR.joinpath(".coverage")
 COVERAGE_DIR = ROOT_DIR.joinpath("htmlcov")
 COVERAGE_REPORT = COVERAGE_DIR.joinpath("index.html")
@@ -26,7 +23,6 @@ TEST_DIR = ROOT_DIR.joinpath("tests")
 PYTHON_TARGETS = [
     SOURCE_DIR,
     TEST_DIR,
-    DOCS_DIR.joinpath("conf.py"),
     ROOT_DIR.joinpath("noxfile.py"),
     Path(__file__),
 ]
@@ -64,13 +60,7 @@ def clean_tests(c: Context) -> None:
     _run(c, "rm -fr .pytest_cache")
 
 
-@task()
-def clean_docs(c: Context) -> None:
-    """Clean up files from documentation builds."""
-    _run(c, f"rm -fr {DOCS_BUILD_DIR}")
-
-
-@task(pre=[clean_build, clean_python, clean_tests, clean_docs])
+@task(pre=[clean_build, clean_python, clean_tests])
 def clean(c: Context) -> None:
     """Run all clean sub-tasks."""
 
@@ -157,35 +147,6 @@ def coverage(c: Context, fmt: str = "report", open_browser: bool = False) -> Non
     _run(c, f"uv run coverage {fmt} -i")
     if fmt == "html" and open_browser:
         webbrowser.open(COVERAGE_REPORT.as_uri())
-
-
-@task(
-    help={
-        "serve": "Build the docs watching for changes",
-        "open_browser": "Open the docs in the web browser",
-    }
-)
-def docs(c: Context, serve: bool = False, open_browser: bool = False) -> None:
-    """Build documentation."""
-    _run(c, f"uv run sphinx-apidoc -f -o {DOCS_DIR} {SOURCE_DIR}")
-    build_docs = f"uv run sphinx-build -b html {DOCS_DIR} {DOCS_BUILD_DIR}"
-    _run(c, build_docs)
-    if open_browser:
-        webbrowser.open(DOCS_INDEX.absolute().as_uri())
-    if serve:
-        _run(c, f"uv run watchmedo shell-command -p '*.rst;*.md' -c '{build_docs}' -R -D .")
-
-
-@task(
-    help={
-        "part": "Part of the version to be bumped.",
-        "dry_run": "Don't write any files, just pretend. (default: False)",
-    }
-)
-def version(c: Context, part: str, dry_run: bool = False) -> None:
-    """Bump version."""
-    bump_options = ["--dry-run"] if dry_run else []
-    _run(c, f"uv run bump2version {' '.join(bump_options)} {part}")
 
 
 @task(

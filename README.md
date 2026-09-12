@@ -1,258 +1,177 @@
-![AI Marketplace Monitor](docs/AIMM_neutral.png)
+# AI Marketplace Monitor
 
-<div align="center">
+Monitor de avisos para Chile y Latinoamérica. Busca productos en **Facebook
+Marketplace**, **Mercado Libre**, **Lider** y **Sodimac**, filtra los resultados
+por precio, palabras clave y ubicación, los evalúa con un modelo de lenguaje y
+avisa por Telegram, correo, Pushover, Pushbullet o ntfy cuando aparece algo que
+vale la pena. También puede seguir una página concreta y avisar cuando baja de
+precio.
 
-[![PyPI - Version](https://img.shields.io/pypi/v/ai-marketplace-monitor.svg)](https://pypi.python.org/pypi/ai-marketplace-monitor)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/ai-marketplace-monitor.svg)](https://pypi.python.org/pypi/ai-marketplace-monitor)
-[![Tests](https://github.com/BoPeng/ai-marketplace-monitor/workflows/tests/badge.svg)](https://github.com/BoPeng/ai-marketplace-monitor/actions?workflow=tests)
-[![Codecov](https://codecov.io/gh/BoPeng/ai-marketplace-monitor/branch/main/graph/badge.svg)](https://codecov.io/gh/BoPeng/ai-marketplace-monitor)
-[![Read the Docs](https://readthedocs.org/projects/ai-marketplace-monitor/badge/)](https://ai-marketplace-monitor.readthedocs.io/)
-[![PyPI - License](https://img.shields.io/pypi/l/ai-marketplace-monitor.svg)](https://pypi.python.org/pypi/ai-marketplace-monitor)
+Es un fork de [ai-marketplace-monitor](https://github.com/BoPeng/ai-marketplace-monitor)
+de Bo Peng, reescrito en buena parte para esta región y para uso personal.
 
-[![Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](https://github.com/pre-commit/pre-commit)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](https://www.contributor-covenant.org/version/2/1/code_of_conduct/)
+**Interfaz oficial:** [platform-scrapper-ui](https://github.com/elMaxip/platform-scrapper-ui).
+Este repositorio es el monitor y su API; la interfaz web con la que se maneja
+vive en ese otro repositorio, junto con el `docker-compose.yml` que levanta los
+dos servicios juntos.
 
-</div>
+## Qué hace
 
-An intelligent tool that monitors Facebook Marketplace listings using AI to help you find the best deals. Get instant notifications when items matching your criteria are posted, with AI-powered analysis of each listing.
+- **Búsquedas por producto**, cada una con sus frases, rango de precio,
+  palabras obligatorias y excluidas (por título, por descripción o por ambos),
+  vendedores excluidos y ciudades o regiones guardadas.
+- **Varias plataformas a la vez**: cada plataforma corre en su propio
+  navegador y su propio hilo, y una búsqueda decide en cuáles corre.
+- **Evaluación con IA** (OpenAI, Anthropic, DeepSeek, Gemini u Ollama local):
+  cada aviso recibe una nota de 1 a 5 y sólo se avisa desde la nota que fijes.
+- **Seguimiento de páginas** (`[track.*]`): pega la dirección de un producto y
+  el monitor la revisa periódicamente y avisa cuando baja de precio.
+- **Revisión de avisos guardados**: los avisos ya vistos se vuelven a abrir cada
+  cierto tiempo para detectar bajadas de precio y avisos vendidos o borrados.
+- **Recarga de configuración en caliente**: un cambio en el archivo se aplica en
+  segundos, incluso a la búsqueda que está corriendo.
+- **Sesiones guardadas**: se inicia sesión una vez (o se importan las cookies
+  desde el navegador propio) y el monitor reutiliza la sesión.
+- **Historial de observaciones** por aviso (precio, cambios, cuándo se vio) que
+  la interfaz usa para gráficos, comparaciones y detección de oportunidades.
+- **API web** (REST + WebSocket) con la que la interfaz edita la configuración,
+  controla el monitor y muestra el registro en vivo.
 
-**📚 [Read the Full Documentation](https://ai-marketplace-monitor.readthedocs.io/)**
+## Instalación
 
-![Search In Action](docs/search_in_action.png)
-
-Example notification from PushBullet:
-
-```
-Found 1 new gopro from facebook
-[Great deal (5)] Go Pro hero 12
-$180, Houston, TX
-https://facebook.com/marketplace/item/1234567890
-AI: Great deal; A well-priced, well-maintained camera meets all search criteria, with extra battery and charger.
-```
-
-## What's New
-
-- **Built-in Web UI**: Edit config, add AI backends, and monitor live logs from your browser — starts automatically with the monitor. See [Web UI documentation](docs/webui.md).
-- **Anthropic/Claude AI Backend**: Use Claude models (e.g. `claude-sonnet-4-20250514`) to evaluate listings alongside OpenAI, DeepSeek, Gemini, and Ollama. See [AI Services](docs/README.md#ai-services) for configuration.
-- **Configurable Rate Limiting**: Rate limiting framework for all notification types with per-instance and global limits. Telegram notifications use optimized defaults automatically.
-
-**Table of Contents:**
-
-- [What's New](#whats-new)
-- [✨ Key Features](#-key-features)
-- [🚀 Quick Start](#-quick-start)
-- [💡 Example Usage](#-example-usage)
-- [📚 Documentation](#-documentation)
-- [🤝 Contributing](#-contributing)
-- [📜 License](#-license)
-- [💬 Support](#-support)
-- [🙏 Credits](#-credits)
-
-## ✨ Key Features
-
-🔍 **Smart Search**
-
-- Search multiple products using keywords
-- Filter by price and location
-- Exclude irrelevant results and spammers
-- Support for different Facebook Marketplace layouts
-
-🤖 **AI-Powered**
-
-- Intelligent listing evaluation
-- Smart recommendations
-- Multiple AI service providers supported
-- Self-hosted model option (Ollama)
-
-📱 **Notifications**
-
-- PushBullet, PushOver, Telegram, or Ntfy notifications
-- HTML email notifications with images
-- Customizable notification levels
-- Repeated notification options
-
-🖥️ **Web UI**
-
-- Built-in config editor with TOML syntax highlighting
-- Live log streaming and filtering
-- Add, edit, and delete config sections from your browser
-- No password required on localhost
-
-![Web UI](docs/webui_screenshot.png)
-
-🌎 **Location Support**
-
-- Multi-city search
-- Pre-defined regions (USA, Canada, etc.)
-- Customizable search radius
-- Flexible seller location filtering
-
-## 🚀 Quick Start
-
-> **⚠️ Legal Notice**: Facebook's EULA prohibits automated data collection without authorization. This tool was developed for personal, hobbyist use only. You are solely responsible for ensuring compliance with platform terms and applicable laws.
-
-### Installation
-
-> **Requires Python 3.10 or higher.** Check your version with `python --version`. If your system default is older, use `pip3.10` (or `pip3.11`, `pip3.12`, etc.) instead of `pip`, or create a virtual environment with the correct version.
+Requiere Python 3.10 o superior.
 
 ```bash
-pip install ai-marketplace-monitor
+git clone https://github.com/elMaxip/marketplace-scrapper-latam.git
+cd marketplace-scrapper-latam
+
+# con uv
+uv sync --all-extras
+uv run playwright install
+
+# o con pip
+pip install -e ".[stealth]"
 playwright install
 ```
 
-### Basic Configuration
+El extra `stealth` instala [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright),
+un fork de Playwright que las tiendas con verificación de bots (Lider, Sodimac)
+detectan menos. Es opcional: si no está, se usa Playwright normal.
 
-Create `~/.ai-marketplace-monitor/config.toml`:
-
-```toml
-[marketplace.facebook]
-search_city = 'houston'  # Replace with your city
-
-[item.gopro]
-search_phrases = 'Go Pro Hero 11'
-min_price = 100
-max_price = 300
-
-[user.me]
-pushbullet_token = 'your_token_here'  # Get from pushbullet.com
-```
-
-### Run the Monitor
+## Uso
 
 ```bash
-ai-marketplace-monitor
+ai-marketplace-monitor          # o el alias corto: aimm
 ```
 
-The program will open a browser, search Facebook Marketplace, and notify you of matching items. A web UI also starts automatically at [http://127.0.0.1:8467](http://127.0.0.1:8467) for editing config and monitoring logs — see [Web UI Guide](docs/webui.md).
+Al primer arranque crea `~/.ai-marketplace-monitor/config.toml` vacío y levanta
+la API en `http://127.0.0.1:8467`. Desde ahí se agregan las búsquedas con la
+[interfaz](https://github.com/elMaxip/platform-scrapper-ui) o editando el
+archivo a mano.
 
-### Run with Docker
+Opciones útiles:
 
-A prebuilt Linux image is published to GitHub Container Registry. It bundles Python, Playwright Chromium, a virtual display (Xvfb), and an embedded noVNC client so you can solve Facebook CAPTCHAs / interactive logins from the web UI — useful on macOS, headless servers, or NAS boxes.
+| Opción | Qué hace |
+| --- | --- |
+| `--config <archivo>` | Lee uno o más archivos de configuración además del principal. |
+| `--headless` | No muestra la ventana del navegador. |
+| `--login` | Abre el navegador para iniciar sesión a mano, sin límite de tiempo, guarda la sesión y sale. |
+| `--check <url o id>` | Explica por qué un aviso guardado fue aceptado o rechazado. |
+| `--clear-cache <tipo\|sessions\|all>` | Borra la caché indicada (avisos, respuestas de la IA, sesiones…). |
+| `--no-webui` | No levanta la API web. |
+| `--webui-host`, `--webui-port` | Dónde escucha la API (por defecto `127.0.0.1:8467`). |
+| `--verbose` | Muestra mensajes de depuración. |
 
-```bash
-docker run -d --name aimm \
-  -p 8467:8467 \
-  -v "$HOME/.ai-marketplace-monitor:/root/.ai-marketplace-monitor" \
-  -e FACEBOOK_USERNAME -e FACEBOOK_PASSWORD \
-  -e ANTHROPIC_API_KEY \
-  --restart unless-stopped \
-  ghcr.io/bopeng/ai-marketplace-monitor:latest
-```
+Fuera de `127.0.0.1` la API pide usuario y contraseña (`FACEBOOK_USERNAME` /
+`FACEBOOK_PASSWORD` o la sección `[marketplace.facebook]`).
 
-Then open [http://localhost:8467](http://localhost:8467). When Facebook needs an interactive login or CAPTCHA, click the **Browser** button in the header to view and control the in-container Chromium.
-
-Mounting `~/.ai-marketplace-monitor` shares your existing config, cache, and logs between the host install and the container — so you can switch back and forth freely. Update with `docker pull ghcr.io/bopeng/ai-marketplace-monitor:latest && docker restart aimm`.
-
-To build the image yourself instead of pulling: `docker build -t aimm .` from a checkout of this repo.
-
-## 💡 Example Usage
-
-**Find GoPro cameras under $300:**
-
-```toml
-[item.gopro]
-search_phrases = 'Go Pro Hero'
-keywords = "('Go Pro' OR gopro) AND (11 OR 12 OR 13)"
-min_price = 100
-max_price = 300
-```
-
-**Search nationwide with shipping:**
-
-```toml
-[item.rare_item]
-search_phrases = 'vintage collectible'
-search_region = 'usa'
-delivery_method = 'shipping'
-seller_locations = []
-```
-
-**AI-powered filtering:**
+### Configuración mínima
 
 ```toml
 [ai.openai]
-api_key = 'your_openai_key'
+api_key = "${OPENAI_API_KEY}"
+model = "gpt-4o-mini"
 
-[item.camera]
-description = '''High-quality DSLR camera in good condition.
-Exclude listings with water damage or missing parts.'''
-rating = 4  # Only notify for 4+ star AI ratings
+[user.yo]
+telegram_token = "${TELEGRAM_BOT_TOKEN}"
+telegram_chat_id = "123456789"
+
+[item.playstation]
+search_phrases = "playstation 5"
+min_price = 200000
+max_price = 450000
+antikeywords = ["control", "solo caja", "cambio"]
+rating = 4
+
+[monitor]
+search_interval = "30m"
+max_search_interval = "1h"
 ```
 
-## 📚 Documentation
+Las plataformas no hay que declararlas: todas existen y una búsqueda corre en
+todas salvo que diga lo contrario. Cualquier valor puede escribirse como
+`"${VARIABLE}"` para leerlo del entorno.
 
-For detailed information on setup and advanced features, see the comprehensive documentation:
+La referencia completa de opciones está en [`docs/README.md`](docs/README.md)
+y hay un ejemplo con muchas de ellas en
+[`docs/example_config.toml`](docs/example_config.toml).
 
-- **[📖 Full Documentation](https://ai-marketplace-monitor.readthedocs.io/)** - Complete guide and reference
-- **[🚀 Quick Start Guide](https://ai-marketplace-monitor.readthedocs.io/en/latest/quickstart.html)** - Get up and running in 10 minutes
-- **[🔍 Features Overview](https://ai-marketplace-monitor.readthedocs.io/en/latest/features.html)** - Complete feature list
-- **[📱 Usage Guide](https://ai-marketplace-monitor.readthedocs.io/en/latest/usage.html)** - Command-line options and tips
-- **[🔧 Configuration Guide](https://ai-marketplace-monitor.readthedocs.io/en/latest/configuration-guide.html)** - Notifications, AI prompts, multi-location search
-- **[⚙️ Configuration Reference](https://ai-marketplace-monitor.readthedocs.io/en/latest/configuration.html)** - Complete configuration reference
-- **[🖥️ Web UI Guide](docs/webui.md)** - Built-in web interface for config editing and monitoring
+## Docker
 
-### Key Topics Covered in Documentation
+El `Dockerfile` construye una imagen con Chromium, una pantalla virtual (Xvfb)
+y noVNC, para poder resolver un CAPTCHA o un inicio de sesión desde el
+navegador aunque el monitor corra en un servidor sin pantalla. Se publica en
+`ghcr.io/elmaxip/marketplace-scrapper-latam` con cada tag `v*.*.*`.
 
-**Notification Setup:**
+La forma recomendada de levantarlo es con el `docker-compose.yml` del
+[repositorio de la interfaz](https://github.com/elMaxip/platform-scrapper-ui),
+que arranca el monitor y la interfaz juntos. Para construirla a mano:
 
-- Email (SMTP), PushBullet, PushOver, Telegram, Ntfy
-- Multi-user configurations
-- HTML email templates
+```bash
+docker build -t aimm .
+docker run -d --name aimm -p 8467:8467 \
+  -v "$HOME/.ai-marketplace-monitor:/home/aimm/.ai-marketplace-monitor" \
+  aimm
+```
 
-**AI Integration:**
+Dentro de un contenedor la API tiene que escuchar en `0.0.0.0`; para eso existe
+`--webui-open` / `AIMM_WEBUI_OPEN`, que la sirve sin contraseña. Úsalo sólo
+detrás de algo que mantenga el puerto privado (la red interna de Compose, una
+VPN como Tailscale).
 
-- OpenAI, DeepSeek, Gemini, Anthropic, Ollama setup
-- Custom prompt configuration
-- Rating thresholds and filtering
+## Documentación
 
-**Advanced Search:**
+- [`docs/README.md`](docs/README.md) — referencia de todas las opciones de configuración.
+- [`docs/webui.md`](docs/webui.md) — qué expone la API y cómo se comporta el monitor detrás de la interfaz.
+- [`docs/mercadolibre.md`](docs/mercadolibre.md) — cómo se lee Mercado Libre, su muro de inicio de sesión y cómo importar una sesión.
+- [`CHANGELOG.md`](CHANGELOG.md) — cambios por versión.
 
-- Multi-city and region search
-- Currency conversion
-- Keyword filtering with Boolean logic
-- Proxy/anonymous searching
+## Desarrollo
 
-**Configuration:**
+```bash
+uv run inv lint      # ruff + black/isort en modo comprobación
+uv run inv format    # aplica el formato
+uv run inv mypy
+uv run inv tests     # pytest con cobertura
+uv run pytest tests/test_observations.py -k nombre   # una prueba
+```
 
-- TOML file structure
-- Environment variables
-- Multiple marketplace support
-- Language/translation support
+Sin `uv`, el paquete se resuelve desde `src/`:
 
-## 🤝 Contributing
+```powershell
+$env:PYTHONPATH = "src"; python -m pytest tests -q
+```
 
-Contributions are welcome! Here are some ways you can contribute:
+## Aviso
 
-- 🐛 Report bugs and issues
-- 💡 Suggest new features
-- 🔧 Submit pull requests
-- 📚 Improve documentation
-- 🏪 Add support for new marketplaces
-- 🌍 Add support for new regions and languages
-- 🤖 Add support for new AI providers
-- 📱 Add new notification methods
+Los términos de uso de estas plataformas restringen la recolección automática de
+datos. Este proyecto es de uso personal; quien lo ejecute es responsable de
+cumplir los términos de cada sitio y la ley aplicable.
 
-Please read our [Contributing Guidelines](https://ai-marketplace-monitor.readthedocs.io/en/latest/contributing.html) before submitting a Pull Request.
+## Licencia
 
-## 📜 License
+[GNU AGPL v3](LICENSE), la misma del proyecto original.
 
-This project is licensed under the **Affero General Public License (AGPL)**. For the full terms and conditions, please refer to the official [GNU AGPL v3](https://www.gnu.org/licenses/agpl-3.0.en.html).
-
-## 💬 Support
-
-We provide multiple ways to access support and contribute to AI Marketplace Monitor:
-
-- 📖 [Documentation](https://ai-marketplace-monitor.readthedocs.io/) - Comprehensive guides and instructions
-- 🤝 [Discussions](https://github.com/BoPeng/ai-marketplace-monitor/discussions) - Community support and ideas
-- 🐛 [Issues](https://github.com/BoPeng/ai-marketplace-monitor/issues) - Bug reports and feature requests
-- 💖 [Become a sponsor](https://github.com/sponsors/BoPeng) - Support development
-- 💰 [Donate via PayPal](https://www.paypal.com/donate/?hosted_button_id=3WT5JPQ2793BN) - Alternative donation method
-
-**Important Note:** Due to time constraints, priority support is provided to sponsors and donors. For general questions, please use the GitHub Discussions or Issues.
-
-## 🙏 Credits
-
-- Some of the code was copied from [facebook-marketplace-scraper](https://github.com/passivebot/facebook-marketplace-scraper).
-- Region definitions were copied from [facebook-marketplace-nationwide](https://github.com/gmoz22/facebook-marketplace-nationwide/), which is released under an MIT license as of Jan 2025.
-- This package was created with [Cookiecutter](https://github.com/cookiecutter/cookiecutter) and the [cookiecutter-modern-pypackage](https://github.com/fedejaure/cookiecutter-modern-pypackage) project template.
+Créditos al proyecto de origen, [BoPeng/ai-marketplace-monitor](https://github.com/BoPeng/ai-marketplace-monitor),
+y a lo que ese a su vez tomó de
+[facebook-marketplace-scraper](https://github.com/passivebot/facebook-marketplace-scraper).

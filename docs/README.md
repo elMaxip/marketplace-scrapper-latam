@@ -98,10 +98,10 @@ platforms.
 | `language`         | Optional    | String   | Language the platform's pages are read in. A fallback only: each search sets its own `language`, and that wins.  |
 | **Common options** |             |          | Options listed in the [Common options](#common-options) section below that provide default values for all items. |
 
-1. Multiple marketplaces with different `name`s can be specified for different `item`s (see [Multiple marketplaces](../README.md#multiple-marketplaces)). However, because the default `marketplace` for all items are `facebook`, it is easiest to define a default marketplace called `marketplace.facebook`.
+1. Multiple marketplaces with different `name`s can be specified for different `item`s (see Multiple marketplaces). However, because the default `marketplace` for all items are `facebook`, it is easiest to define a default marketplace called `marketplace.facebook`.
 2. `username` and `password` can be provided in three ways (in order of priority): directly in the config file, via the `${ENV_VAR}` syntax (e.g. `password = '${MY_FB_PASS}'`), or automatically from the `FACEBOOK_USERNAME` and `FACEBOOK_PASSWORD` environment variables. If none are set, the monitor runs in anonymous mode.
 3. If `language="LAN"` is specified, it must match to one of `translation` sections, defined by yourself or in the system configuration file. The system will try exact match (e.g. `es` to `es` or `zh_CN` to `zh_CN`), then partial match (e.g. `es` to `es_CO` or `es_CO` to `es`).
-4. Please see [Support for non-English languages](../README.md#support-for-non-english-languages) on how to set this option and define your own translations.
+4. Please see Support for non-English languages on how to set this option and define your own translations.
 
 ### Users
 
@@ -254,7 +254,7 @@ Note that
 1. We provide default `smtp_server` and `smtp_port` values for popular SMTP service providers.
 2. `smtp_username` is assumed to be the first `email`.
 
-See [Setting up email notification](../README.md#setting-up-email-notification) for details on how to set up email notification.
+See Setting up email notification for details on how to set up email notification.
 
 ### Items to search
 
@@ -279,7 +279,7 @@ return related items under different names. To select the right items, you can
 
 1. Use `keywords` to keep only items with certain words in the title. For example, you can set `keywords = ['gopro', 'go pro']` when you search for `search_phrases = 'gopro'`.
 2. Use `antikeywords` to narrow down the search. For example, setting `antikeywords=['HERO 4']` will exclude items with `HERO 4` or `hero 4`in the title or description.
-3. The `keywords` and `antikeywords` options allows the specification of multiple keywords with a `OR` relationship, but it also allows complex `AND`, `OR` and `NOT` logics. See [Advanced Keyword-based filters](../README.md#advanced-keyword-based-filters) for details.
+3. The `keywords` and `antikeywords` options allows the specification of multiple keywords with a `OR` relationship, but it also allows complex `AND`, `OR` and `NOT` logics. See Advanced Keyword-based filters for details.
 4. The four scoped variants (`*_title`, `*_description`) exist because the two
    original keys read the title and the description glued together, which is the
    right default and a poor only option. "I do not want cases" is a rule about
@@ -335,12 +335,12 @@ The following options that can specified for both `marketplace` sections and `it
 
 Note that
 
-1. `search_city` can be found from the URL that facebook uses to search your region. For example, if the URL for your facebook search is `https://www.facebook.com/marketplace/sanfrancisco/search?query=go%20pro%2011%20deal%20site`, the `search_city` is `sanfrancisco`. This name is not necessarily the name of your city, especially for non-US cities, and you can search multiple cities or an entire region. See [Searching multiple cities and regions](../README.md#searching-multiple-cities-and-regions) for details.
+1. `search_city` can be found from the URL that facebook uses to search your region. For example, if the URL for your facebook search is `https://www.facebook.com/marketplace/sanfrancisco/search?query=go%20pro%2011%20deal%20site`, the `search_city` is `sanfrancisco`. This name is not necessarily the name of your city, especially for non-US cities, and you can search multiple cities or an entire region. See Searching multiple cities and regions for details.
 2. If `notify` is not specified for both `item` and `marketplace`, all listed users will be notified.
-3. `prompt`, `extra_prompt`, `rating_prompt`, and `rating` are used to adjust how to interact with an AI service. See [Adjust prompt and notification level](../README.md#adjust-prompt-and-notification-level) for details.
+3. `prompt`, `extra_prompt`, `rating_prompt`, and `rating` are used to adjust how to interact with an AI service. See Adjust prompt and notification level for details.
 4. `start_at` supports one or more of the following values: <br> - `HH:MM:SS` or `HH:MM` for every day at `HH:MM:SS` or `HH:MM:00` <br> - `*:MM:SS` or `*:MM` for every hour at `MM:SS` or `MM:00` <br> - `*:*:SS` for every minute at `SS`.
-5. A list of two values can be specified for options `rating`, `availability`, `delivery_method`, and `date_listed`. See [First and subsequent searches](../README.md#first-and-subsequent-searches) for details.
-6. `min_price` and `max_price` can be specified as a number (e.g. `min_price=100`) or a number followed by a currency name (e.g. `min_price='100 USD'`). If different currencies are specified for both `min_price/max_price` and `search_city` (or `region`), the `min_price` and `max_price` will be adjusted to use currency for the `search_city`. See [Searching across regions with different currencies](../README.md#searching-across-regions-with-different-currencies) for details. **The conversion needs an exchange rate, and there is not always one.** Rates come from the ECB's daily table via `CurrencyConverter`, which publishes none for CLP, ARS, COP, PEN or UYU — most of the region this monitor is usually pointed at. When there is no rate the bound is sent as the plain number and a warning is logged; it used to raise out of the middle of building a search URL. Naming a currency on a city is still worth doing: it says what that city prices in, and a bound written in the same currency needs no conversion at all. Leaving it unset is the safe default and sends the number exactly as written.
+5. A list of two values can be specified for options `rating`, `availability`, `delivery_method`, and `date_listed`. See First and subsequent searches for details.
+6. `min_price` and `max_price` can be specified as a number (e.g. `min_price=100`) or a number followed by a currency name (e.g. `min_price='100 USD'`). If different currencies are specified for both `min_price/max_price` and `search_city` (or `region`), the `min_price` and `max_price` will be adjusted to use currency for the `search_city`. See Searching across regions with different currencies for details. **The conversion needs an exchange rate, and there is not always one.** Rates come from the ECB's daily table via `CurrencyConverter`, which publishes none for CLP, ARS, COP, PEN or UYU — most of the region this monitor is usually pointed at. When there is no rate the bound is sent as the plain number and a warning is logged; it used to raise out of the middle of building a search URL. Naming a currency on a city is still worth doing: it says what that city prices in, and a bound written in the same currency needs no conversion at all. Leaving it unset is the safe default and sends the number exactly as written.
 7. `category` can be `vehicles`, `propertyrentals`, `apparel`, `electronics`, `entertainment`, `family`, `freestuff`, `free`, `garden`, `hobbies`, `homegoods`, `homeimprovement`, `homesales`, `musicalinstruments`, `officesupplies`, `petsupplies`, `sportinggoods`, `tickets`, `toys`, and `videogames`. If `catgory=freestuff` or `catgory=free` is set, `min_price` and `max_price` is ignored.
 8. `sort_by` controls the order of the search results. `suggested` (the default) uses Facebook's own ranking, `new` lists the newest items first (useful for catching newly listed items), `price_ascend` and `price_descend` sort by price, and `distance_ascend` sorts by distance from the search city.
 
@@ -429,7 +429,7 @@ This section currently accept the following values for Facebook Marketplace.
 
 Note that not all words needs to be translated (the English version will be used if unspecified), and _AI Marketplace Monitor_ may be able to extract information using language-independent methods.
 
-Please see [Support for non-English languages](../README.md#support-for-non-english-languages)
+Please see Support for non-English languages
 
 ### Mercado Libre options
 

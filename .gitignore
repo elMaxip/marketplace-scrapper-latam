@@ -135,3 +135,11 @@ dmypy.json
 
 # Code editors
 .vscode
+
+# Lock file: this project is installed from pyproject.toml, not from a lock
+uv.lock
+
+# Debug dumps the scraper writes beside itself, profiles, throwaway scripts
+debug_*.html
+*.prof
+_diag*.py

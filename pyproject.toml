@@ -50,10 +50,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/BoPeng/ai-marketplace-monitor"
-Repository = "https://github.com/BoPeng/ai-marketplace-monitor"
-Documentation = "https://ai-marketplace-monitor.readthedocs.io"
-"Bug Tracker" = "https://github.com/BoPeng/ai-marketplace-monitor/issues"
+Homepage = "https://github.com/elMaxip/marketplace-scrapper-latam"
+Repository = "https://github.com/elMaxip/marketplace-scrapper-latam"
+"Web UI" = "https://github.com/elMaxip/platform-scrapper-ui"
+Upstream = "https://github.com/BoPeng/ai-marketplace-monitor"
 
 [project.scripts]
 ai-marketplace-monitor = "ai_marketplace_monitor.cli:app"
@@ -77,8 +77,6 @@ stealth = ["patchright>=1.62,<1.63"]
 dev = [
   "pre-commit>=4.0.1",
   "invoke>=2.2.0",
-  "bump2version>=1.0.1",
-  "watchdog[watchmedo]>=6.0.0",
   "pip-audit>=2.9.0",
   "build>=1.0.0",
   "twine>=5.0.0",
@@ -93,14 +91,6 @@ test = [
 linters = ["isort>=5.13.2,<7.0.0", "black>=24.10,<27.0", "ruff>=0.9.2,<0.16.0"]
 security = ["safety>=3.2.11"]
 typing = ["mypy>=1.13.0"]
-docs = [
-  "sphinx>=8.1.3",
-  "furo>=2024.1.29",
-  "myst-parser>=3.0.0",
-  "sphinx-copybutton>=0.5.2",
-  "sphinxext-opengraph>=0.9.0",
-  "linkify-it-py>=2.0.0",
-]
 
 [tool.coverage.paths]
 source = ["src", "*/site-packages"]
@@ -142,7 +132,6 @@ target-version = "py39"
 output-format = "full"
 line-length = 99
 fix = true
-extend-exclude = ["docs/*"]
 
 [tool.ruff.lint]
 ignore = [

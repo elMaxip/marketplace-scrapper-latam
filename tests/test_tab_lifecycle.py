@@ -28,6 +28,7 @@ from typing import Any, Dict, Iterator, List
 import pytest
 
 from ai_marketplace_monitor import control
+from ai_marketplace_monitor import monitor as monitor_module
 from ai_marketplace_monitor.control import CancelledScrape
 from ai_marketplace_monitor.marketplace import Marketplace
 from ai_marketplace_monitor.monitor import MarketplaceMonitor
@@ -252,6 +253,10 @@ def test_a_shared_tab_review_round_gives_the_tab_back(
     # what is under test is the tidy-up at the end, not the decision to run.
     monitor.config = type("Config", (), {"monitor": type("M", (), {})()})()
 
+    # The pause switch is persisted in the real data directory, and a monitor
+    # that happens to be paused on this machine would end the round before it
+    # touched a tab -- which is not what is under test.
+    monkeypatch.setattr(monitor_module, "is_paused", lambda: False)
     monkeypatch.setattr(monitor, "_review_due_now", lambda: True)
     monkeypatch.setattr(monitor, "_review_marketplaces", lambda: ("facebook",))
     monkeypatch.setattr(monitor, "_plan_next_review", lambda *a, **k: None)
@@ -283,6 +288,10 @@ def test_a_review_round_that_fails_gives_the_tab_back(
     # what is under test is the tidy-up at the end, not the decision to run.
     monitor.config = type("Config", (), {"monitor": type("M", (), {})()})()
 
+    # The pause switch is persisted in the real data directory, and a monitor
+    # that happens to be paused on this machine would end the round before it
+    # touched a tab -- which is not what is under test.
+    monkeypatch.setattr(monitor_module, "is_paused", lambda: False)
     monkeypatch.setattr(monitor, "_review_due_now", lambda: True)
     monkeypatch.setattr(monitor, "_review_marketplaces", lambda: ("facebook",))
     monkeypatch.setattr(monitor, "_plan_next_review", lambda *a, **k: None)

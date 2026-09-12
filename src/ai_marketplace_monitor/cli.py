@@ -157,7 +157,7 @@ _DEFAULT_CONFIG_TEMPLATE = """\
 # web UI: pasting the cookies from your own browser works where an
 # automated sign-in usually does not.
 #
-# See https://ai-marketplace-monitor.readthedocs.io/ for a full reference.
+# See docs/README.md in the repository for the full reference.
 """
 
 
